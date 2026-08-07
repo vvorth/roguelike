@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Machine-local Claude Code tool permissions — not portable, not shared
+.claude/settings.local.json

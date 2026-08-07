@@ -1,0 +1,30 @@
+# Runtime dependencies for the roguelike engine.
+#
+# THIS FILE IS INTENTIONALLY EMPTY.
+#
+# The engine is standard library only, by design and by contract:
+#   .plan/CONTRACT.md §0.2  — "Standard library only. No third-party imports in
+#                              roguelike/ or tests/, ever."
+# Terminal I/O uses the stdlib `curses` module, which ships with CPython on
+# macOS and Linux. (On Windows it does not; `windows-curses` would go here.)
+#
+# Add a dependency here the moment one appears — this file exists as the
+# reminder to do that, not as a claim that nothing will ever be needed.
+#
+# Install with:
+#   python -m pip install -r requirements.txt
+#
+# ---------------------------------------------------------------------------
+# Development / test tooling is NOT a runtime dependency and is deliberately
+# not pinned here. Running the test suite needs exactly one package:
+#
+#   pytest
+#
+# Python 3.10+ is required (the project uses `X | Y` type syntax and modern
+# dataclass behaviour). The system Python on this machine is 3.9, so the suite
+# runs from a virtualenv:
+#
+#   python3.14 -m venv .venv
+#   .venv/bin/python -m pip install pytest
+#   .venv/bin/python -m pytest
+# ---------------------------------------------------------------------------
