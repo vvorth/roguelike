@@ -184,4 +184,4 @@ handled — the view clips safely rather than reflowing.
 
 ## Licence
 
-None yet.
+[MIT](LICENSE) — use it, change it, ship it, sell it. Just keep the copyright notice.
