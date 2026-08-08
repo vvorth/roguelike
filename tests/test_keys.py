@@ -181,6 +181,7 @@ def test_every_bound_key_in_the_table_is_expected() -> None:
     expected |= {ord(c) for c in DIGIT_BINDINGS}
     expected |= set(ARROW_BINDINGS)
     expected |= {ord("q"), ord("Q")}
+    expected |= {ord(">"), ord("<")}
     assert set(keys_module._KEY_BINDINGS) == expected
 
 
@@ -214,6 +215,57 @@ def test_quit_keys(key: int | str) -> None:
     command = translate_key(key)
     assert command.kind is CommandKind.QUIT
     assert command == QUIT_COMMAND
+
+
+# --- Stairs (CONTRACT-v3 §5): explicit command, not step-on-to-use ----------
+
+
+def test_descend_as_str() -> None:
+    command = translate_key(">")
+    assert command.kind is CommandKind.DESCEND
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_descend_as_int() -> None:
+    command = translate_key(ord(">"))
+    assert command.kind is CommandKind.DESCEND
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_ascend_as_str() -> None:
+    command = translate_key("<")
+    assert command.kind is CommandKind.ASCEND
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_ascend_as_int() -> None:
+    command = translate_key(ord("<"))
+    assert command.kind is CommandKind.ASCEND
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_descend_str_and_int_forms_agree() -> None:
+    assert translate_key(">") == translate_key(ord(">"))
+
+
+def test_ascend_str_and_int_forms_agree() -> None:
+    assert translate_key("<") == translate_key(ord("<"))
+
+
+def test_descend_and_ascend_are_distinct_commands() -> None:
+    assert translate_key(">") != translate_key("<")
+
+
+def test_descend_and_ascend_do_not_collide_with_movement_or_quit() -> None:
+    stair_commands = {translate_key(">"), translate_key("<")}
+    other_commands = {
+        translate_key(c) for c in list(LETTER_BINDINGS) + list(DIGIT_BINDINGS) + ["q", "Q"]
+    }
+    assert stair_commands.isdisjoint(other_commands)
 
 
 # --- Unknown keys: ordinary input, never an error ---------------------------
@@ -317,11 +369,21 @@ def test_command_is_hashable() -> None:
 
 
 def test_command_kind_members() -> None:
-    assert [member.name for member in CommandKind] == ["MOVE", "QUIT", "UNKNOWN"]
+    assert [member.name for member in CommandKind] == [
+        "MOVE",
+        "QUIT",
+        "UNKNOWN",
+        "DESCEND",
+        "ASCEND",
+    ]
 
 
 def test_command_kind_uses_auto_values() -> None:
-    assert [member.value for member in CommandKind] == [1, 2, 3]
+    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5]
+
+
+def test_command_kind_has_exactly_five_members() -> None:
+    assert len(list(CommandKind)) == 5
 
 
 def test_module_constants_are_the_expected_kinds() -> None:

@@ -13,6 +13,7 @@ import roguelike.tiles
 from roguelike.level import Level, Room, blank_grid, freeze_grid
 from roguelike.tiles import (
     PLAYER_CHAR,
+    STAIRS,
     TILE_CHARS,
     WALKABLE,
     Tile,
@@ -46,7 +47,15 @@ def test_tile_members_and_values():
     assert Tile.WALL == 0
     assert Tile.FLOOR == 1
     assert Tile.DOOR == 2
-    assert [t.name for t in Tile] == ["WALL", "FLOOR", "DOOR"]
+    assert Tile.STAIRS_UP == 3
+    assert Tile.STAIRS_DOWN == 4
+    assert [t.name for t in Tile] == [
+        "WALL",
+        "FLOOR",
+        "DOOR",
+        "STAIRS_UP",
+        "STAIRS_DOWN",
+    ]
 
 
 def test_tile_is_int_enum():
@@ -54,7 +63,13 @@ def test_tile_is_int_enum():
 
 
 def test_tile_chars_mapping():
-    assert TILE_CHARS == {Tile.WALL: "#", Tile.FLOOR: ".", Tile.DOOR: "+"}
+    assert TILE_CHARS == {
+        Tile.WALL: "#",
+        Tile.FLOOR: ".",
+        Tile.DOOR: "+",
+        Tile.STAIRS_UP: "<",
+        Tile.STAIRS_DOWN: ">",
+    }
 
 
 def test_player_char():
@@ -63,7 +78,13 @@ def test_player_char():
 
 @pytest.mark.parametrize(
     ("tile", "char"),
-    [(Tile.WALL, "#"), (Tile.FLOOR, "."), (Tile.DOOR, "+")],
+    [
+        (Tile.WALL, "#"),
+        (Tile.FLOOR, "."),
+        (Tile.DOOR, "+"),
+        (Tile.STAIRS_UP, "<"),
+        (Tile.STAIRS_DOWN, ">"),
+    ],
 )
 def test_tile_char(tile, char):
     assert tile_char(tile) == char
@@ -75,13 +96,27 @@ def test_tile_char_unknown_raises_key_error():
 
 
 def test_walkable_set():
-    assert WALKABLE == frozenset({Tile.FLOOR, Tile.DOOR})
+    assert WALKABLE == frozenset(
+        {Tile.FLOOR, Tile.DOOR, Tile.STAIRS_UP, Tile.STAIRS_DOWN}
+    )
     assert isinstance(WALKABLE, frozenset)
+    assert Tile.WALL not in WALKABLE
+
+
+def test_stairs_set():
+    assert STAIRS == frozenset({Tile.STAIRS_UP, Tile.STAIRS_DOWN})
+    assert isinstance(STAIRS, frozenset)
 
 
 @pytest.mark.parametrize(
     ("tile", "expected"),
-    [(Tile.WALL, False), (Tile.FLOOR, True), (Tile.DOOR, True)],
+    [
+        (Tile.WALL, False),
+        (Tile.FLOOR, True),
+        (Tile.DOOR, True),
+        (Tile.STAIRS_UP, True),
+        (Tile.STAIRS_DOWN, True),
+    ],
 )
 def test_is_walkable_tile(tile, expected):
     assert is_walkable_tile(tile) is expected
@@ -254,6 +289,37 @@ def test_level_positional_field_order():
     assert level.rooms == rooms
     assert level.player_start == (2, 1)
     assert level.seed == -5
+    # The three v3 stair fields default without being supplied — this is what keeps
+    # every pre-v3 six-argument positional construction valid (CONTRACT-v3 §2).
+    assert level.stairs_up is None
+    assert level.stairs_down == ()
+    assert level.depth == 1
+
+
+def test_level_field_order_via_dataclasses_fields():
+    names = tuple(f.name for f in dataclasses.fields(Level))
+    assert names == (
+        "width",
+        "height",
+        "grid",
+        "rooms",
+        "player_start",
+        "seed",
+        "stairs_up",
+        "stairs_down",
+        "depth",
+    )
+
+
+def test_level_positional_construction_with_all_nine_fields():
+    grid = freeze_grid(blank_grid(6, 6))
+    rooms = (Room(1, 1, 2, 2),)
+    level = Level(
+        6, 6, grid, rooms, (2, 2), 3, (1, 1), ((4, 4), (2, 3)), 5
+    )
+    assert level.stairs_up == (1, 1)
+    assert level.stairs_down == ((4, 4), (2, 3))
+    assert level.depth == 5
 
 
 def test_level_in_bounds():
@@ -374,6 +440,119 @@ def test_level_minimal_one_by_one():
 def test_level_equality():
     assert make_level() == make_level()
     assert make_level(seed=1) != make_level(seed=2)
+
+
+# ------------------------------------------------------------- Level stairs and depth
+
+
+def test_level_no_stairs_by_default():
+    level = make_level()
+    assert level.stairs_up is None
+    assert level.stairs_down == ()
+    assert level.depth == 1
+
+
+@pytest.mark.parametrize("depth", [0, -1, -100])
+def test_level_rejects_non_positive_depth(depth):
+    grid = freeze_grid(blank_grid(5, 4))
+    with pytest.raises(ValueError):
+        Level(5, 4, grid, (), (1, 1), 0, depth=depth)
+
+
+def test_level_accepts_depth_one():
+    grid = freeze_grid(blank_grid(5, 4))
+    level = Level(5, 4, grid, (), (1, 1), 0, depth=1)
+    assert level.depth == 1
+
+
+def test_level_accepts_depth_greater_than_one():
+    grid = freeze_grid(blank_grid(5, 4))
+    level = Level(5, 4, grid, (), (1, 1), 0, depth=7)
+    assert level.depth == 7
+
+
+def test_level_stairs_up_none_is_accepted():
+    grid = freeze_grid(blank_grid(5, 4))
+    level = Level(5, 4, grid, (), (1, 1), 0, stairs_up=None)
+    assert level.stairs_up is None
+
+
+@pytest.mark.parametrize("bad", [(-1, 1), (1, -1), (5, 1), (1, 4), (5, 4)])
+def test_level_rejects_out_of_bounds_stairs_up(bad):
+    grid = freeze_grid(blank_grid(5, 4))
+    with pytest.raises(ValueError):
+        Level(5, 4, grid, (), (1, 1), 0, stairs_up=bad)
+
+
+def test_level_accepts_in_bounds_stairs_up():
+    grid = freeze_grid(blank_grid(5, 4))
+    level = Level(5, 4, grid, (), (1, 1), 0, stairs_up=(2, 2))
+    assert level.stairs_up == (2, 2)
+
+
+def test_level_stairs_down_empty_tuple_is_accepted():
+    level = make_level()
+    assert level.stairs_down == ()
+
+
+@pytest.mark.parametrize("bad", [(-1, 1), (1, -1), (5, 1), (1, 4), (5, 4)])
+def test_level_rejects_out_of_bounds_stairs_down_entry(bad):
+    grid = freeze_grid(blank_grid(5, 4))
+    with pytest.raises(ValueError):
+        Level(5, 4, grid, (), (1, 1), 0, stairs_down=(bad,))
+
+
+def test_level_rejects_out_of_bounds_stairs_down_among_valid_entries():
+    grid = freeze_grid(blank_grid(5, 4))
+    with pytest.raises(ValueError):
+        Level(5, 4, grid, (), (1, 1), 0, stairs_down=((1, 1), (99, 99)))
+
+
+def test_level_accepts_two_entry_stairs_down_both_in_bounds():
+    # The branching scaffolding (req 3): a two-entry stairs_down must already work,
+    # even though the generator ships only one entry today.
+    grid = freeze_grid(blank_grid(5, 4))
+    level = Level(5, 4, grid, (), (1, 1), 0, stairs_down=((1, 1), (2, 2)))
+    assert level.stairs_down == ((1, 1), (2, 2))
+
+
+def test_level_stairs_down_is_a_tuple_not_a_scalar():
+    grid = freeze_grid(blank_grid(5, 4))
+    level = Level(5, 4, grid, (), (1, 1), 0, stairs_down=((2, 2),))
+    assert isinstance(level.stairs_down, tuple)
+    assert level.stairs_down == ((2, 2),)
+    assert level.stairs_down[0] == (2, 2)
+
+
+def test_level_does_not_require_stairs_to_exist():
+    # A hand-built test level with no stairs at all must stay constructible.
+    level = make_level()
+    assert level.stairs_up is None
+    assert level.stairs_down == ()
+
+
+def test_level_stairs_and_depth_are_frozen():
+    level = make_level()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        level.stairs_up = (0, 0)  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        level.stairs_down = ((0, 0),)  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        level.depth = 2  # type: ignore[misc]
+
+
+def test_level_grid_containing_stairs_reports_them_and_is_walkable():
+    grid = blank_grid(6, 5)
+    grid[2][2] = Tile.STAIRS_UP
+    grid[2][3] = Tile.STAIRS_DOWN
+    level = Level(
+        6, 5, freeze_grid(grid), (), (2, 2), 0,
+        stairs_up=(2, 2), stairs_down=((3, 2),),
+    )
+    assert level.tile_at(2, 2) is Tile.STAIRS_UP
+    assert level.tile_at(3, 2) is Tile.STAIRS_DOWN
+    assert level.is_walkable(2, 2) is True
+    assert level.is_walkable(3, 2) is True
 
 
 # ---------------------------------------------------------------------- grid helpers

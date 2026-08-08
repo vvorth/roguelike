@@ -26,11 +26,13 @@ __all__ = [
 
 
 class CommandKind(Enum):
-    """The three things a key press can mean."""
+    """The five things a key press can mean."""
 
     MOVE = auto()
     QUIT = auto()
     UNKNOWN = auto()
+    DESCEND = auto()  # ">"
+    ASCEND = auto()  # "<"
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,13 @@ _MOVEMENT_BINDINGS: tuple[tuple[tuple[int, int], tuple[int | str, ...]], ...] = 
 
 _QUIT_KEYS: tuple[int | str, ...] = ("q", "Q")
 
+# Stairs are used by an explicit command, as in ADOM (CONTRACT-v3 §5) — not by
+# stepping on the tile. dx == dy == 0 for both.
+_STAIR_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
+    (CommandKind.DESCEND, ">"),
+    (CommandKind.ASCEND, "<"),
+)
+
 
 def _keycode(key: int | str) -> int:
     """Normalise a table entry to the integer code `curses.getch` would give."""
@@ -86,6 +95,8 @@ def _build_bindings() -> dict[int, Command]:
             bindings[_keycode(table_key)] = command
     for table_key in _QUIT_KEYS:
         bindings[_keycode(table_key)] = QUIT_COMMAND
+    for kind, table_key in _STAIR_BINDINGS:
+        bindings[_keycode(table_key)] = Command(kind)
     return bindings
 
 

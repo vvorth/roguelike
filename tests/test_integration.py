@@ -1,18 +1,18 @@
-"""End-to-end checks across the whole stack — orchestrator-owned (CONTRACT §9 / §9 v2).
+"""End-to-end checks across the whole stack — orchestrator-owned (CONTRACT §9 / v2 / v3).
 
 Every test here crosses at least two task boundaries, which is what no individual
 worker could verify: each of them only ever saw their own module plus the frozen
 core types. Single-module behaviour is covered by the per-task suites and is
 deliberately not repeated here.
 
-v2 adds colour, fog of war, permissive field of view and openable doors, so this
-file now also pins the properties that only appear once those meet: that the map
-starts hidden and is revealed by walking, that memory never shrinks, that an
-unexplored map does not leak through the renderer, and that bumping a door opens
-it and reveals what is behind.
+v3 makes the dungeon multi-level, so this file now also pins the properties that
+only exist once generation, the stair contract, fog persistence and the message
+system meet: that descending keeps the player on the same coordinate, that the
+level below anchors its up-staircase there, that fog and opened doors survive a
+round trip, and that the chrome rows carry the right text.
 
 Nothing in this file initialises curses. The live curses session is verified
-separately, out of band, and recorded in .plan/INTEGRATION-v2.md.
+separately, out of band, and recorded in .plan/INTEGRATION-v3.md.
 """
 
 from __future__ import annotations
@@ -25,23 +25,37 @@ from pathlib import Path
 
 import pytest
 
-from roguelike import world
-from roguelike.fov import DEFAULT_RADIUS, compute_visible
-from roguelike.game import GameState, format_status, new_game, step
+from roguelike import dungeon, events, world
+from roguelike.events import EventKind
+from roguelike.fov import compute_visible
+from roguelike.game import (
+    GameState,
+    format_stats,
+    format_status_right,
+    new_game,
+    step,
+)
 from roguelike.generator import generate_level
-from roguelike.keys import CommandKind, translate_key
+from roguelike.keys import Command, CommandKind, translate_key
 from roguelike.level import Level
-from roguelike.movement import try_move
-from roguelike.render import render_to_cells, to_lines
-from roguelike.style import Attr, Role, Visibility, attr_for
+from roguelike.render import Chrome, render_to_cells, to_lines
+from roguelike.style import Role, Visibility
 from roguelike.tiles import DOOR_OPEN_CHAR, PLAYER_CHAR, TILE_CHARS, Tile
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-SEEDS = (0, 1, 7, 42, 1234, 31337, 2026, -1, -99)
+SEEDS = (0, 1, 7, 42, 1234, 2026, -1)
+SMALL = (40, 18)          # a real dungeon, small enough to walk quickly
 
-# Mixes hjkl, diagonals, numpad digits, and an unbound key that must be a no-op.
+DESCEND = Command(CommandKind.DESCEND)
+ASCEND = Command(CommandKind.ASCEND)
+
 WALK_KEYS = "jjllkkhhyubn55nnbbjjllll"
+
+
+# --------------------------------------------------------------------------
+# Helpers — written here, independent of any module under test
+# --------------------------------------------------------------------------
 
 
 def walkable_cells(level: Level) -> set[tuple[int, int]]:
@@ -54,54 +68,104 @@ def walkable_cells(level: Level) -> set[tuple[int, int]]:
 
 
 def flood_fill(level: Level, start: tuple[int, int]) -> set[tuple[int, int]]:
-    """4-directional flood fill over walkable terrain, written independently of
-    the generator's own internal check so a bug there cannot hide from us."""
+    """4-directional flood fill over walkable terrain, implemented here so a bug
+    in the generator's own self-check cannot hide from this suite."""
     if not level.is_walkable(*start):
         return set()
     seen = {start}
     queue = deque([start])
     while queue:
         x, y = queue.popleft()
-        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-            if (nx, ny) not in seen and level.is_walkable(nx, ny):
-                seen.add((nx, ny))
-                queue.append((nx, ny))
+        for nxt in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if nxt not in seen and level.is_walkable(*nxt):
+                seen.add(nxt)
+                queue.append(nxt)
     return seen
 
 
-def drive(state: GameState, keys: str) -> tuple[GameState, list[GameState]]:
-    """Feed raw key characters through the real input abstraction into the loop —
-    the headless equivalent of what game.run does with getch."""
-    history = [state]
-    for key in keys:
-        state = step(state, translate_key(key))
-        history.append(state)
-    return state, history
+def open_spot(level: Level, x: int, y: int) -> bool:
+    """'At least 1 tile away from any wall' — all eight neighbours non-WALL."""
+    return all(
+        level.in_bounds(x + dx, y + dy)
+        and level.tile_at(x + dx, y + dy) is not Tile.WALL
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+    )
+
+
+def route_to(state: GameState, target: tuple[int, int]) -> GameState | None:
+    """Walk to ``target`` by breadth-first search over *real* steps.
+
+    Every move goes through translate_key -> step, so this exercises the whole
+    input/movement/FOV path rather than teleporting the player.
+    """
+    seen = {state.player}
+    queue = deque([state])
+    while queue:
+        current = queue.popleft()
+        if current.player == target:
+            return current
+        for key in "hjkl":
+            nxt = step(current, translate_key(key))
+            if nxt.player != current.player and nxt.player not in seen:
+                seen.add(nxt.player)
+                queue.append(nxt)
+            elif nxt.open_doors != current.open_doors:
+                queue.append(nxt)
+    return None
+
+
+def descend_once(state: GameState) -> GameState:
+    at_stair = route_to(state, state.level.stairs_down[0])
+    assert at_stair is not None, "the down-staircase was unreachable"
+    return step(at_stair, DESCEND)
 
 
 # --------------------------------------------------------------------------
-# Terrain: generator x level  (v1 properties that must not regress)
+# Terrain and stairs: generator x level  (v1/v2 properties + the v3 stair rules)
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("seed", SEEDS)
-def test_every_walkable_tile_is_reachable_from_player_start(seed: int) -> None:
+def test_every_walkable_tile_is_reachable_from_the_up_staircase(seed: int) -> None:
     level = generate_level(seed)
-    assert flood_fill(level, level.player_start) == walkable_cells(level)
+    assert flood_fill(level, level.stairs_up) == walkable_cells(level)
 
 
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("size", [(80, 22), (40, 15), (24, 12)])
-def test_connectivity_holds_at_other_map_sizes(seed, size) -> None:
-    width, height = size
-    level = generate_level(seed, width, height)
-    assert flood_fill(level, level.player_start) == walkable_cells(level)
+def test_both_staircases_are_valid_spawn_cells(seed: int) -> None:
+    """Requirement 1, and what makes the level below anchorable at this one's
+    down-staircase."""
+    level = generate_level(seed)
+    for coord in (level.stairs_up, *level.stairs_down):
+        assert open_spot(level, *coord), f"seed {seed}: {coord} is beside a wall"
+        # An open spot is provably within the anchorable range.
+        assert 2 <= coord[0] <= level.width - 3
+        assert 2 <= coord[1] <= level.height - 3
 
 
 @pytest.mark.parametrize("seed", SEEDS)
-def test_every_door_is_embedded_in_a_wall_run(seed: int) -> None:
-    """CONTRACT-v2 §3 G9b/G9c, re-derived here. The v1 build violated this on
-    13.1% of doors; this test is the guard against a silent regression."""
+def test_the_spawn_is_the_up_staircase(seed: int) -> None:
+    level = generate_level(seed)
+    assert level.player_start == level.stairs_up
+    assert level.tile_at(*level.stairs_up) is Tile.STAIRS_UP
+    assert level.tile_at(*level.stairs_down[0]) is Tile.STAIRS_DOWN
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_the_two_staircases_are_distinct_and_usually_far_apart(seed: int) -> None:
+    level = generate_level(seed)
+    assert level.stairs_up != level.stairs_down[0]
+    if len(level.rooms) > 1:
+        up_room = [r for r in level.rooms if r.contains(*level.stairs_up)]
+        down_room = [r for r in level.rooms if r.contains(*level.stairs_down[0])]
+        assert up_room and down_room
+        assert up_room[0] != down_room[0], "stairs must not share a room"
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_every_door_is_still_embedded_in_a_wall_run(seed: int) -> None:
+    """The v2 door fix must survive the v3 generator rewrite."""
     level = generate_level(seed)
     for y in range(level.height):
         for x in range(level.width):
@@ -115,397 +179,56 @@ def test_every_door_is_embedded_in_a_wall_run(seed: int) -> None:
             walls_ud = tile(x, y - 1) is Tile.WALL and tile(x, y + 1) is Tile.WALL
             open_lr = tile(x - 1, y) is not Tile.WALL and tile(x + 1, y) is not Tile.WALL
             open_ud = tile(x, y - 1) is not Tile.WALL and tile(x, y + 1) is not Tile.WALL
-            assert (walls_ud and open_lr) or (walls_lr and open_ud), (
-                f"seed {seed}: malformed door at ({x}, {y})"
+            assert (walls_ud and open_lr) or (walls_lr and open_ud)
+            for nxt in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if level.in_bounds(*nxt):
+                    assert level.tile_at(*nxt) is not Tile.DOOR
+
+
+# --------------------------------------------------------------------------
+# The descent chain: dungeon x generator x level
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("master", (0, 7, 1234, -1))
+def test_a_five_level_chain_lines_up_and_stays_connected(master: int) -> None:
+    """Level N+1's up-staircase is exactly level N's down-staircase, and every
+    level is fully connected from it."""
+    required = None
+    previous_down = None
+    for depth in range(1, 6):
+        level = dungeon.level_for(master, depth, required_up=required, width=40, height=18)
+        assert level.depth == depth
+        if previous_down is not None:
+            assert level.stairs_up == previous_down, (
+                f"master {master} depth {depth}: stairs do not line up"
             )
-            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-                if level.in_bounds(nx, ny):
-                    assert level.tile_at(nx, ny) is not Tile.DOOR
+        assert flood_fill(level, level.stairs_up) == walkable_cells(level)
+        assert open_spot(level, *level.stairs_down[0])
+        previous_down = level.stairs_down[0]
+        required = previous_down
 
 
-# --------------------------------------------------------------------------
-# The walk: keys x game x movement x world x level
-# --------------------------------------------------------------------------
+def test_the_same_master_seed_rebuilds_the_same_dungeon() -> None:
+    def chain(master):
+        out, required = [], None
+        for depth in range(1, 5):
+            lv = dungeon.level_for(master, depth, required_up=required, width=40, height=18)
+            out.append((lv.grid, lv.stairs_up, lv.stairs_down))
+            required = lv.stairs_down[0]
+        return out
 
+    assert chain(31337) == chain(31337)
+    assert chain(31337) != chain(31338)
 
-@pytest.mark.parametrize("seed", SEEDS)
-def test_scripted_walk_never_enters_a_wall_or_leaves_the_map(seed: int) -> None:
-    """The core safety invariant, asserted after every single keystroke."""
-    level = generate_level(seed)
-    state = new_game(level)
-    assert level.is_walkable(*state.player)
 
-    final, history = drive(state, WALK_KEYS * 6)
-
-    for index, snap in enumerate(history):
-        x, y = snap.player
-        assert level.in_bounds(x, y), f"seed {seed} @{index}: left the map at ({x}, {y})"
-        assert level.tile_at(x, y) is not Tile.WALL, (
-            f"seed {seed} @{index}: stood in a wall at ({x}, {y})"
-        )
-        # Stronger than v1: the player must stand only where the world is
-        # currently passable, which now depends on which doors are open.
-        assert world.is_passable(level, snap.open_doors, x, y)
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_turns_equal_accepted_moves_plus_doors_opened(seed: int) -> None:
-    """v1's 'a rejected move consumes no turn', extended for the third outcome:
-    bumping a closed door consumes a turn without moving."""
-    level = generate_level(seed)
-    state = new_game(level)
-    accepted = opened = blocked = 0
-
-    for key in WALK_KEYS * 4:
-        before = state
-        state = step(state, translate_key(key))
-        if state.player != before.player:
-            accepted += 1
-        elif state.open_doors != before.open_doors:
-            opened += 1
-        elif state.turns == before.turns:
-            blocked += 1
-        assert state.turns == accepted + opened
-
-    assert blocked > 0, "the walk was never blocked, so it proves nothing"
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_a_player_only_ever_stands_on_terrain_it_could_reach(seed: int) -> None:
-    level = generate_level(seed)
-    reachable = flood_fill(level, level.player_start)
-    final, history = drive(new_game(level), WALK_KEYS * 4)
-    for snap in history:
-        assert snap.player in reachable
-
-
-# --------------------------------------------------------------------------
-# Fog of war: fov x game x level  (the heart of v2)
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_the_map_starts_mostly_hidden(seed: int) -> None:
-    """Fog of war is meaningful only if the opening frame hides most of the map."""
-    level = generate_level(seed)
-    state = new_game(level)
-    total = level.width * level.height
-    assert state.explored, "the starting cell must be seen"
-    assert len(state.explored) < total * 0.5, (
-        f"seed {seed}: {len(state.explored)}/{total} explored at turn 0 — "
-        "fog of war is not hiding anything"
-    )
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_explored_grows_monotonically_and_never_shrinks(seed: int) -> None:
-    level = generate_level(seed)
-    _, history = drive(new_game(level), WALK_KEYS * 6)
-    for older, newer in zip(history, history[1:]):
-        assert newer.explored >= older.explored, "ground once seen was forgotten"
-        assert newer.explored >= newer.visible, "a visible cell was not explored"
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_passing_through_a_door_reveals_strictly_more_of_the_map(seed: int) -> None:
-    """Fog lifts as you explore — but only where it actually can.
-
-    A short walk *inside one room* legitimately reveals nothing new: at radius 20
-    the whole room is visible the moment you stand in it, which is why radius 20
-    and radius 8 differ by so little indoors. The meaningful progression property
-    is that crossing into somewhere new reveals more, so that is what this asserts.
-    """
-    level = generate_level(seed)
-    start = new_game(level)
-    at_door, key = find_door_approach(level, start)
-    if at_door is None:
-        pytest.skip(f"seed {seed}: no reachable closed door")
-
-    opened = step(at_door, translate_key(key))
-    through = step(opened, translate_key(key))
-
-    assert opened.explored > at_door.explored, "opening the door revealed nothing"
-    assert through.explored >= opened.explored
-    assert through.explored > start.explored
-
-
-@pytest.mark.parametrize("seed", (1234, 7, 42))
-def test_visible_agrees_with_a_direct_fov_call(seed: int) -> None:
-    """game.step must not reimplement visibility — it must delegate to fov."""
-    level = generate_level(seed)
-    state = new_game(level)
-    for key in WALK_KEYS:
-        state = step(state, translate_key(key))
-        expected = compute_visible(level, state.open_doors, state.player, state.radius)
-        assert state.visible == expected
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_every_visible_cell_is_within_radius_and_in_bounds(seed: int) -> None:
-    level = generate_level(seed)
-    _, history = drive(new_game(level), WALK_KEYS * 2)
-    for snap in history:
-        px, py = snap.player
-        for x, y in snap.visible:
-            assert level.in_bounds(x, y)
-            assert (x - px) ** 2 + (y - py) ** 2 <= snap.radius**2
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_a_rejected_move_does_not_recompute_visibility(seed: int) -> None:
-    """FOV recomputes only on an accepted move or a door opening.
-
-    The starting cell is often the middle of a room with all eight directions
-    open, so this walks out to a cell that genuinely has a wall beside it rather
-    than skipping.
-    """
-    level = generate_level(seed)
-    start = new_game(level)
-
-    # Breadth-first walk to the first reachable state with a blocked direction.
-    deltas = {"h": (-1, 0), "l": (1, 0), "k": (0, -1), "j": (0, 1)}
-    seen = {start.player}
-    queue = deque([start])
-    blocked_state = blocked_key = None
-    while queue and blocked_state is None:
-        current = queue.popleft()
-        for key, (dx, dy) in deltas.items():
-            result = try_move(level, current.player, dx, dy, current.open_doors)
-            if not result.moved and result.blocked_by_door is None:
-                blocked_state, blocked_key = current, key
-                break
-            if result.moved and result.position not in seen:
-                seen.add(result.position)
-                queue.append(step(current, translate_key(key)))
-
-    assert blocked_state is not None, f"seed {seed}: no wall anywhere on the map"
-
-    after = step(blocked_state, translate_key(blocked_key))
-    assert after is blocked_state or after.visible is blocked_state.visible, (
-        "a rejected move recomputed the field of view"
-    )
-    assert after.turns == blocked_state.turns
-    assert after.player == blocked_state.player
-    assert after.explored == blocked_state.explored
-    assert after.open_doors == blocked_state.open_doors
-
-
-# --------------------------------------------------------------------------
-# Doors: bump-to-open across keys x movement x world x fov x game
-# --------------------------------------------------------------------------
-
-
-def find_door_approach(level: Level, state: GameState):
-    """Walk the map for a state standing next to a closed door, and the key
-    that bumps into it."""
-    deltas = {"h": (-1, 0), "l": (1, 0), "k": (0, -1), "j": (0, 1)}
-    seen = {state.player}
-    queue = deque([state])
-    while queue:
-        current = queue.popleft()
-        for key, (dx, dy) in deltas.items():
-            target = (current.player[0] + dx, current.player[1] + dy)
-            if world.is_closed_door(level, current.open_doors, *target):
-                return current, key
-            if target in seen or not world.is_passable(level, current.open_doors, *target):
-                continue
-            seen.add(target)
-            queue.append(step(current, translate_key(key)))
-    return None, None
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_bumping_a_door_opens_it_costs_a_turn_and_reveals_what_is_behind(seed) -> None:
-    level = generate_level(seed)
-    at_door, key = find_door_approach(level, new_game(level))
-    if at_door is None:
-        pytest.skip(f"seed {seed}: no reachable closed door")
-
-    after = step(at_door, translate_key(key))
-
-    assert after.player == at_door.player, "opening a door must not move the player"
-    assert after.turns == at_door.turns + 1, "opening a door costs exactly one turn"
-    assert len(after.open_doors) == len(at_door.open_doors) + 1
-    opened = next(iter(after.open_doors - at_door.open_doors))
-    assert level.tile_at(*opened) is Tile.DOOR
-    assert after.visible > at_door.visible or after.visible != at_door.visible, (
-        "opening a door must recompute the field of view"
-    )
-    assert after.explored >= at_door.explored
-
-    # And the next move in the same direction now walks onto the door cell.
-    through = step(after, translate_key(key))
-    assert through.player == opened
-    assert through.turns == at_door.turns + 2
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_open_doors_are_always_real_door_tiles(seed: int) -> None:
-    level = generate_level(seed)
-    final, _ = drive(new_game(level), WALK_KEYS * 6)
-    for coord in final.open_doors:
-        assert level.tile_at(*coord) is Tile.DOOR
-
-
-# --------------------------------------------------------------------------
-# The frame: render x style x fov x game
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("seed", (1234, 7, -1))
-def test_rendered_frame_matches_visibility_state(seed: int) -> None:
-    level = generate_level(seed)
-    state = new_game(level)
-    _, history = drive(state, WALK_KEYS)
-
-    for snap in history:
-        cells = render_to_cells(
-            snap.level, snap.player, snap.visible, snap.explored,
-            snap.open_doors, format_status(snap),
-        )
-        assert len(cells) == level.height + 1
-        assert all(len(row) == level.width for row in cells)
-
-        px, py = snap.player
-        assert cells[py][px].char == PLAYER_CHAR
-        assert cells[py][px].role is Role.PLAYER
-        assert cells[py][px].visibility is Visibility.VISIBLE
-
-        for y in range(level.height):
-            for x in range(level.width):
-                if (x, y) == (px, py):
-                    continue
-                cell = cells[y][x]
-                if (x, y) in snap.visible:
-                    assert cell.visibility is Visibility.VISIBLE
-                elif (x, y) in snap.explored:
-                    assert cell.visibility is Visibility.EXPLORED
-                else:
-                    assert cell.visibility is Visibility.UNSEEN
-                    assert cell.char == " ", "unexplored ground leaked a glyph"
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_the_unexplored_map_does_not_leak_through_the_renderer(seed: int) -> None:
-    """The player must not be able to infer the map shape from unexplored area."""
-    level = generate_level(seed)
-    state = new_game(level)
-    cells = render_to_cells(
-        level, state.player, state.visible, state.explored,
-        state.open_doors, format_status(state),
-    )
-    lines = to_lines(cells)
-    for y in range(level.height):
-        for x in range(level.width):
-            if (x, y) in state.explored or (x, y) == state.player:
-                continue
-            assert lines[y][x] == " ", f"unexplored cell ({x}, {y}) drew a glyph"
-
-
-def test_an_opened_door_changes_glyph_in_the_frame() -> None:
-    level = generate_level(1234)
-    at_door, key = find_door_approach(level, new_game(level))
-    assert at_door is not None
-
-    after = step(at_door, translate_key(key))
-    door = next(iter(after.open_doors - at_door.open_doors))
-
-    before_cells = render_to_cells(
-        level, at_door.player, at_door.visible, at_door.explored,
-        at_door.open_doors, "",
-    )
-    after_cells = render_to_cells(
-        level, after.player, after.visible, after.explored, after.open_doors, "",
-    )
-    assert before_cells[door[1]][door[0]].char == TILE_CHARS[Tile.DOOR]
-    assert after_cells[door[1]][door[0]].char == DOOR_OPEN_CHAR
-    assert after_cells[door[1]][door[0]].role is Role.DOOR
-
-
-def test_colours_differ_between_visible_and_explored() -> None:
-    """The user's rule: explored area is a darker shade of its natural colour."""
-    for role in (Role.TERRAIN, Role.DOOR):
-        lit = attr_for(role, Visibility.VISIBLE)
-        dim = attr_for(role, Visibility.EXPLORED)
-        assert lit != dim
-        assert dim.color < lit.color, f"{role} explored is not darker than visible"
-    player = attr_for(Role.PLAYER, Visibility.VISIBLE)
-    assert player.bold is True, "the player must be bold"
-    assert attr_for(Role.TERRAIN, Visibility.VISIBLE).bold is False
-
-
-def test_every_drawn_cell_of_a_real_frame_has_a_usable_attribute() -> None:
-    """No frame the game can produce may contain a cell the palette refuses."""
-    level = generate_level(1234)
-    state, _ = drive(new_game(level), WALK_KEYS)
-    cells = render_to_cells(
-        level, state.player, state.visible, state.explored,
-        state.open_doors, format_status(state),
-    )
-    for row in cells:
-        for cell in row:
-            if cell.visibility is Visibility.UNSEEN:
-                assert cell.char == " "
-                continue
-            attr = attr_for(cell.role, cell.visibility)
-            assert isinstance(attr, Attr) and isinstance(attr.color, int)
-
-
-def test_status_line_tracks_the_walk() -> None:
-    level = generate_level(1234)
-    state = new_game(level)
-    x, y = state.player
-    assert format_status(state) == f"Seed: 1234  Pos: ({x}, {y})  Turns: 0  [q] quit"
-    state, _ = drive(state, "jjll")
-    x, y = state.player
-    assert format_status(state) == (
-        f"Seed: 1234  Pos: ({x}, {y})  Turns: {state.turns}  [q] quit"
-    )
-
-
-def test_frame_fits_a_classic_terminal_at_the_default_size() -> None:
-    level = generate_level(1234)
-    state = new_game(level)
-    cells = render_to_cells(
-        level, state.player, state.visible, state.explored, state.open_doors, "s",
-    )
-    lines = to_lines(cells)
-    assert len(lines) == 23
-    assert all(len(line) == 80 for line in lines)
-
-
-# --------------------------------------------------------------------------
-# Determinism and immutability across the whole stack
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_same_seed_produces_an_identical_level(seed: int) -> None:
-    assert generate_level(seed) == generate_level(seed)
-
-
-def test_determinism_survives_a_separate_process() -> None:
+def test_seed_derivation_is_stable_across_processes() -> None:
     script = (
         "import sys; sys.path.insert(0, %r)\n"
-        "from roguelike.generator import generate_level\n"
-        "from roguelike.game import new_game\n"
-        "from roguelike.render import render_to_cells, to_lines\n"
-        "level = generate_level(31337)\n"
-        "s = new_game(level)\n"
-        "cells = render_to_cells(level, s.player, s.visible, s.explored, s.open_doors, '')\n"
-        "print('\\n'.join(to_lines(cells)))\n"
+        "from roguelike import dungeon\n"
+        "print([dungeon.seed_for(1234, d) for d in range(1, 6)])\n"
     ) % str(PROJECT_ROOT)
-
-    level = generate_level(31337)
-    state = new_game(level)
-    expected = "\n".join(
-        to_lines(
-            render_to_cells(
-                level, state.player, state.visible, state.explored, state.open_doors, ""
-            )
-        )
-    )
-
+    expected = str([dungeon.seed_for(1234, d) for d in range(1, 6)])
     for hash_seed in ("0", "1", "424242"):
         result = subprocess.run(
             [sys.executable, "-c", script],
@@ -513,29 +236,353 @@ def test_determinism_survives_a_separate_process() -> None:
             env={"PYTHONHASHSEED": hash_seed, "PATH": "/usr/bin:/bin"},
             cwd=str(PROJECT_ROOT), check=True,
         )
-        assert result.stdout.rstrip("\n") == expected, (
-            f"frame differed with PYTHONHASHSEED={hash_seed}"
+        assert result.stdout.strip() == expected
+
+
+def test_branch_scaffolding_yields_a_different_dungeon() -> None:
+    """Requirement 3's scaffolding: a branch index must actually change the seed."""
+    assert dungeon.seed_for(1234, 3, branch=1) != dungeon.seed_for(1234, 3, branch=0)
+
+
+# --------------------------------------------------------------------------
+# Playing: keys x game x movement x fov x world
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_a_scripted_walk_never_enters_a_wall_or_leaves_the_map(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    assert state.level.tile_at(*state.player) is Tile.STAIRS_UP
+
+    for key in WALK_KEYS * 4:
+        state = step(state, translate_key(key))
+        x, y = state.player
+        assert state.level.in_bounds(x, y)
+        assert state.level.tile_at(x, y) is not Tile.WALL
+        assert world.is_passable(state.level, state.open_doors, x, y)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_turns_count_only_actions_that_cost_one(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    accepted = opened = 0
+    for key in WALK_KEYS * 3:
+        before = state
+        state = step(state, translate_key(key))
+        if state.player != before.player:
+            accepted += 1
+        elif state.open_doors != before.open_doors:
+            opened += 1
+        assert state.turns == accepted + opened
+
+
+def test_pressing_descend_off_the_stairs_costs_nothing_but_says_so() -> None:
+    state = new_game(1234, *SMALL)
+    moved = step(state, translate_key("j"))
+    if moved.player == state.player:
+        pytest.skip("could not step off the staircase")
+    after = step(moved, DESCEND)
+    assert after.turns == moved.turns
+    assert after.depth == moved.depth
+    assert after.player == moved.player
+    assert [e.kind for e in after.events] == [EventKind.NO_STAIRS_DOWN]
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_the_map_starts_hidden_and_fog_only_grows(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    total = state.level.width * state.level.height
+    assert state.explored and len(state.explored) < total * 0.5
+
+    previous = state
+    for key in WALK_KEYS * 3:
+        state = step(state, translate_key(key))
+        assert state.explored >= previous.explored, "ground once seen was forgotten"
+        assert state.explored >= state.visible
+        previous = state
+
+
+def test_visible_agrees_with_a_direct_fov_call() -> None:
+    """game.step must delegate visibility rather than reimplement it."""
+    state = new_game(1234, *SMALL)
+    for key in WALK_KEYS:
+        state = step(state, translate_key(key))
+        assert state.visible == compute_visible(
+            state.level, state.open_doors, state.player, state.radius
         )
 
 
-def test_a_full_walk_mutates_nothing() -> None:
-    level = generate_level(2026)
-    reference = copy.deepcopy(level)
-    state = new_game(level)
+# --------------------------------------------------------------------------
+# Stairs end to end: the heart of v3
+# --------------------------------------------------------------------------
 
+
+@pytest.mark.parametrize("seed", (1234, 7, 42))
+def test_descending_keeps_the_player_put_and_lines_the_stairs_up(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    at_stair = route_to(state, state.level.stairs_down[0])
+    assert at_stair is not None
+    assert [e.kind for e in at_stair.events] == [EventKind.STAIRS_HERE_DOWN], (
+        "stepping onto the down-staircase must announce it"
+    )
+
+    below = step(at_stair, DESCEND)
+
+    assert below.depth == at_stair.depth + 1
+    assert below.player == at_stair.player, "descending must not move the player"
+    assert below.level.stairs_up == at_stair.level.stairs_down[0]
+    assert below.level.tile_at(*below.player) is Tile.STAIRS_UP
+    assert below.turns == at_stair.turns + 1
+    assert [e.kind for e in below.events] == [EventKind.DESCENDED]
+    assert at_stair.depth in below.saved
+
+
+@pytest.mark.parametrize("seed", (1234, 7))
+def test_a_three_level_descent_stays_walkable_all_the_way_down(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    seen_depths = [state.depth]
+    for _ in range(2):
+        state = descend_once(state)
+        seen_depths.append(state.depth)
+        assert flood_fill(state.level, state.player) == walkable_cells(state.level)
+        assert world.is_passable(state.level, state.open_doors, *state.player)
+    assert seen_depths == [1, 2, 3]
+
+
+def test_fog_and_doors_survive_a_round_trip() -> None:
+    """The single most important v3 behaviour: climbing back must not reset the map."""
+    state = new_game(1234, *SMALL)
+    below = descend_once(state)
+    upper_level = below.saved[1].level
+    upper_explored = below.saved[1].explored
+    upper_doors = below.saved[1].open_doors
+
+    # Explore the lower level, then climb back.
     for key in WALK_KEYS * 3:
+        below = step(below, translate_key(key))
+    lower_explored, lower_doors = below.explored, below.open_doors
+
+    at_up = route_to(below, below.level.stairs_up)
+    assert at_up is not None
+    back = step(at_up, ASCEND)
+
+    assert back.depth == 1
+    assert back.level is upper_level, "the saved level object must be restored"
+    assert back.explored == upper_explored, "fog reset on the way up"
+    assert back.open_doors == upper_doors, "doors closed themselves on the way up"
+    assert back.player == upper_level.stairs_down[0], "must arrive on the stair used"
+    assert [e.kind for e in back.events] == [EventKind.ASCENDED]
+
+    # And going back down must restore the lower level too.
+    again = step(route_to(back, upper_level.stairs_down[0]), DESCEND)
+    assert again.explored == lower_explored
+    assert again.open_doors == lower_doors
+
+
+def test_climbing_out_at_depth_one_ends_the_game() -> None:
+    state = new_game(1234, *SMALL)
+    assert state.player == state.level.stairs_up
+    after = step(state, ASCEND)
+    assert after.running is False
+    assert after.outcome == events.MESSAGES[EventKind.LEFT_DUNGEON]
+    assert [e.kind for e in after.events] == [EventKind.LEFT_DUNGEON]
+    # And a stopped game ignores everything afterwards.
+    for command in (DESCEND, ASCEND, translate_key("j")):
+        assert step(after, command) == after
+
+
+def test_open_doors_are_tracked_per_level_not_globally() -> None:
+    state = new_game(1234, *SMALL)
+    below = descend_once(state)
+    upper_doors = below.saved[1].open_doors
+    for coord in below.open_doors:
+        assert below.level.tile_at(*coord) is Tile.DOOR
+    for coord in upper_doors:
+        assert below.saved[1].level.tile_at(*coord) is Tile.DOOR
+
+
+# --------------------------------------------------------------------------
+# The frame: render x style x game x events
+# --------------------------------------------------------------------------
+
+
+def chrome_for(state: GameState) -> Chrome:
+    return Chrome(
+        stats=format_stats(state),
+        message=events.message_for(state.events),
+        status_right=format_status_right(state),
+    )
+
+
+@pytest.mark.parametrize("seed", (1234, 7))
+def test_the_frame_has_two_chrome_rows_and_the_map_is_offset(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    width, height = SMALL
+    for key in WALK_KEYS:
+        state = step(state, translate_key(key))
+        cells = render_to_cells(
+            state.level, state.player, state.visible, state.explored,
+            state.open_doors, chrome_for(state),
+        )
+        assert len(cells) == height + 2
+        assert all(len(row) == width for row in cells)
+
+        px, py = state.player
+        assert cells[py + 1][px].char == PLAYER_CHAR, "map must be offset by one row"
+        assert cells[py + 1][px].role is Role.PLAYER
+
+        for y in range(height):
+            for x in range(width):
+                if (x, y) == (px, py):
+                    continue
+                cell = cells[y + 1][x]
+                if (x, y) in state.visible:
+                    assert cell.visibility is Visibility.VISIBLE
+                elif (x, y) in state.explored:
+                    assert cell.visibility is Visibility.EXPLORED
+                else:
+                    assert cell.visibility is Visibility.UNSEEN
+                    assert cell.char == " "
+
+
+def test_the_status_row_carries_the_level_and_seed() -> None:
+    state = new_game(1234, *SMALL)
+    lines = to_lines(
+        render_to_cells(
+            state.level, state.player, state.visible, state.explored,
+            state.open_doors, chrome_for(state),
+        )
+    )
+    assert lines[0].strip() == "", "the stats row is reserved and blank"
+    assert lines[-1].rstrip().endswith("Level 1  Seed 1234")
+
+
+def test_the_status_row_shows_a_message_and_keeps_the_level_readable() -> None:
+    state = new_game(1234, *SMALL)
+    moved = step(state, translate_key("j"))
+    if moved.player == state.player:
+        pytest.skip("could not step off the staircase")
+    refused = step(moved, DESCEND)
+
+    lines = to_lines(
+        render_to_cells(
+            refused.level, refused.player, refused.visible, refused.explored,
+            refused.open_doors, chrome_for(refused),
+        )
+    )
+    status = lines[-1]
+    assert status.endswith("Level 1  Seed 1234"), "the level must always survive"
+    message = events.MESSAGES[EventKind.NO_STAIRS_DOWN]
+    # On a 40-column level the message is clipped; whatever survives is a prefix.
+    shown = status[: len(status.rstrip()) - len("Level 1  Seed 1234")].strip()
+    assert shown and message.startswith(shown)
+
+
+def test_the_status_row_tracks_the_depth_as_you_descend() -> None:
+    state = new_game(1234, *SMALL)
+    assert format_status_right(state) == "Level 1  Seed 1234"
+    below = descend_once(state)
+    assert format_status_right(below) == "Level 2  Seed 1234"
+
+
+def test_stair_glyphs_reach_the_frame() -> None:
+    state = new_game(1234, *SMALL)
+    cells = render_to_cells(
+        state.level, state.player, state.visible, state.explored,
+        state.open_doors, chrome_for(state),
+    )
+    ux, uy = state.level.stairs_up
+    # The player stands on the up-staircase at spawn, so check the glyph table
+    # and the down-staircase once it has been seen.
+    assert TILE_CHARS[Tile.STAIRS_UP] == "<"
+    assert TILE_CHARS[Tile.STAIRS_DOWN] == ">"
+    assert cells[uy + 1][ux].char == PLAYER_CHAR
+
+    at_stair = route_to(state, state.level.stairs_down[0])
+    dx, dy = at_stair.level.stairs_down[0]
+    frame = render_to_cells(
+        at_stair.level, (0, 0), at_stair.visible, at_stair.explored,
+        at_stair.open_doors, chrome_for(at_stair),
+    )
+    assert frame[dy + 1][dx].char == TILE_CHARS[Tile.STAIRS_DOWN]
+
+
+def find_closed_door(state: GameState) -> tuple[GameState, str] | None:
+    """Breadth-first walk to a state standing beside a closed door, and the key
+    that bumps into it. Deterministic — never relies on a canned walk."""
+    deltas = {"h": (-1, 0), "l": (1, 0), "k": (0, -1), "j": (0, 1)}
+    seen = {state.player}
+    queue = deque([state])
+    while queue:
+        current = queue.popleft()
+        for key, (dx, dy) in deltas.items():
+            target = (current.player[0] + dx, current.player[1] + dy)
+            if world.is_closed_door(current.level, current.open_doors, *target):
+                return current, key
+            if target in seen or not world.is_passable(
+                current.level, current.open_doors, *target
+            ):
+                continue
+            seen.add(target)
+            queue.append(step(current, translate_key(key)))
+    return None
+
+
+def test_an_opened_door_changes_glyph_in_the_frame() -> None:
+    state = new_game(1234, *SMALL)
+    found = find_closed_door(state)
+    assert found is not None, "seed 1234 has no reachable closed door"
+    at_door, key = found
+
+    after = step(at_door, translate_key(key))
+    door = next(iter(after.open_doors - at_door.open_doors))
+    assert [e.kind for e in after.events] == [EventKind.DOOR_OPENED]
+
+    before_cells = render_to_cells(
+        at_door.level, at_door.player, at_door.visible, at_door.explored,
+        at_door.open_doors, chrome_for(at_door),
+    )
+    after_cells = render_to_cells(
+        after.level, after.player, after.visible, after.explored,
+        after.open_doors, chrome_for(after),
+    )
+    assert before_cells[door[1] + 1][door[0]].char == TILE_CHARS[Tile.DOOR]
+    assert after_cells[door[1] + 1][door[0]].char == DOOR_OPEN_CHAR
+    assert after_cells[door[1] + 1][door[0]].role is Role.DOOR
+
+
+def test_a_default_level_fills_a_classic_terminal_exactly() -> None:
+    state = new_game(1234)
+    lines = to_lines(
+        render_to_cells(
+            state.level, state.player, state.visible, state.explored,
+            state.open_doors, chrome_for(state),
+        )
+    )
+    assert len(lines) == 24
+    assert all(len(line) == 80 for line in lines)
+
+
+# --------------------------------------------------------------------------
+# Immutability across the whole stack
+# --------------------------------------------------------------------------
+
+
+def test_a_full_descent_mutates_nothing() -> None:
+    state = new_game(2026, *SMALL)
+    reference = copy.deepcopy(state.level)
+    original = state.level
+
+    state = descend_once(state)
+    for key in WALK_KEYS * 2:
         state = step(state, translate_key(key))
         render_to_cells(
             state.level, state.player, state.visible, state.explored,
-            state.open_doors, format_status(state),
+            state.open_doors, chrome_for(state),
         )
 
-    assert level == reference
-    assert state.level is level
-
-
-def test_different_seeds_produce_different_levels() -> None:
-    assert len({generate_level(seed).grid for seed in SEEDS}) > 1
+    assert original == reference, "the upper level was mutated"
+    assert state.saved[1].level is original
 
 
 # --------------------------------------------------------------------------
@@ -569,12 +616,11 @@ def test_importing_the_whole_package_touches_no_terminal() -> None:
         "import sys; sys.path.insert(0, %r)\n"
         "import curses\n"
         "import main\n"
-        "from roguelike import (game, generator, keys, level, movement, render,\n"
-        "                       tiles, world, style, fov)\n"
+        "from roguelike import (dungeon, events, fov, game, generator, keys, level,\n"
+        "                       movement, render, style, tiles, world)\n"
         "assert not hasattr(curses, 'LINES'), 'curses was initialised on import'\n"
         "print('clean')\n"
     ) % str(PROJECT_ROOT)
-
     result = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True,
         cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL, check=True,

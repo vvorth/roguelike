@@ -1,12 +1,13 @@
-"""Rendering — a pure frame builder plus a dumb curses blitter (CONTRACT-v2 §4).
+"""Rendering — a pure frame builder plus a dumb curses blitter (CONTRACT-v3 §4).
 
-Two layers, unchanged in spirit from v1 but now colour- and fog-of-war-aware:
+Two layers, unchanged in spirit from v1/v2 but now with a chrome frame (a reserved stats
+row and a two-part status row) wrapped around the map:
 
 1. :func:`render_to_cells` is **pure**. It turns a :class:`~roguelike.level.Level`, a
-   player position, three visibility frozensets and a status string into a frame of
-   styled :class:`Cell` objects. It carries all of the layout logic and all of the
-   visibility logic, touches no global state, performs no I/O and never uses ``curses``.
-   :func:`to_lines` is a thin plain-text view over that frame, also pure.
+   player position, three visibility frozensets and a :class:`Chrome` of already-composed
+   text into a frame of styled :class:`Cell` objects. It carries all of the layout logic
+   and all of the visibility logic, touches no global state, performs no I/O and never
+   uses ``curses``. :func:`to_lines` is a thin plain-text view over that frame, also pure.
 2. :func:`init_colors` and :func:`draw` are the only curses in this module. ``draw`` is
    a blitter with no layout logic and no visibility logic of its own: it reads the
    attribute chosen once by :func:`init_colors` for each ``(Role, Visibility)`` pair and
@@ -17,21 +18,29 @@ the top-left; ``y`` grows down (CONTRACT §0.1). ``curses`` wants ``(y, x)``, an
 :func:`draw` is the single place in the whole codebase where that inverted ordering is
 allowed to appear — it is confined to ``getmaxyx``/``addstr`` at the bottom of this file.
 
+**The map is no longer at row 0 (CONTRACT-v3 §0.8).** The frame now reserves row ``0`` for
+:attr:`Chrome.stats` and its last row for the status line, so map cell ``(x, y)`` lands at
+``cells[y + 1][x]``. That ``+1`` exists in exactly this function and nowhere else in the
+codebase — game logic, FOV, movement and the generator never index the frame.
+
 Fog of war (CONTRACT-v2 BRIEF): a map cell is drawn in its natural colour when currently
 ``visible``, a darker shade of that colour when merely ``explored``, and not drawn at all
 — a blank space, not a dimmed glyph — when neither, so the player cannot infer the map
 shape from unexplored area.
 
 Glyphs are never spelled out here: they come from :data:`roguelike.tiles.TILE_CHARS`,
-:data:`roguelike.tiles.PLAYER_CHAR` and :data:`roguelike.tiles.DOOR_OPEN_CHAR`. Colours
-are never spelled out here either: they come from :func:`roguelike.style.attr_for`.
+:data:`roguelike.tiles.PLAYER_CHAR` and :data:`roguelike.tiles.DOOR_OPEN_CHAR` — including
+the stair glyphs, which need no special handling here since they are just another
+``TILE_CHARS`` entry. Colours are never spelled out here either: they come from
+:func:`roguelike.style.attr_for`.
 
 ``curses`` is imported for :class:`curses.error` and its attribute/colour constants;
 nothing in this module calls a terminal-mutating curses function at import time, and only
 :func:`init_colors`/:func:`draw` call curses at all, and only once already-initialised by
 their caller (CONTRACT §0.3). Imports from :mod:`roguelike` are limited to
-:mod:`roguelike.tiles`, :mod:`roguelike.level` and :mod:`roguelike.style` (CONTRACT-v2
-§10).
+:mod:`roguelike.tiles`, :mod:`roguelike.level` and :mod:`roguelike.style` (CONTRACT-v3
+§10). This module never imports ``events``, ``fov``, ``game``, ``generator``, ``movement``
+or ``keys`` — it receives finished strings via :class:`Chrome`, never events or game state.
 """
 
 from __future__ import annotations
@@ -43,7 +52,7 @@ from roguelike.level import Level
 from roguelike.style import Role, Visibility, attr_for, role_for
 from roguelike.tiles import DOOR_OPEN_CHAR, PLAYER_CHAR, TILE_CHARS
 
-__all__ = ["Cell", "render_to_cells", "to_lines", "init_colors", "draw"]
+__all__ = ["Cell", "Chrome", "render_to_cells", "to_lines", "init_colors", "draw"]
 
 
 @dataclass(frozen=True)
@@ -55,13 +64,56 @@ class Cell:
     visibility: Visibility
 
 
+@dataclass(frozen=True)
+class Chrome:
+    """Finished, already-worded UI text for the frame around the map (CONTRACT-v3 §4).
+
+    The renderer never formats wording — it just lays these three finished strings out.
+
+    Attributes:
+        stats: top row, reserved for player stats that do not exist yet. Blank for now.
+        message: bottom row, left-aligned — the current event message.
+        status_right: bottom row, right-aligned — e.g. the level and seed. Always wins
+            over ``message`` when the two would collide (§4.2).
+    """
+
+    stats: str = ""
+    message: str = ""
+    status_right: str = ""
+
+
+def _chrome_row(text: str, width: int) -> list[Cell]:
+    """Pad/truncate ``text`` to exactly ``width`` and wrap it as a terrain/visible row."""
+    padded = text[:width].ljust(width)
+    return [Cell(ch, Role.TERRAIN, Visibility.VISIBLE) for ch in padded]
+
+
+def _compose_status_row(message: str, status_right: str, width: int) -> str:
+    """Compose the status row text per CONTRACT-v3 §4.2.
+
+    ``status_right`` always wins: if it alone is ``>= width`` it is truncated to ``width``
+    and ``message`` is dropped entirely. Otherwise, if ``message`` plus a single
+    separating space plus ``status_right`` fit, both appear in full with ``status_right``
+    flush right. Otherwise ``message`` is truncated (never below zero length) so that
+    ``status_right`` survives intact and flush right.
+    """
+    if len(status_right) >= width:
+        return status_right[:width]
+
+    if len(message) + 1 + len(status_right) > width:
+        message = message[: max(0, width - len(status_right) - 1)]
+
+    pad = width - len(message) - len(status_right)
+    return message + " " * pad + status_right
+
+
 def render_to_cells(
     level: Level,
     player_pos: tuple[int, int],
     visible: frozenset[tuple[int, int]],
     explored: frozenset[tuple[int, int]],
     open_doors: frozenset[tuple[int, int]],
-    status: str,
+    chrome: Chrome,
 ) -> list[list[Cell]]:
     """Render one frame as a grid of styled :class:`Cell`. Pure.
 
@@ -73,24 +125,29 @@ def render_to_cells(
             both.
         explored: coordinates seen before but not currently in view.
         open_doors: coordinates of currently-open doors, used to pick the door glyph.
-        status: the status bar text, already composed by the caller.
+        chrome: already-composed UI text for the stats row and the status row (§4).
 
     Returns:
-        Exactly ``level.height + 1`` rows of exactly ``level.width`` :class:`Cell` each —
-        the map, then one status row.
+        Exactly ``level.height + 2`` rows of exactly ``level.width`` :class:`Cell` each:
+        the reserved stats row, then the map — cell ``(x, y)`` at ``cells[y + 1][x]``
+        (§0.8) — then the status row.
 
     Visibility precedence per map cell: ``visible`` beats ``explored`` beats unseen.
     An unseen cell is blank (``char == " "``, ``role == Role.TERRAIN``) — the map shape
     must never leak through unexplored area. The player glyph overrides whatever tile it
-    stands on, drawn on a wall exactly as readily as on a floor.
+    stands on, drawn on a wall exactly as readily as on a floor. Both chrome rows are
+    ``Role.TERRAIN``, ``Visibility.VISIBLE`` in every cell.
 
-    None of ``level``, ``player_pos``, ``visible``, ``explored`` or ``open_doors`` is
-    mutated; a fresh grid of fresh ``Cell``s is returned each call.
+    None of ``level``, ``player_pos``, ``visible``, ``explored``, ``open_doors`` or
+    ``chrome`` is mutated; a fresh grid of fresh ``Cell``s is returned each call.
     """
-    rows: list[list[Cell]] = []
+    width = level.width
+
+    rows: list[list[Cell]] = [_chrome_row(chrome.stats, width)]
+
     for y in range(level.height):
         row: list[Cell] = []
-        for x in range(level.width):
+        for x in range(width):
             coord = (x, y)
             if coord in visible:
                 visibility = Visibility.VISIBLE
@@ -111,10 +168,10 @@ def render_to_cells(
 
     player_x, player_y = player_pos
     if level.in_bounds(player_x, player_y):
-        rows[player_y][player_x] = Cell(PLAYER_CHAR, Role.PLAYER, Visibility.VISIBLE)
+        rows[player_y + 1][player_x] = Cell(PLAYER_CHAR, Role.PLAYER, Visibility.VISIBLE)
 
-    status_text = status[: level.width].ljust(level.width)
-    rows.append([Cell(ch, Role.TERRAIN, Visibility.VISIBLE) for ch in status_text])
+    status_text = _compose_status_row(chrome.message, chrome.status_right, width)
+    rows.append(_chrome_row(status_text, width))
 
     return rows
 

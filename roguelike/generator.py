@@ -28,6 +28,25 @@ thread *through* an intervening room (entering by one door, leaving by another).
 that cannot be reached at all is dropped from the level rather than left stranded —
 ``max_rooms`` is a ceiling, not a target, and G4 only requires one room.
 
+**The anchor room (CONTRACT-v3 §3.2)**: when ``required_up`` is given, a room whose floor
+rectangle contains that coordinate **strictly inside** — never on a floor edge — is placed
+**before any other room**, as ``rooms[0]``. Every later candidate is then rejected against
+it by the ordinary ``margin=1`` test, so nothing is ever carved, reshaped or repaired after
+the fact and no door can be orphaned. Being ``rooms[0]`` also makes the anchor the seed of
+the connectivity component, which the router never drops — so the required coordinate
+cannot vanish from the level. Requirements 8 and 9 of the brief are therefore not
+implemented: there is nothing to repair.
+
+**Stairs**: both staircases are stamped over *open spots* — walkable non-door cells whose
+eight neighbours are all non-``WALL``, out of bounds counting as ``WALL`` (§3.1). Because
+every room is at least ``MIN_ROOM_SIZE`` x ``MIN_ROOM_SIZE`` and a room's wall ring is
+unbroken except at doors (which are never diagonally adjacent to an interior cell), a
+room's open spots are exactly its floor rectangle shrunk by one cell on every side — at
+least four cells per room. That is what makes both G13 and G16 unconditional rather than
+lucky, and it is also the proof that the anchor always fits: an open spot satisfies
+``2 <= x <= width - 3`` and ``2 <= y <= height - 3``, so a room whose interior contains it
+always fits inside the map margins.
+
 **Doors**: a door is a wall-ring cell ``D`` of room ``R``, never a ring corner, whose
 inward neighbour is ``R``'s floor and whose outward neighbour — the *mouth* — is a free
 cell that the corridor occupies. The two cells flanking ``D`` along the wall lie in ``R``'s
@@ -53,7 +72,7 @@ from __future__ import annotations
 import random
 
 from roguelike.level import Level, Room, blank_grid, freeze_grid
-from roguelike.tiles import Tile
+from roguelike.tiles import STAIRS, WALKABLE, Tile
 
 __all__ = [
     "DEFAULT_WIDTH",
@@ -97,23 +116,39 @@ def generate_level(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     max_rooms: int = 12,
+    depth: int = 1,
+    required_up: tuple[int, int] | None = None,
 ) -> Level:
     """Generate a fully connected dungeon level deterministically from ``seed``.
 
     ``max_rooms`` is a ceiling, not a target — the level may contain fewer rooms if the
     map filled up or a candidate room could not be reached, but never zero (G4).
 
+    ``depth`` is recorded on the level and is otherwise inert here (G19); this function
+    knows nothing about descent, seed derivation or what lives on a deeper floor.
+
+    ``required_up`` forces the up-staircase to an exact coordinate — the cell the player
+    descended from on the level above — by placing the *anchor room* around it before any
+    other room (CONTRACT-v3 §3.2). When it is ``None`` the up-staircase is drawn from the
+    level's own RNG over every open spot (G20), not fixed to a corner or a room centre.
+
     Raises:
-        TypeError: if ``seed`` is not an ``int`` or is a ``bool``, or if ``width``,
-            ``height`` or ``max_rooms`` is not an ``int``.
-        ValueError: if ``max_rooms < 1``, or if ``width`` or ``height`` is too small to
-            hold a single ``MIN_ROOM_SIZE`` room with its wall margin.
+        TypeError: if ``seed`` is not an ``int`` or is a ``bool``; if ``width``,
+            ``height``, ``max_rooms`` or ``depth`` is not an ``int``; or if
+            ``required_up`` is neither ``None`` nor a 2-tuple of ``int``.
+        ValueError: if ``max_rooms < 1``; if ``depth < 1``; if ``width`` or ``height`` is
+            too small to hold a single ``MIN_ROOM_SIZE`` room with its wall margin; or if
+            ``required_up`` lies outside the anchorable range
+            ``2 <= x <= width - 3``, ``2 <= y <= height - 3``.
     """
-    _validate_arguments(seed, width, height, max_rooms)
+    _validate_arguments(seed, width, height, max_rooms, depth, required_up)
 
     rng = random.Random(seed)
 
-    rooms, doors, corridor = _lay_out(rng, width, height, max_rooms)
+    # The anchor goes in first, before any other room, and is never reshaped afterwards.
+    anchor = None if required_up is None else _anchor_room(rng, required_up, width, height)
+
+    rooms, doors, corridor = _lay_out(rng, width, height, max_rooms, anchor)
 
     grid = blank_grid(width, height, Tile.WALL)
     for room in rooms:
@@ -123,15 +158,22 @@ def generate_level(
     for x, y in doors:
         grid[y][x] = Tile.DOOR
 
+    stairs_up, stairs_down = _place_stairs(rng, grid, rooms, width, height, required_up)
+    grid[stairs_up[1]][stairs_up[0]] = Tile.STAIRS_UP
+    grid[stairs_down[1]][stairs_down[0]] = Tile.STAIRS_DOWN
+
     level = Level(
         width,
         height,
         freeze_grid(grid),
         tuple(rooms),
-        rooms[0].center,
+        stairs_up,  # player_start — the spawn *is* the up-staircase (G17)
         seed,
+        stairs_up,
+        (stairs_down,),
+        depth,
     )
-    _assert_guarantees(level)
+    _assert_guarantees(level, depth, required_up)
     return level
 
 
@@ -141,22 +183,44 @@ def generate_level(
 
 
 def _validate_arguments(
-    seed: object, width: object, height: object, max_rooms: object
+    seed: object,
+    width: object,
+    height: object,
+    max_rooms: object,
+    depth: object,
+    required_up: object,
 ) -> None:
-    """Enforce the §3.1 error table. ``bool`` is an ``int`` subclass, so ``seed`` needs an
-    explicit rejection; the contract asks for that only on ``seed``."""
+    """Enforce the §3.1 (v1) and §3.4 (v3) error tables.
+
+    Every ``TypeError`` is raised before any ``ValueError``, which is the v1 precedence
+    rule. ``bool`` is an ``int`` subclass, so ``seed`` needs an explicit rejection; the
+    contract asks for that only on ``seed``.
+    """
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError(f"seed must be an int, got {type(seed).__name__}")
     for name, value in (
         ("width", width),
         ("height", height),
         ("max_rooms", max_rooms),
+        ("depth", depth),
     ):
         if not isinstance(value, int):
             raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if required_up is not None:
+        if not isinstance(required_up, tuple) or len(required_up) != 2:
+            raise TypeError(
+                f"required_up must be None or a 2-tuple of int, got {required_up!r}"
+            )
+        if not all(isinstance(value, int) for value in required_up):
+            raise TypeError(
+                f"required_up must be None or a 2-tuple of int, got {required_up!r}"
+            )
 
     if max_rooms < 1:  # type: ignore[operator]
         raise ValueError(f"max_rooms must be >= 1, got {max_rooms}")
+
+    if depth < 1:  # type: ignore[operator]
+        raise ValueError(f"depth must be >= 1, got {depth}")
 
     minimum = MIN_ROOM_SIZE + 2
     if width < minimum:  # type: ignore[operator]
@@ -170,24 +234,79 @@ def _validate_arguments(
             f"with its wall margin, got {height}"
         )
 
+    if required_up is not None:
+        # The anchorable range (§3.4). It is exactly the set of cells a room interior can
+        # cover, and every open spot on a generated level already satisfies it, so an
+        # honest descent never trips this — a hand-written coordinate can.
+        x, y = required_up
+        max_x = width - 3  # type: ignore[operator]
+        max_y = height - 3  # type: ignore[operator]
+        if not (2 <= x <= max_x) or not (2 <= y <= max_y):
+            raise ValueError(
+                f"required_up {required_up!r} is not anchorable on a "
+                f"{width}x{height} map: need 2 <= x <= {max_x} "
+                f"and 2 <= y <= {max_y}"
+            )
+
 
 # --------------------------------------------------------------------------------------
 # Room placement
 # --------------------------------------------------------------------------------------
 
 
+def _anchor_room(
+    rng: random.Random, required_up: tuple[int, int], width: int, height: int
+) -> Room:
+    """Build the room that must hold ``required_up`` **strictly inside its floor rect**.
+
+    Sizing is drawn from the same distribution as an ordinary room, so the anchor is not
+    visually distinguishable; only its *position* is constrained, and only enough to put
+    the required cell one step inside every floor edge. That is what makes the cell an
+    open spot: all eight of its neighbours are floor of this same room.
+
+    Writing ``(rx, ry)`` for ``required_up`` and ``w`` for the drawn floor width, the
+    legal left edges are ``max(1, rx + 2 - w) <= x <= min(rx - 1, width - 1 - w)``:
+
+    * ``x >= 1`` and ``x2 <= width - 2`` are G6;
+    * ``x <= rx - 1`` and ``x2 >= rx + 1`` put ``rx`` strictly inside.
+
+    That interval is **never empty**. Its four ordering conditions reduce to ``rx >= 2``,
+    ``w <= width - 2``, ``w >= 3`` and ``rx <= width - 3`` — the first and last are the
+    anchorable range validated in :func:`_validate_arguments`, and the middle two hold for
+    every drawn size because ``MIN_ROOM_SIZE >= 3`` and the draw is capped at
+    ``width - 2``. The vertical axis is the same argument transposed. So the anchor is
+    always constructible and never needs a retry, a fallback, or a repair pass.
+    """
+    rx, ry = required_up
+    room_width = rng.randint(MIN_ROOM_SIZE, min(MAX_ROOM_SIZE, width - 2))
+    room_height = rng.randint(MIN_ROOM_SIZE, min(MAX_ROOM_SIZE, height - 2))
+    x = rng.randint(max(1, rx + 2 - room_width), min(rx - 1, width - 1 - room_width))
+    y = rng.randint(max(1, ry + 2 - room_height), min(ry - 1, height - 1 - room_height))
+    return Room(x, y, room_width, room_height)
+
+
 def _place_rooms(
-    rng: random.Random, width: int, height: int, max_rooms: int
+    rng: random.Random,
+    width: int,
+    height: int,
+    max_rooms: int,
+    anchor: Room | None = None,
 ) -> list[Room]:
     """Draw candidate rectangles and keep the ones that fit, in placement order.
 
     Every candidate already satisfies G6 by construction; G5 is enforced by rejection.
     The first candidate is always accepted, so the result is never empty.
+
+    ``anchor`` — when given — is seeded into the list **first**, so every later candidate
+    is rejected against it by the same ``margin=1`` test as any other placed room. It also
+    lands at index 0, which is the room the corridor router treats as the root of the
+    connected component and therefore never drops. It counts against ``max_rooms``, which
+    stays a ceiling on ``len(level.rooms)``.
     """
     max_room_width = min(MAX_ROOM_SIZE, width - 2)
     max_room_height = min(MAX_ROOM_SIZE, height - 2)
 
-    rooms: list[Room] = []
+    rooms: list[Room] = [] if anchor is None else [anchor]
     for _ in range(max_rooms * _ATTEMPTS_PER_ROOM):
         if len(rooms) >= max_rooms:
             break
@@ -207,7 +326,11 @@ def _place_rooms(
 
 
 def _lay_out(
-    rng: random.Random, width: int, height: int, max_rooms: int
+    rng: random.Random,
+    width: int,
+    height: int,
+    max_rooms: int,
+    anchor: Room | None = None,
 ) -> tuple[list[Room], list[tuple[int, int]], list[tuple[int, int]]]:
     """Draw a room layout and route it, redrawing while any room comes out stranded.
 
@@ -218,10 +341,16 @@ def _lay_out(
     simply a worse layout — so redraw and keep the best one seen. On the default 80x22 the
     first draw succeeds for all but roughly one seed in a hundred; the retries matter on
     maps so thin that every room's ring spans the short axis.
+
+    ``anchor`` is drawn once, before this function, and reused unchanged by every attempt:
+    it is the one room whose position is not the layout's to choose, and re-rolling it per
+    attempt would only waste RNG draws. It is always ``placed[0]``, which the router marks
+    connected from the start and so can never drop — that is what keeps G14 true no matter
+    which attempt wins.
     """
     best: tuple[list[Room], list[tuple[int, int]], list[tuple[int, int]]] | None = None
     for _ in range(_LAYOUT_ATTEMPTS):
-        placed = _place_rooms(rng, width, height, max_rooms)
+        placed = _place_rooms(rng, width, height, max_rooms, anchor)
         layout = _plan_corridors(rng, placed, width, height)
         if best is None or len(layout[0]) > len(best[0]):
             best = layout
@@ -237,6 +366,107 @@ def _carve_room_floor(grid: list[list[Tile]], room: Room) -> None:
         row = grid[y]
         for x in range(room.x, room.x2 + 1):
             row[x] = Tile.FLOOR
+
+
+# --------------------------------------------------------------------------------------
+# Stairs (CONTRACT-v3 §3.1, G13-G18, G20)
+# --------------------------------------------------------------------------------------
+
+
+def _is_open_spot(grid: list[list[Tile]], width: int, height: int, x: int, y: int) -> bool:
+    """Return ``True`` iff ``(x, y)`` is an **open spot** (CONTRACT-v3 §3.1).
+
+    That is: walkable, not a door, and all eight neighbours non-``WALL``, with
+    out-of-bounds neighbours counting as ``WALL``. This is requirement 1's "at least one
+    tile away from any wall".
+    """
+    if not (0 <= x < width and 0 <= y < height):
+        return False
+    tile = grid[y][x]
+    if tile is Tile.DOOR or tile not in WALKABLE:
+        return False
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height):
+                return False
+            if grid[ny][nx] is Tile.WALL:
+                return False
+    return True
+
+
+def _open_spots_by_room(
+    grid: list[list[Tile]], rooms: list[Room], width: int, height: int
+) -> list[tuple[tuple[int, int], int]]:
+    """Every in-room open spot as ``((x, y), room index)``, rooms in order, cells in
+    row-major order within a room.
+
+    Only *in-room* spots are offered to the stair chooser, because G10 requires
+    ``player_start`` — which G17 makes the up-staircase — to lie inside a room's floor
+    rect. A corridor cell can in principle be an open spot (two corridors merging into a
+    3-wide blob), and is a perfectly legal ``required_up``; it is simply not something the
+    generator will *choose*.
+
+    The list is never empty: every room's floor is at least ``MIN_ROOM_SIZE`` (4) on both
+    axes, and every cell one step inside a room's floor edge has all eight neighbours
+    inside that same floor rect, hence non-``WALL``. So each room contributes at least
+    ``2 x 2 = 4`` spots — which is also why the two stairs can always be distinct (G16)
+    and, on a multi-room level, always sit in different rooms.
+
+    Iteration is over lists and ranges only; no set or dict order reaches the output.
+    """
+    spots: list[tuple[tuple[int, int], int]] = []
+    for index, room in enumerate(rooms):
+        for y in range(room.y + 1, room.y2):
+            for x in range(room.x + 1, room.x2):
+                if _is_open_spot(grid, width, height, x, y):
+                    spots.append(((x, y), index))
+    return spots
+
+
+def _place_stairs(
+    rng: random.Random,
+    grid: list[list[Tile]],
+    rooms: list[Room],
+    width: int,
+    height: int,
+    required_up: tuple[int, int] | None,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Choose ``(stairs_up, stairs_down)``. Nothing is written to ``grid`` here.
+
+    The up-staircase is ``required_up`` when given (G14) — by construction it is strictly
+    inside the anchor room, hence an open spot — and otherwise a uniform RNG draw over the
+    open spots (G20), which is what replaces v2's fixed ``rooms[0].center`` spawn.
+
+    The down-staircase is drawn from the open spots of a *different* room whenever the
+    level has more than one (G16), so the player must cross the level to descend; on a
+    single-room level it is any other open spot of that room.
+    """
+    spots = _open_spots_by_room(grid, rooms, width, height)
+    if not spots:  # pragma: no cover - every room contributes at least four spots
+        raise RuntimeError("no open spot available for a staircase")
+
+    if required_up is None:
+        stairs_up, up_room = spots[rng.randrange(len(spots))]
+    else:
+        stairs_up = required_up
+        matches = [index for cell, index in spots if cell == stairs_up]
+        if not matches:  # pragma: no cover - the anchor room guarantees a match
+            raise RuntimeError(
+                f"required_up {required_up!r} did not land on an open spot"
+            )
+        up_room = matches[0]
+
+    if len(rooms) > 1:
+        candidates = [cell for cell, index in spots if index != up_room]
+    else:
+        candidates = [cell for cell, _ in spots if cell != stairs_up]
+    if not candidates:  # pragma: no cover - see _open_spots_by_room
+        raise RuntimeError("no second open spot available for the down-staircase")
+
+    return stairs_up, candidates[rng.randrange(len(candidates))]
 
 
 # --------------------------------------------------------------------------------------
@@ -482,10 +712,28 @@ def _is_wall(level: Level, x: int, y: int) -> bool:
     return level.tile_at(x, y) is Tile.WALL
 
 
-def _assert_guarantees(level: Level) -> None:
-    """Re-derive G3-G10 plus G9a-G9d and G4a from the finished ``Level`` and raise rather
-    than return a level that breaks any of them (CONTRACT §3: "Never returns a ``Level``
-    violating G1-G12"; CONTRACT-v2 §3 replaces G9 and adds G4a).
+def _level_is_open_spot(level: Level, x: int, y: int) -> bool:
+    """:func:`_is_open_spot` against a finished ``Level`` (CONTRACT-v3 §3.1)."""
+    if not level.in_bounds(x, y):
+        return False
+    tile = level.tile_at(x, y)
+    if tile is Tile.DOOR or tile not in WALKABLE:
+        return False
+    return not any(
+        _is_wall(level, x + dx, y + dy)
+        for dy in (-1, 0, 1)
+        for dx in (-1, 0, 1)
+        if dx or dy
+    )
+
+
+def _assert_guarantees(
+    level: Level, depth: int, required_up: tuple[int, int] | None
+) -> None:
+    """Re-derive G3-G10 plus G9a-G9d, G4a and G13-G20 from the finished ``Level`` and
+    raise rather than return a level that breaks any of them (CONTRACT §3: "Never returns
+    a ``Level`` violating G1-G12"; CONTRACT-v2 §3 replaces G9 and adds G4a; CONTRACT-v3
+    §3.3 amends G7 and adds G13-G20).
 
     G1/G2 are properties of the code, G11/G12 of the constructor arguments; the rest are
     properties of the output and are cheap enough to verify every time.
@@ -512,12 +760,16 @@ def _assert_guarantees(level: Level) -> None:
                 raise RuntimeError(f"G5 violated: {room} intersects {other}")
         if room.x < 1 or room.y < 1 or room.x2 > width - 2 or room.y2 > height - 2:
             raise RuntimeError(f"G6 violated: {room} escapes the wall margin")
-        for y in range(room.y, room.y2 + 1):  # G7
+        for y in range(room.y, room.y2 + 1):  # G7, as amended by CONTRACT-v3 §3.3
             for x in range(room.x, room.x2 + 1):
-                if level.tile_at(x, y) is not Tile.FLOOR:
-                    raise RuntimeError(f"G7 violated: ({x}, {y}) in {room} is not FLOOR")
+                tile = level.tile_at(x, y)
+                if tile is not Tile.FLOOR and tile not in STAIRS:
+                    raise RuntimeError(
+                        f"G7 violated: ({x}, {y}) in {room} is neither FLOOR nor a stair"
+                    )
 
     _assert_doors(level)
+    _assert_stairs(level, depth, required_up)
 
     if not any(room.contains(*level.player_start) for room in rooms) or not (
         level.is_walkable(*level.player_start)
@@ -534,6 +786,72 @@ def _assert_guarantees(level: Level) -> None:
     if len(reached) != walkable:
         raise RuntimeError(
             f"G8 violated: flood fill reached {len(reached)} of {walkable} walkable cells"
+        )
+
+
+def _assert_stairs(
+    level: Level, depth: int, required_up: tuple[int, int] | None
+) -> None:
+    """Check G13-G20 (CONTRACT-v3 §3.3).
+
+    G8 is *not* rechecked here — :func:`_assert_guarantees` floods from
+    ``level.player_start``, which G17 pins to the up-staircase, so the one flood fill
+    covers both the v1 guarantee and v3's "reachable from the up-stair" reading. Stamping
+    a stair does not change walkability (both stair tiles are in ``WALKABLE``), so the
+    walkable set is exactly what it was before the stairs went down.
+    """
+    if len(level.stairs_down) != 1:  # G15
+        raise RuntimeError(
+            f"G15 violated: {len(level.stairs_down)} down-staircases, expected 1"
+        )
+    up = level.stairs_up
+    down = level.stairs_down[0]
+    if up is None:  # pragma: no cover - always set by generate_level
+        raise RuntimeError("G13 violated: level has no up-staircase")
+
+    if required_up is not None and up != required_up:  # G14
+        raise RuntimeError(
+            f"G14 violated: stairs_up {up} does not equal required_up {required_up}"
+        )
+    if level.player_start != up:  # G17
+        raise RuntimeError(
+            f"G17 violated: player_start {level.player_start} is not stairs_up {up}"
+        )
+    if level.depth != depth:  # G19
+        raise RuntimeError(f"G19 violated: depth {level.depth} != requested {depth}")
+
+    for name, cell in (("stairs_up", up), ("stairs_down", down)):  # G13
+        if not _level_is_open_spot(level, *cell):
+            raise RuntimeError(f"G13 violated: {name} {cell} is not an open spot")
+
+    if up == down:  # G16
+        raise RuntimeError(f"G16 violated: both staircases are at {up}")
+    if len(level.rooms) > 1:
+        up_rooms = {i for i, room in enumerate(level.rooms) if room.contains(*up)}
+        down_rooms = {i for i, room in enumerate(level.rooms) if room.contains(*down)}
+        if not up_rooms or not down_rooms or up_rooms & down_rooms:
+            raise RuntimeError(
+                f"G16 violated: stairs_up {up} and stairs_down {down} are not in "
+                f"two different rooms"
+            )
+
+    found_up = [
+        (x, y)
+        for y in range(level.height)
+        for x in range(level.width)
+        if level.tile_at(x, y) is Tile.STAIRS_UP
+    ]
+    found_down = [
+        (x, y)
+        for y in range(level.height)
+        for x in range(level.width)
+        if level.tile_at(x, y) is Tile.STAIRS_DOWN
+    ]
+    if found_up != [up]:  # G18
+        raise RuntimeError(f"G18 violated: STAIRS_UP cells {found_up}, expected [{up}]")
+    if found_down != [down]:  # G18
+        raise RuntimeError(
+            f"G18 violated: STAIRS_DOWN cells {found_down}, expected [{down}]"
         )
 
 

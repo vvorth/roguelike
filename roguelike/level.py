@@ -81,7 +81,9 @@ class Room:
 class Level:
     """A generated dungeon level. Immutable, including its grid.
 
-    Field order is binding — positional construction must work as written.
+    Field order is binding — positional construction must work as written. The three
+    stair fields (CONTRACT-v3 §2) are appended with defaults so every pre-v3 positional
+    construction keeps working unchanged.
     """
 
     width: int
@@ -90,6 +92,9 @@ class Level:
     rooms: tuple[Room, ...]
     player_start: tuple[int, int]
     seed: int
+    stairs_up: tuple[int, int] | None = None
+    stairs_down: tuple[tuple[int, int], ...] = ()
+    depth: int = 1
 
     def __post_init__(self) -> None:
         if self.width < 1:
@@ -107,6 +112,13 @@ class Level:
                 )
         if not self.in_bounds(*self.player_start):
             raise ValueError(f"player_start {self.player_start!r} is out of bounds")
+        if self.depth < 1:
+            raise ValueError(f"depth must be >= 1, got {self.depth}")
+        if self.stairs_up is not None and not self.in_bounds(*self.stairs_up):
+            raise ValueError(f"stairs_up {self.stairs_up!r} is out of bounds")
+        for coord in self.stairs_down:
+            if not self.in_bounds(*coord):
+                raise ValueError(f"stairs_down entry {coord!r} is out of bounds")
 
     def in_bounds(self, x: int, y: int) -> bool:
         """Return ``True`` iff ``0 <= x < width`` and ``0 <= y < height``. Never raises."""

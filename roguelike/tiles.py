@@ -11,6 +11,7 @@ __all__ = [
     "Tile",
     "TILE_CHARS",
     "WALKABLE",
+    "STAIRS",
     "PLAYER_CHAR",
     "DOOR_OPEN_CHAR",
     "tile_char",
@@ -19,20 +20,31 @@ __all__ = [
 
 
 class Tile(IntEnum):
-    """The complete tile vocabulary (CONTRACT §1). Do not add members."""
+    """The complete tile vocabulary (CONTRACT-v3 §1). Do not add members."""
 
     WALL = 0
     FLOOR = 1
     DOOR = 2
+    STAIRS_UP = 3
+    STAIRS_DOWN = 4
 
 
 TILE_CHARS: dict[Tile, str] = {
     Tile.WALL: "#",
     Tile.FLOOR: ".",
     Tile.DOOR: "+",
+    Tile.STAIRS_UP: "<",
+    Tile.STAIRS_DOWN: ">",
 }
 
-WALKABLE: frozenset[Tile] = frozenset({Tile.FLOOR, Tile.DOOR})
+WALKABLE: frozenset[Tile] = frozenset(
+    {Tile.FLOOR, Tile.DOOR, Tile.STAIRS_UP, Tile.STAIRS_DOWN}
+)
+
+STAIRS: frozenset[Tile] = frozenset({Tile.STAIRS_UP, Tile.STAIRS_DOWN})
+"""Both staircase tiles. Both are walkable (CONTRACT-v3 §0.9) — this is what makes them
+passable and transparent throughout the engine with no change to ``world.py``, ``fov.py``
+or ``movement.py``, which are defined in terms of :data:`WALKABLE` and "not ``WALL``"."""
 
 PLAYER_CHAR: str = "@"
 
@@ -52,5 +64,5 @@ def tile_char(tile: Tile) -> str:
 
 
 def is_walkable_tile(tile: Tile) -> bool:
-    """Return ``True`` iff ``tile`` may be stepped on (FLOOR and DOOR)."""
+    """Return ``True`` iff ``tile`` may be stepped on (FLOOR, DOOR, and both stairs)."""
     return tile in WALKABLE

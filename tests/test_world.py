@@ -259,8 +259,21 @@ def test_tile_chars_door_is_still_the_closed_door_glyph():
     assert TILE_CHARS[Tile.DOOR] == "+"
 
 
-def test_tile_still_has_exactly_three_members():
-    assert set(Tile) == {Tile.WALL, Tile.FLOOR, Tile.DOOR}
+def test_tile_vocabulary_is_pinned():
+    """The world predicates are written against a known tile vocabulary, so a new
+    tile must be a deliberate act — it has to pass through here.
+
+    v3 added the two staircase tiles. Both are in ``WALKABLE``, which is the whole
+    mechanism by which they became passable and transparent without this module
+    changing at all (CONTRACT-v3 §0.9).
+    """
+    assert set(Tile) == {
+        Tile.WALL,
+        Tile.FLOOR,
+        Tile.DOOR,
+        Tile.STAIRS_UP,
+        Tile.STAIRS_DOWN,
+    }
 
 
 # --------------------------------------------------------------------------
