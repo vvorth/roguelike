@@ -31,13 +31,24 @@ EXPECTED_MESSAGES = {
     EventKind.LEFT_DUNGEON: "You climb out of the dungeon and give up. Farewell.",
     EventKind.NO_STAIRS_DOWN: "There are no stairs leading down here.",
     EventKind.NO_STAIRS_UP: "There are no stairs leading up here.",
+    # -- v4: multi-turn activities (CONTRACT-v4 §16) --
+    EventKind.WALK_WHICH_WAY: "Walk in which direction?",
+    EventKind.TRAVELLING: "You travel towards the staircase.",
+    EventKind.ARRIVED: "You arrive at the staircase.",
+    EventKind.EXPLORED_EVERYTHING: "You have explored everything you can reach here.",
+    EventKind.NOTHING_FURTHER: "There is nowhere further to go.",
+    EventKind.STOPPED_AT_JUNCTION: "You stop at a junction.",
+    EventKind.STOPPED_AT_OPENING: "You stop before the opening.",
+    EventKind.INTERRUPTED: "You stop.",
 }
 
 
 # --- EventKind shape ----------------------------------------------------------
 
 
-def test_event_kind_has_exactly_eight_members() -> None:
+def test_event_kind_has_exactly_sixteen_members() -> None:
+    # The eight from v3, plus the eight new v4 activity-messaging kinds
+    # (CONTRACT-v4 §16), in declaration order.
     assert [member.name for member in EventKind] == [
         "DOOR_OPENED",
         "STAIRS_HERE_UP",
@@ -47,11 +58,19 @@ def test_event_kind_has_exactly_eight_members() -> None:
         "LEFT_DUNGEON",
         "NO_STAIRS_DOWN",
         "NO_STAIRS_UP",
+        "WALK_WHICH_WAY",
+        "TRAVELLING",
+        "ARRIVED",
+        "EXPLORED_EVERYTHING",
+        "NOTHING_FURTHER",
+        "STOPPED_AT_JUNCTION",
+        "STOPPED_AT_OPENING",
+        "INTERRUPTED",
     ]
 
 
 def test_event_kind_uses_auto_values() -> None:
-    assert [member.value for member in EventKind] == list(range(1, 9))
+    assert [member.value for member in EventKind] == list(range(1, 17))
 
 
 # --- MESSAGES: complete and exact --------------------------------------------
@@ -138,6 +157,58 @@ def test_depth_zero_is_a_valid_depth_value() -> None:
     assert message_for([Event(EventKind.DESCENDED, depth=0)]) == "You descend to level 0."
 
 
+# --- message_for: the eight new v4 activity messages (CONTRACT-v4 §16) -------
+
+
+def test_walk_which_way_message() -> None:
+    assert (
+        message_for([Event(EventKind.WALK_WHICH_WAY)]) == "Walk in which direction?"
+    )
+
+
+def test_travelling_message() -> None:
+    assert (
+        message_for([Event(EventKind.TRAVELLING)])
+        == "You travel towards the staircase."
+    )
+
+
+def test_arrived_message() -> None:
+    assert message_for([Event(EventKind.ARRIVED)]) == "You arrive at the staircase."
+
+
+def test_explored_everything_message() -> None:
+    assert (
+        message_for([Event(EventKind.EXPLORED_EVERYTHING)])
+        == "You have explored everything you can reach here."
+    )
+
+
+def test_nothing_further_message() -> None:
+    assert (
+        message_for([Event(EventKind.NOTHING_FURTHER)])
+        == "There is nowhere further to go."
+    )
+
+
+def test_stopped_at_junction_message() -> None:
+    assert (
+        message_for([Event(EventKind.STOPPED_AT_JUNCTION)])
+        == "You stop at a junction."
+    )
+
+
+def test_stopped_at_opening_message() -> None:
+    assert (
+        message_for([Event(EventKind.STOPPED_AT_OPENING)])
+        == "You stop before the opening."
+    )
+
+
+def test_interrupted_message() -> None:
+    assert message_for([Event(EventKind.INTERRUPTED)]) == "You stop."
+
+
 # --- depth requirement -------------------------------------------------------
 
 
@@ -160,6 +231,14 @@ def test_missing_depth_raises_value_error_for_ascended() -> None:
         EventKind.LEFT_DUNGEON,
         EventKind.NO_STAIRS_DOWN,
         EventKind.NO_STAIRS_UP,
+        EventKind.WALK_WHICH_WAY,
+        EventKind.TRAVELLING,
+        EventKind.ARRIVED,
+        EventKind.EXPLORED_EVERYTHING,
+        EventKind.NOTHING_FURTHER,
+        EventKind.STOPPED_AT_JUNCTION,
+        EventKind.STOPPED_AT_OPENING,
+        EventKind.INTERRUPTED,
     ],
 )
 def test_depthless_kinds_ignore_a_supplied_depth(kind: EventKind) -> None:

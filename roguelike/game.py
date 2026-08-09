@@ -64,10 +64,31 @@ happens in exactly one place in the whole codebase: the ``curses.wrapper`` call 
 why :func:`play` prints the farewell *after* ``wrapper`` returns, onto a sane screen
 rather than into a torn-down curses window.
 
+**v4 adds automatic navigation**, and it turns on three ideas:
+
+* **One mechanism gives both pacing and cancellation.** ``stdscr.timeout(100)`` was
+  measured to deliver both the ten-turns-per-second cap (9 ticks in 1.0 s with no input)
+  and instant cancellation (a waiting key returns in 0.00 ms). So the loop asks for a key
+  with a 100 ms deadline: a key cancels the activity, and ``-1`` — the deadline expiring —
+  means take one more turn of it. There is no ``sleep`` and no busy-wait anywhere in this
+  project, and there must not be (CONTRACT-v4 §0.10).
+* **Timing does not leak into the pure core.** :func:`step` and :func:`advance` are both
+  pure functions of a state; only :func:`run` reads the keyboard or the clock. The whole
+  of auto-explore is therefore unit-testable with no terminal.
+* **Routes are re-planned every turn.** A full-level search costs a fraction of a
+  millisecond against a 100 ms budget (CONTRACT-v4 §18.1), so :class:`Activity` carries no
+  path, there is no route cache, and there is no incremental replanning to get wrong. A
+  plan that has gone stale — because a door opened underneath it — cannot exist.
+
+The one rule of the loop that is easy to get wrong: **the cancelling keypress is consumed
+by the cancellation**. It must not also act as a command, or a panicked keypress would
+stop the walk *and* move you into whatever you were fleeing.
+
 This is the only module permitted to import this widely: :mod:`roguelike.level`,
 :mod:`roguelike.keys`, :mod:`roguelike.movement`, :mod:`roguelike.render`,
-:mod:`roguelike.fov`, :mod:`roguelike.world`, :mod:`roguelike.dungeon` and
-:mod:`roguelike.events` (CONTRACT-v3 §10).
+:mod:`roguelike.fov`, :mod:`roguelike.world`, :mod:`roguelike.dungeon`,
+:mod:`roguelike.events`, :mod:`roguelike.pathfind` and :mod:`roguelike.activity`
+(CONTRACT-v4 §10).
 """
 
 from __future__ import annotations
@@ -76,16 +97,21 @@ import curses
 from dataclasses import dataclass, replace
 
 from roguelike import dungeon, events, fov, render
+from roguelike.activity import Activity, ActivityKind, frontier_cells, walk_step
 from roguelike.events import Event, EventKind
 from roguelike.keys import Command, CommandKind, translate_key
 from roguelike.level import Level
 from roguelike.movement import try_move
+from roguelike.pathfind import Coord, Passable, find_path, octile
+from roguelike.world import is_planning_passable
 
 __all__ = [
     "LevelState",
     "GameState",
     "new_game",
     "step",
+    "advance",
+    "interruption",
     "format_stats",
     "format_status_right",
     "run",
@@ -160,7 +186,21 @@ class GameState:
     per-game state rather than a constant read at the call site, because indoors the walls
     dominate long before the radius does and the number is expected to be tuned.
 
-    Field order is binding (CONTRACT-v3 §7): everything without a default comes first.
+    ``activity`` is the multi-turn action in progress, or ``None`` when the player is
+    driving every turn by hand (CONTRACT-v4 §7). It is the whole of what makes automatic
+    navigation a *state* rather than a loop: :func:`advance` performs exactly one turn of
+    it and hands back a new state, so the pacing lives in :func:`run` and the rules live
+    here. It carries no path — see the module docstring — and it does not survive a level
+    change, because the route it was planned over ceases to exist.
+
+    ``awaiting_walk`` is the one-keystroke prefix state left behind by ``w``: a terminal
+    cannot observe key release, so "walk in a direction" is necessarily two keystrokes and
+    the first of them has to be remembered somewhere (RESEARCH-v4 §6). It is cleared by
+    the very next command whatever that command is.
+
+    Field order is binding (CONTRACT-v3 §7, CONTRACT-v4 §7): everything without a default
+    comes first, and the two v4 fields are appended with defaults so every construction
+    written against v3 still works unchanged.
     """
 
     master_seed: int
@@ -176,6 +216,8 @@ class GameState:
     radius: int = fov.DEFAULT_RADIUS
     events: tuple[Event, ...] = ()
     outcome: str | None = None
+    activity: Activity | None = None
+    awaiting_walk: bool = False
 
 
 def new_game(
@@ -327,6 +369,84 @@ def _change_level(
     )
 
 
+def _explored_passable(state: GameState) -> Passable:
+    """The planning predicate for a route the *character* could have worked out.
+
+    ``world.is_planning_passable`` restricted to ``explored`` — a cell may be routed
+    through if it has been seen and is either passable or a closed door (bumping opens
+    one, so planning through it is honest; CONTRACT-v4 §13). Restricting it to
+    ``explored`` is what stops travel and auto-explore from routing over terrain the
+    character has never laid eyes on.
+
+    The character's own cell is never asked about: :func:`roguelike.pathfind.find_path`
+    only calls the predicate on cells it expands *into*, so standing somewhere this
+    predicate would reject cannot block a search.
+    """
+    level = state.level
+    open_doors = state.open_doors
+    explored = state.explored
+
+    def passable(x: int, y: int) -> bool:
+        return (x, y) in explored and is_planning_passable(level, open_doors, x, y)
+
+    return passable
+
+
+def _whole_level_passable(state: GameState) -> Passable:
+    """The planning predicate for auto-walk: the level as it stands, fog aside.
+
+    Auto-walk is a *local* rule — it reads at most the cells touching the one being
+    considered, all of which are in view — so restricting it to ``explored`` would change
+    nothing except to make "stop before the opening" depend on how much of the room ahead
+    happened to be lit. Closed doors count as passable here for the same reason as
+    everywhere else in planning: the walk bumps them open and carries on
+    (RESEARCH-v4 §6).
+    """
+    level = state.level
+    open_doors = state.open_doors
+
+    def passable(x: int, y: int) -> bool:
+        return is_planning_passable(level, open_doors, x, y)
+
+    return passable
+
+
+def _travel_or_report(
+    state: GameState, candidates: tuple[Coord, ...], unknown: EventKind
+) -> GameState:
+    """Start travelling to the nearest known staircase, or report that none is known.
+
+    The off-the-stairs half of ``>`` and ``<`` (CONTRACT-v4 §7.4). ``candidates`` is every
+    staircase of that kind on the level; only those in ``explored`` are eligible, because
+    the character cannot walk to a staircase they have not found. With none of them found,
+    v3's behaviour survives exactly: say so, consume no turn, start nothing (user decision
+    2).
+
+    "Nearest" is nearest *by route*, not by straight line: the search is given all the
+    eligible staircases at once and the one it reaches first is the goal. The fallback
+    only fires when every known staircase is unreachable through explored ground, where
+    any goal leads to the same ``NOTHING_FURTHER`` on the first :func:`advance`; it exists
+    so that a goal can always be named and never so that a better one is passed over.
+
+    No turn is consumed either way — starting an activity is not itself an action.
+    """
+    goals = frozenset(cell for cell in candidates if cell in state.explored)
+    if not goals:
+        return replace(state, events=(Event(unknown),))
+
+    route = find_path(_explored_passable(state), state.player, goals)
+    goal = (
+        route[-1]
+        if route is not None
+        else min(goals, key=lambda cell: (octile(state.player, cell), cell))
+    )
+    return replace(
+        state,
+        activity=Activity(ActivityKind.TRAVEL, goal=goal),
+        events=(Event(EventKind.TRAVELLING),),
+    )
+
+
 def _descend(state: GameState) -> GameState:
     """Take the down-staircase under the player, or report that there isn't one.
 
@@ -335,12 +455,14 @@ def _descend(state: GameState) -> GameState:
     so the new level's up-staircase lands exactly there (G14) and the player's ``(x, y)``
     is unchanged by the descent. The world moves, not the player.
 
-    Off the stairs this emits ``NO_STAIRS_DOWN`` and consumes **no turn**: it is a
-    mistyped key, not an action.
+    Off the stairs it is not a mistyped key any more but a destination: v4 turns it into
+    a travel order towards the nearest down-staircase the character has already found, or,
+    when none has been found, into v3's ``NO_STAIRS_DOWN`` unchanged. Either way it
+    consumes **no turn** (CONTRACT-v4 §7.4).
     """
     stairs_down = state.level.stairs_down
     if not stairs_down or state.player != stairs_down[0]:
-        return replace(state, events=(Event(EventKind.NO_STAIRS_DOWN),))
+        return _travel_or_report(state, stairs_down, EventKind.NO_STAIRS_DOWN)
 
     target = stairs_down[0]
     depth = state.depth + 1
@@ -384,10 +506,13 @@ def _ascend(state: GameState) -> GameState:
     originally used. ``saved`` always holds it, because the only way to be at depth *d* is
     to have descended through *d-1*.
 
-    Off the stairs this emits ``NO_STAIRS_UP`` and consumes no turn.
+    Off the stairs it is the mirror of ``>``: travel to the up-staircase if it has been
+    found, ``NO_STAIRS_UP`` if it has not, and no turn either way (CONTRACT-v4 §7.4).
     """
-    if state.level.stairs_up is None or state.player != state.level.stairs_up:
-        return replace(state, events=(Event(EventKind.NO_STAIRS_UP),))
+    stairs_up = state.level.stairs_up
+    if stairs_up is None or state.player != stairs_up:
+        candidates = () if stairs_up is None else (stairs_up,)
+        return _travel_or_report(state, candidates, EventKind.NO_STAIRS_UP)
 
     if state.depth == 1:
         emitted = (Event(EventKind.LEFT_DUNGEON),)
@@ -443,8 +568,22 @@ def step(state: GameState, command: Command) -> GameState:
 
     - :attr:`~roguelike.keys.CommandKind.DESCEND` and
       :attr:`~roguelike.keys.CommandKind.ASCEND` take the staircase under the player, or,
-      if there is none there, say so and cost nothing. Ascending from level 1 leaves the
-      dungeon and ends the game. See :func:`_descend` and :func:`_ascend`.
+      off the stairs, start travelling to the nearest one already found — or say there is
+      none, exactly as in v3. Ascending from level 1 leaves the dungeon and ends the game.
+      See :func:`_descend` and :func:`_ascend`.
+    - :attr:`~roguelike.keys.CommandKind.AUTO_EXPLORE` starts an activity and costs no
+      turn; every step of the exploration is taken by :func:`advance`. Pressing it with
+      nothing left to explore is not special-cased here — the first :func:`advance` finds
+      no frontier, clears the activity and reports it, still without a turn
+      (CONTRACT-v4 §11).
+    - :attr:`~roguelike.keys.CommandKind.WALK_PREFIX` is half a command: it sets
+      ``awaiting_walk``, asks which way, and costs no turn. The **next** command is
+      swallowed by the prefix whatever it is — a ``MOVE`` starts the walk, and anything
+      else (including ``QUIT``) is a typo that clears the prefix and does nothing at all,
+      not even replacing the message (CONTRACT-v4 §7.4, §11).
+    - **Any command clears a running activity first.** The loop normally cancels before
+      it ever gets here, but the rule cannot depend on that: a command the player typed is
+      always about now, never about the walk they had started.
     - A state that has stopped running is returned as-is whatever the command, so a key
       that arrives after the last one cannot resurrect the game.
 
@@ -457,8 +596,34 @@ def step(state: GameState, command: Command) -> GameState:
     if not state.running:
         return state
 
+    if state.activity is not None:
+        state = replace(state, activity=None)
+
+    if state.awaiting_walk:
+        state = replace(state, awaiting_walk=False)
+        if command.kind is CommandKind.MOVE:
+            return replace(
+                state,
+                activity=Activity(
+                    ActivityKind.AUTO_WALK, direction=(command.dx, command.dy)
+                ),
+            )
+        # A typo, not an error: the prefix is dropped, the command is swallowed whole,
+        # and the message already on screen is left alone.
+        return state
+
     if command.kind is CommandKind.QUIT:
         return replace(state, running=False)
+
+    if command.kind is CommandKind.WALK_PREFIX:
+        return replace(
+            state,
+            awaiting_walk=True,
+            events=(Event(EventKind.WALK_WHICH_WAY),),
+        )
+
+    if command.kind is CommandKind.AUTO_EXPLORE:
+        return replace(state, activity=Activity(ActivityKind.AUTO_EXPLORE))
 
     if command.kind is CommandKind.MOVE:
         result = try_move(
@@ -493,6 +658,172 @@ def step(state: GameState, command: Command) -> GameState:
 
 
 # --------------------------------------------------------------------------------------
+# Activities — one turn at a time, and still pure (CONTRACT-v4 §7.5, §7.6)
+# --------------------------------------------------------------------------------------
+
+
+#: What each ``walk_step`` stop reason is called when the player reads it. The reason
+#: strings are the ones CONTRACT-v4 §19.2 fixes; the wording behind each kind lives, as
+#: ever, in :data:`roguelike.events.MESSAGES` and nowhere near here.
+_WALK_STOPPED: dict[str, EventKind] = {
+    "blocked": EventKind.NOTHING_FURTHER,
+    "intersection": EventKind.STOPPED_AT_JUNCTION,
+    "opening": EventKind.STOPPED_AT_OPENING,
+}
+
+#: What an activity says when the very next cell of its plan turns out to be unenterable.
+#: Unreachable in practice — every cell a planner proposes is planning-passable, and the
+#: only planning-passable cell ``try_move`` refuses is a closed door, which is bumped open
+#: instead — so this is the answer to a question the code should never be asked, chosen to
+#: match what the same activity says when it runs out of route.
+_ACTIVITY_BLOCKED: dict[ActivityKind, EventKind] = {
+    ActivityKind.TRAVEL: EventKind.NOTHING_FURTHER,
+    ActivityKind.AUTO_EXPLORE: EventKind.EXPLORED_EVERYTHING,
+    ActivityKind.AUTO_WALK: EventKind.NOTHING_FURTHER,
+}
+
+
+def _finished(state: GameState, kind: EventKind) -> GameState:
+    """Clear the activity and say why it ended. Exactly one event, never a turn."""
+    return replace(state, activity=None, events=(Event(kind),))
+
+
+def _planned_step(
+    state: GameState, activity: Activity
+) -> tuple[Coord, None] | tuple[None, EventKind]:
+    """Where the activity wants to go next, or why it is over. Never both.
+
+    The whole of "which cell?" for all three kinds, and the only place any of them is
+    planned. Each kind is re-planned from scratch every turn — there is no path to carry
+    forward and nothing that can go stale (CONTRACT-v4 §7.5).
+
+    * ``AUTO_WALK`` delegates to :func:`roguelike.activity.walk_step`, which decides
+      locally and reports its own stop reason.
+    * ``TRAVEL`` arrives when the player is standing on the goal, and otherwise searches
+      for it over explored ground.
+    * ``AUTO_EXPLORE`` heads for the nearest frontier. **The player's own cell is
+      subtracted from the goals**: standing on a frontier would make the search return a
+      one-cell path with no step in it, and the activity would stall silently rather than
+      finish. It does not arise at the default sight radius, where every neighbour is
+      already seen, and it costs one set difference to make impossible.
+
+    Both searches use the same explored-only predicate, so neither can route the character
+    over ground they have never seen.
+    """
+    if activity.kind is ActivityKind.AUTO_WALK:
+        target, reason = walk_step(
+            _whole_level_passable(state),
+            state.player,
+            activity.came_from,
+            activity.direction,
+        )
+        return (target, None) if target is not None else (None, _WALK_STOPPED[reason])
+
+    if activity.kind is ActivityKind.TRAVEL:
+        if activity.goal is None:
+            return (None, EventKind.NOTHING_FURTHER)
+        if state.player == activity.goal:
+            return (None, EventKind.ARRIVED)
+        route = find_path(_explored_passable(state), state.player, {activity.goal})
+        if route is None:
+            return (None, EventKind.NOTHING_FURTHER)
+        return (route[1], None)
+
+    goals = frontier_cells(state.level, state.explored, state.open_doors) - {state.player}
+    if not goals:
+        return (None, EventKind.EXPLORED_EVERYTHING)
+    route = find_path(_explored_passable(state), state.player, goals)
+    if route is None:
+        return (None, EventKind.EXPLORED_EVERYTHING)
+    return (route[1], None)
+
+
+def advance(state: GameState) -> GameState:
+    """Perform exactly one turn of the activity in progress and return the new state.
+
+    Pure, in the same sense and to the same degree as :func:`step`: no mutation, no
+    terminal, no I/O, no clock. The pacing that makes an activity watchable belongs to
+    :func:`run` and lives nowhere else (CONTRACT-v4 §0.10), which is why the whole of
+    auto-explore can be driven to completion in a test with no screen anywhere.
+
+    With no activity — or on a game that has stopped — the state comes back **unchanged**,
+    the same object, so calling this on an idle state is free and harmless.
+
+    Otherwise the activity is asked where to go next (:func:`_planned_step`). Finishing
+    clears the activity and emits exactly one event saying why: ``ARRIVED``,
+    ``NOTHING_FURTHER``, ``EXPLORED_EVERYTHING``, ``STOPPED_AT_JUNCTION`` or
+    ``STOPPED_AT_OPENING``. Otherwise the step is taken **by the same rules as a ``MOVE``
+    command** — the same :func:`roguelike.movement.try_move`, the same turn counter, the
+    same field of view recomputation, the same stair messages — so that a closed door on
+    the route is bumped open, costs its turn, reports itself, and the activity carries
+    straight on (user decision 3). Not stopping for a door is what lets auto-explore reach
+    the far side of the level at all.
+
+    ``came_from`` is carried forward for an auto-walk that actually moved, which is what
+    lets the corridor rule tell "onwards" from "back the way I came". A bump does not move
+    the player, so it does not disturb it.
+
+    Nothing here descends, ascends, or touches ``depth``: auto-explore stops on the
+    current level and hands control back (user decision 1). An activity cannot survive a
+    level change either, because every command clears it and only a command can change
+    level.
+    """
+    activity = state.activity
+    if activity is None or not state.running:
+        return state
+
+    target, stopped = _planned_step(state, activity)
+    if target is None:
+        return _finished(state, stopped)
+
+    dx = target[0] - state.player[0]
+    dy = target[1] - state.player[1]
+    result = try_move(state.level, state.player, dx, dy, state.open_doors)
+    if result.moved:
+        after = _take_turn(
+            state,
+            result.position,
+            state.open_doors,
+            _stair_events(state.level, result.position),
+        )
+        if activity.kind is ActivityKind.AUTO_WALK:
+            after = replace(after, activity=replace(activity, came_from=state.player))
+    elif result.blocked_by_door is not None:
+        after = _take_turn(
+            state,
+            state.player,
+            state.open_doors | {result.blocked_by_door},
+            (Event(EventKind.DOOR_OPENED),),
+        )
+    else:
+        return _finished(state, _ACTIVITY_BLOCKED[activity.kind])
+
+    interrupted = interruption(state, after)
+    if interrupted is not None:
+        return replace(after, activity=None, events=(interrupted,))
+    return after
+
+
+def interruption(before: GameState, after: GameState) -> Event | None:
+    """Should the turn just taken stop the activity, and if so, saying what?
+
+    ``None`` in **every** case today, and that is the honest state of the feature rather
+    than an oversight (CONTRACT-v4 §7.6). The conditions that will one day answer
+    otherwise — a hostile coming into view, taking damage, a change in the character's
+    state — need monsters and hit points, and neither exists yet. Opening a door, the one
+    thing that *could* interrupt today, deliberately does not (user decision 3): the door
+    opens, costs its turn, says so, and the walk continues.
+
+    So this is a seam, and the point of shipping it now is that :func:`advance` calls it
+    after every activity turn: the call site exists, is exercised, and is tested. When
+    monsters arrive it grows a case. It is one pure function of the two states around a
+    turn — deliberately not a registry, an observer list or a plugin mechanism, none of
+    which one condition could justify.
+    """
+    return None
+
+
+# --------------------------------------------------------------------------------------
 # Chrome text (CONTRACT-v3 §7.2)
 # --------------------------------------------------------------------------------------
 
@@ -522,17 +853,56 @@ def format_status_right(state: GameState) -> str:
 
 
 # --------------------------------------------------------------------------------------
-# The loop (CONTRACT-v3 §7.3)
+# The loop (CONTRACT-v3 §7.3, CONTRACT-v4 §7.7)
 # --------------------------------------------------------------------------------------
+
+
+#: The deadline, in milliseconds, that :func:`run` gives a keypress while an activity is
+#: running. Measured on a real terminal: it delivers both the ten-turns-per-second cap
+#: (9 ticks in 1.0 s with no input) and instant cancellation (a key already waiting comes
+#: back in 0.00 ms). It is the *only* pacing mechanism in this project — there is no
+#: sleep, no clock read and no busy-wait anywhere (CONTRACT-v4 §0.10).
+_ACTIVITY_TICK_MS: int = 100
+
+#: What ``getch`` returns when that deadline passes with no key: nothing was typed, so
+#: the activity gets another turn.
+_NO_KEY: int = -1
+
+#: The deadline that means "no deadline" — ordinary play, where ``getch`` blocks until
+#: the player types something and the game spends no cycles waiting. Curses spells this
+#: with the same number it returns for "nothing arrived"; they are unrelated meanings and
+#: are named apart here so neither can be mistaken for the other.
+_BLOCKING: int = -1
+
+
+def _cancelled(state: GameState) -> GameState:
+    """Stop the activity because the player pressed something. One event, no turn.
+
+    Separate from :func:`run` because it is a rule and :func:`run` holds none, and
+    separate from :func:`step` because the key that caused it is **consumed by the
+    cancellation** and never reaches :func:`step` as a command — otherwise a panicked
+    keypress would stop the walk *and* move you into whatever you were fleeing
+    (CONTRACT-v4 §7.7).
+    """
+    return replace(state, activity=None, events=(Event(EventKind.INTERRUPTED),))
 
 
 def run(stdscr, state: GameState) -> GameState:
     """Run the turn loop on an already-initialised curses window until the game ends.
 
-    A shell around :func:`step` and the renderer, holding no game rules: it composes the
-    chrome text, renders the current state to cells, blits them, blocks for a key, turns it
-    into a :class:`~roguelike.keys.Command` and hands both to :func:`step`. ``stdscr`` must
-    already be initialised — :func:`play` does that, and nothing here does.
+    A shell around :func:`step`, :func:`advance` and the renderer, holding no game rules:
+    it composes the chrome text, renders the current state to cells, blits them, asks for
+    a key, and hands the result to whichever of the two owns the next transition.
+    ``stdscr`` must already be initialised — :func:`play` does that, and nothing here does.
+
+    **The keyboard is read two different ways, and that is the whole of the v4 loop.**
+    With no activity in progress it blocks for a key exactly as v3 did (``timeout(-1)``)
+    and steps. With one, it gives the key a 100 ms deadline: a key that arrives cancels
+    the activity and **is consumed doing so**, and a deadline that passes with no key —
+    ``getch`` returning ``-1`` — is one more turn of the activity. That single call is
+    both the pace (about ten turns a second, fast enough to watch and slow enough to read)
+    and the cancellation, which is why there is no timer, no sleep and no polling loop
+    here or anywhere else.
 
     Colour pairs are allocated once, here, immediately after curses comes up and before
     the first frame; :func:`roguelike.render.init_colors` degrades to monochrome by itself
@@ -573,7 +943,14 @@ def run(stdscr, state: GameState) -> GameState:
             chrome,
         )
         render.draw(stdscr, cells)
-        state = step(state, translate_key(stdscr.getch()))
+
+        if state.activity is not None:
+            stdscr.timeout(_ACTIVITY_TICK_MS)
+            key = stdscr.getch()
+            state = advance(state) if key == _NO_KEY else _cancelled(state)
+        else:
+            stdscr.timeout(_BLOCKING)
+            state = step(state, translate_key(stdscr.getch()))
 
     return state
 

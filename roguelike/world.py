@@ -25,7 +25,7 @@ from __future__ import annotations
 from roguelike.level import Level
 from roguelike.tiles import Tile
 
-__all__ = ["is_passable", "is_transparent", "is_closed_door"]
+__all__ = ["is_passable", "is_transparent", "is_closed_door", "is_planning_passable"]
 
 
 def is_closed_door(
@@ -52,6 +52,28 @@ def is_passable(
     if not level.is_walkable(x, y):
         return False
     return not is_closed_door(level, open_doors, x, y)
+
+
+def is_planning_passable(
+    level: Level, open_doors: frozenset[tuple[int, int]], x: int, y: int
+) -> bool:
+    """Return ``True`` iff a route may be planned *through* ``(x, y)`` (CONTRACT-v4 §13).
+
+    Exactly ``is_passable(...) or is_closed_door(...)``: it differs from
+    :func:`is_passable` on precisely one case, the closed door, which a planner may
+    route through because bumping it opens it (CONTRACT-v2 §7 bump-to-open). A ``FLOOR``
+    cell, an open ``DOOR`` and both staircases are planning-passable; a ``WALL`` and
+    every out-of-bounds coordinate are not. Never raises.
+
+    **Only planning may use this.** Actual movement and sight keep asking
+    :func:`is_passable` and :func:`is_transparent`, which are unchanged — a closed door
+    still cannot be stepped onto or seen through. Routing over it is what stops every
+    frontier behind a door from being permanently unreachable, which would otherwise
+    strand auto-explore in the first room (CONTRACT-v4 §13, RESEARCH-v4 §4).
+    """
+    return is_passable(level, open_doors, x, y) or is_closed_door(
+        level, open_doors, x, y
+    )
 
 
 def is_transparent(

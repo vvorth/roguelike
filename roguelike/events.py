@@ -1,4 +1,4 @@
-"""Event vocabulary and message wording (CONTRACT-v3 §16).
+"""Event vocabulary and message wording (CONTRACT-v3 §16, CONTRACT-v4 §16).
 
 Game logic emits structured, terminal-free :class:`Event` values; all English
 wording lives in exactly one table, :data:`MESSAGES`. This module is a leaf:
@@ -36,6 +36,15 @@ class EventKind(Enum):
     LEFT_DUNGEON = auto()
     NO_STAIRS_DOWN = auto()
     NO_STAIRS_UP = auto()
+    # -- v4: multi-turn activities (CONTRACT-v4 §16) --
+    WALK_WHICH_WAY = auto()
+    TRAVELLING = auto()
+    ARRIVED = auto()
+    EXPLORED_EVERYTHING = auto()
+    NOTHING_FURTHER = auto()
+    STOPPED_AT_JUNCTION = auto()
+    STOPPED_AT_OPENING = auto()
+    INTERRUPTED = auto()
 
 
 @dataclass(frozen=True)
@@ -64,6 +73,15 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.LEFT_DUNGEON: "You climb out of the dungeon and give up. Farewell.",
     EventKind.NO_STAIRS_DOWN: "There are no stairs leading down here.",
     EventKind.NO_STAIRS_UP: "There are no stairs leading up here.",
+    # -- v4: multi-turn activities (CONTRACT-v4 §16) --
+    EventKind.WALK_WHICH_WAY: "Walk in which direction?",
+    EventKind.TRAVELLING: "You travel towards the staircase.",
+    EventKind.ARRIVED: "You arrive at the staircase.",
+    EventKind.EXPLORED_EVERYTHING: "You have explored everything you can reach here.",
+    EventKind.NOTHING_FURTHER: "There is nowhere further to go.",
+    EventKind.STOPPED_AT_JUNCTION: "You stop at a junction.",
+    EventKind.STOPPED_AT_OPENING: "You stop before the opening.",
+    EventKind.INTERRUPTED: "You stop.",
 }
 
 

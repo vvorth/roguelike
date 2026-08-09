@@ -65,6 +65,36 @@ ALL_EIGHT_DELTAS = {
     if (dx, dy) != (0, 0)
 }
 
+# --- v4: Shift-diagonal bindings, rotated 45 degrees clockwise from the base
+# direction (CONTRACT-v4 §5.1). Reproduced independently, as the acceptance
+# criteria require, rather than imported from roguelike.keys.
+#
+# TRAP: curses names the Shift+Up/Shift+Down constants KEY_SR/KEY_SF ("scroll
+# reverse"/"scroll forward"). KEY_SR is Shift+Up -> north-east -> negative dy.
+# KEY_SF is Shift+Down -> south-west -> positive dy. A swap must fail loudly,
+# so several tests below assert the sign explicitly rather than just equality.
+SHIFT_ARROW_BINDINGS = {
+    curses.KEY_SR: (1, -1),  # Shift+Up -> north-east
+    curses.KEY_SRIGHT: (1, 1),  # Shift+Right -> south-east
+    curses.KEY_SF: (-1, 1),  # Shift+Down -> south-west
+    curses.KEY_SLEFT: (-1, -1),  # Shift+Left -> north-west
+}
+
+SHIFT_LETTER_BINDINGS = {
+    "K": (1, -1),  # north-east
+    "L": (1, 1),  # south-east
+    "J": (-1, 1),  # south-west
+    "H": (-1, -1),  # north-west
+}
+
+# Each Shift-diagonal must equal the pre-existing legacy diagonal it matches.
+LEGACY_DIAGONAL_FOR_SHIFT_LETTER = {
+    "K": "u",
+    "L": "n",
+    "J": "b",
+    "H": "y",
+}
+
 
 # --- Movement bindings ------------------------------------------------------
 
@@ -149,6 +179,88 @@ def test_diagonals_are_the_composition_of_their_cardinals() -> None:
         assert (command.dx, command.dy) == (horizontal.dx, vertical.dy)
 
 
+# --- v4: Shift-diagonals, rotated 45 degrees clockwise (CONTRACT-v4 §5.1) ---
+
+
+@pytest.mark.parametrize(("code", "delta"), sorted(SHIFT_ARROW_BINDINGS.items()))
+def test_shift_arrow_keys(code: int, delta: tuple[int, int]) -> None:
+    assert translate_key(code) == Command(CommandKind.MOVE, delta[0], delta[1])
+
+
+@pytest.mark.parametrize(("char", "delta"), sorted(SHIFT_LETTER_BINDINGS.items()))
+def test_shift_letter_keys_as_str(char: str, delta: tuple[int, int]) -> None:
+    assert translate_key(char) == Command(CommandKind.MOVE, delta[0], delta[1])
+
+
+@pytest.mark.parametrize(("char", "delta"), sorted(SHIFT_LETTER_BINDINGS.items()))
+def test_shift_letter_keys_as_int(char: str, delta: tuple[int, int]) -> None:
+    assert translate_key(ord(char)) == Command(CommandKind.MOVE, delta[0], delta[1])
+
+
+def test_key_sr_is_shift_up_and_yields_negative_dy() -> None:
+    # THE NAMED TRAP: KEY_SR ("scroll reverse") is Shift+Up, which rotates 45
+    # degrees clockwise to north-east — a NEGATIVE dy. If this were swapped
+    # with KEY_SF, dy would come out positive here instead.
+    command = translate_key(curses.KEY_SR)
+    assert command.kind is CommandKind.MOVE
+    assert command.dy < 0
+    assert (command.dx, command.dy) == (1, -1)
+
+
+def test_key_sf_is_shift_down_and_yields_positive_dy() -> None:
+    # THE NAMED TRAP, other half: KEY_SF ("scroll forward") is Shift+Down,
+    # which rotates 45 degrees clockwise to south-west — a POSITIVE dy.
+    command = translate_key(curses.KEY_SF)
+    assert command.kind is CommandKind.MOVE
+    assert command.dy > 0
+    assert (command.dx, command.dy) == (-1, 1)
+
+
+def test_key_sr_and_key_sf_are_not_swapped_with_each_other() -> None:
+    assert translate_key(curses.KEY_SR) != translate_key(curses.KEY_SF)
+    assert translate_key(curses.KEY_SR).dy == -translate_key(curses.KEY_SF).dy
+
+
+def test_shift_up_and_k_produce_equal_commands() -> None:
+    assert translate_key(curses.KEY_SR) == translate_key("K")
+
+
+def test_shift_right_and_l_produce_equal_commands() -> None:
+    assert translate_key(curses.KEY_SRIGHT) == translate_key("L")
+
+
+def test_shift_down_and_j_produce_equal_commands() -> None:
+    assert translate_key(curses.KEY_SF) == translate_key("J")
+
+
+def test_shift_left_and_h_produce_equal_commands() -> None:
+    assert translate_key(curses.KEY_SLEFT) == translate_key("H")
+
+
+@pytest.mark.parametrize(
+    ("shift_letter", "legacy_letter"), sorted(LEGACY_DIAGONAL_FOR_SHIFT_LETTER.items())
+)
+def test_shift_diagonal_equals_legacy_letter_diagonal(
+    shift_letter: str, legacy_letter: str
+) -> None:
+    assert translate_key(shift_letter) == translate_key(legacy_letter)
+
+
+@pytest.mark.parametrize(
+    ("shift_letter", "digit"),
+    [("K", "9"), ("L", "3"), ("J", "1"), ("H", "7")],
+)
+def test_shift_diagonal_equals_legacy_digit_diagonal(
+    shift_letter: str, digit: str
+) -> None:
+    assert translate_key(shift_letter) == translate_key(digit)
+
+
+def test_shift_diagonals_cover_all_four_diagonal_directions() -> None:
+    assert _deltas(SHIFT_LETTER_BINDINGS) == {(1, -1), (1, 1), (-1, 1), (-1, -1)}
+    assert set(SHIFT_ARROW_BINDINGS.values()) == {(1, -1), (1, 1), (-1, 1), (-1, -1)}
+
+
 # --- Exhaustiveness ---------------------------------------------------------
 
 
@@ -182,6 +294,10 @@ def test_every_bound_key_in_the_table_is_expected() -> None:
     expected |= set(ARROW_BINDINGS)
     expected |= {ord("q"), ord("Q")}
     expected |= {ord(">"), ord("<")}
+    # v4 additions: Shift-diagonals, auto-explore, walk-prefix.
+    expected |= set(SHIFT_ARROW_BINDINGS)
+    expected |= {ord(c) for c in SHIFT_LETTER_BINDINGS}
+    expected |= {ord("E"), ord("w")}
     assert set(keys_module._KEY_BINDINGS) == expected
 
 
@@ -268,6 +384,71 @@ def test_descend_and_ascend_do_not_collide_with_movement_or_quit() -> None:
     assert stair_commands.isdisjoint(other_commands)
 
 
+# --- Auto-explore and walk-prefix (CONTRACT-v4 §5.1): new in v4 -------------
+
+
+def test_auto_explore_as_str() -> None:
+    command = translate_key("E")
+    assert command.kind is CommandKind.AUTO_EXPLORE
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_auto_explore_as_int() -> None:
+    command = translate_key(ord("E"))
+    assert command.kind is CommandKind.AUTO_EXPLORE
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_walk_prefix_as_str() -> None:
+    command = translate_key("w")
+    assert command.kind is CommandKind.WALK_PREFIX
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_walk_prefix_as_int() -> None:
+    command = translate_key(ord("w"))
+    assert command.kind is CommandKind.WALK_PREFIX
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_auto_explore_str_and_int_forms_agree() -> None:
+    assert translate_key("E") == translate_key(ord("E"))
+
+
+def test_walk_prefix_str_and_int_forms_agree() -> None:
+    assert translate_key("w") == translate_key(ord("w"))
+
+
+def test_auto_explore_and_walk_prefix_are_distinct_commands() -> None:
+    assert translate_key("E") != translate_key("w")
+
+
+def test_lowercase_e_is_unknown_only_uppercase_e_is_auto_explore() -> None:
+    assert translate_key("e") == UNKNOWN_COMMAND
+    assert translate_key("E") != UNKNOWN_COMMAND
+
+
+def test_uppercase_w_is_unknown_only_lowercase_w_is_walk_prefix() -> None:
+    assert translate_key("W") == UNKNOWN_COMMAND
+    assert translate_key("w") != UNKNOWN_COMMAND
+
+
+def test_auto_explore_and_walk_prefix_do_not_collide_with_anything_else() -> None:
+    new_commands = {translate_key("E"), translate_key("w")}
+    other_commands = {
+        translate_key(c)
+        for c in list(LETTER_BINDINGS)
+        + list(DIGIT_BINDINGS)
+        + list(SHIFT_LETTER_BINDINGS)
+        + ["q", "Q", ">", "<"]
+    }
+    assert new_commands.isdisjoint(other_commands)
+
+
 # --- Unknown keys: ordinary input, never an error ---------------------------
 
 
@@ -277,11 +458,9 @@ def test_descend_and_ascend_do_not_collide_with_movement_or_quit() -> None:
         "5",  # numpad 5: there is no wait command (BRIEF Q8)
         ord("5"),
         27,  # ESC is not quit (BRIEF Q9)
-        "H",  # uppercase movement letters mean "run": out of scope
-        "J",
-        "K",
-        "L",
-        "Y",
+        # H/J/K/L used to be UNKNOWN ("run" is out of scope) but are bound to
+        # the Shift-diagonals as of v4 — see test_uppercase_hjkl_are_now_diagonals.
+        "Y",  # uppercase of the remaining diagonal letters stay UNKNOWN
         "U",
         "B",
         "N",
@@ -291,6 +470,8 @@ def test_descend_and_ascend_do_not_collide_with_movement_or_quit() -> None:
         " ",
         "\n",
         "\t",
+        "e",  # lowercase auto-explore is not bound — only "E" is
+        "W",  # uppercase walk-prefix is not bound — only "w" is
         -1,  # getch() with no input in non-blocking mode
         0,
         4,  # the integer four, not the numpad-4 key
@@ -307,9 +488,23 @@ def test_unknown_keys_return_unknown_without_raising(key: int | str) -> None:
     assert translate_key(key).kind is CommandKind.UNKNOWN
 
 
-def test_uppercase_movement_letters_are_unknown() -> None:
-    for char in LETTER_BINDINGS:
-        assert translate_key(char.upper()) == UNKNOWN_COMMAND
+def test_uppercase_hjkl_are_now_diagonals() -> None:
+    # v1-v3 treated uppercase H/J/K/L as UNKNOWN ("run" is out of scope). v4
+    # repurposes them as the Shift-diagonal bindings (CONTRACT-v4 §5.1) — this
+    # is the intended, contract-mandated change, not a regression.
+    assert translate_key("K") == Command(CommandKind.MOVE, 1, -1)
+    assert translate_key("L") == Command(CommandKind.MOVE, 1, 1)
+    assert translate_key("J") == Command(CommandKind.MOVE, -1, 1)
+    assert translate_key("H") == Command(CommandKind.MOVE, -1, -1)
+    for char in "HJKL":
+        assert translate_key(char) != UNKNOWN_COMMAND
+
+
+def test_remaining_uppercase_movement_letters_are_still_unknown() -> None:
+    # Y, U, B, N (uppercase of the other four diagonal letters) are not bound
+    # to anything in v4 either.
+    for char in "YUBN":
+        assert translate_key(char) == UNKNOWN_COMMAND
 
 
 def test_raw_integer_digits_are_not_numpad_keys() -> None:
@@ -375,15 +570,19 @@ def test_command_kind_members() -> None:
         "UNKNOWN",
         "DESCEND",
         "ASCEND",
+        "AUTO_EXPLORE",
+        "WALK_PREFIX",
     ]
 
 
 def test_command_kind_uses_auto_values() -> None:
-    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5]
+    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5, 6, 7]
 
 
-def test_command_kind_has_exactly_five_members() -> None:
-    assert len(list(CommandKind)) == 5
+def test_command_kind_has_exactly_seven_members() -> None:
+    # The five from v3 (MOVE, QUIT, UNKNOWN, DESCEND, ASCEND) plus the two new
+    # v4 members, AUTO_EXPLORE and WALK_PREFIX (CONTRACT-v4 §5).
+    assert len(list(CommandKind)) == 7
 
 
 def test_module_constants_are_the_expected_kinds() -> None:
@@ -442,6 +641,17 @@ def test_keys_references_curses_constants_rather_than_hardcoding_them() -> None:
     for constant in ("KEY_LEFT", "KEY_RIGHT", "KEY_UP", "KEY_DOWN"):
         assert f"curses.{constant}" in source
     for hardcoded in ("258", "259", "260", "261"):
+        assert hardcoded not in source
+
+
+def test_keys_references_shift_diagonal_constants_rather_than_hardcoding_them() -> None:
+    # THE NAMED TRAP (CONTRACT-v4 §5.1): KEY_SR/KEY_SF are Shift+Up/Shift+Down
+    # despite the "scroll" names. Must be referenced through curses, never as
+    # the raw measured integers 337/336/402/393.
+    source = _keys_source()
+    for constant in ("KEY_SR", "KEY_SF", "KEY_SLEFT", "KEY_SRIGHT"):
+        assert f"curses.{constant}" in source
+    for hardcoded in ("337", "336", "393", "402"):
         assert hardcoded not in source
 
 

@@ -11,8 +11,15 @@ system meet: that descending keeps the player on the same coordinate, that the
 level below anchors its up-staircase there, that fog and opened doors survive a
 round trip, and that the chrome rows carry the right text.
 
+v4 adds automatic navigation, so this file now also pins the properties that
+only exist once input, pathfinding, the frontier planner and the turn loop meet:
+that a planned route is actually walkable by the real movement rules, that
+auto-explore reaches the whole level using only what has been seen and then
+stops, that travel reaches a staircase, and that an activity dies on any command
+and never survives a level change.
+
 Nothing in this file initialises curses. The live curses session is verified
-separately, out of band, and recorded in .plan/INTEGRATION-v3.md.
+separately, out of band, and recorded in .plan/INTEGRATION-v4.md.
 """
 
 from __future__ import annotations
@@ -25,11 +32,12 @@ from pathlib import Path
 
 import pytest
 
-from roguelike import dungeon, events, world
+from roguelike import activity, dungeon, events, pathfind, world
 from roguelike.events import EventKind
 from roguelike.fov import compute_visible
 from roguelike.game import (
     GameState,
+    advance,
     format_stats,
     format_status_right,
     new_game,
@@ -626,3 +634,246 @@ def test_importing_the_whole_package_touches_no_terminal() -> None:
         cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL, check=True,
     )
     assert result.stdout.strip() == "clean"
+
+
+# --------------------------------------------------------------------------
+# v4 — diagonals: keys x movement x game
+# --------------------------------------------------------------------------
+
+
+SHIFT_DIAGONALS = {
+    "K": (1, -1), "L": (1, 1), "J": (-1, 1), "H": (-1, -1),
+}
+
+
+def test_shift_diagonals_actually_move_the_player_diagonally() -> None:
+    """The key layer and the movement layer must agree about 45 degrees clockwise."""
+    state = new_game(1234, *SMALL)
+    for key, (dx, dy) in SHIFT_DIAGONALS.items():
+        command = translate_key(key)
+        assert command.kind is CommandKind.MOVE
+        assert (command.dx, command.dy) == (dx, dy)
+        target = (state.player[0] + dx, state.player[1] + dy)
+        after = step(state, command)
+        if world.is_passable(state.level, state.open_doors, *target):
+            assert after.player == target, f"{key} did not move diagonally"
+            assert after.turns == state.turns + 1
+
+
+def test_every_diagonal_spelling_is_the_same_command() -> None:
+    """Shift+hjkl, yubn and the numpad must be interchangeable."""
+    for shift, legacy, digit in (("K", "u", "9"), ("L", "n", "3"),
+                                 ("J", "b", "1"), ("H", "y", "7")):
+        assert translate_key(shift) == translate_key(legacy) == translate_key(digit)
+
+
+# --------------------------------------------------------------------------
+# v4 — pathfinding agrees with the movement rules
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("seed", (1234, 7, 42))
+def test_a_planned_route_is_actually_walkable_by_the_real_engine(seed: int) -> None:
+    """A path is only useful if the movement layer accepts every step of it.
+
+    This is the seam between pathfind (which knows nothing of the engine) and
+    movement (which knows nothing of planning). Routes are planned over
+    ``is_planning_passable``, which admits closed doors precisely because bumping
+    one opens it — so a door costs a turn without moving, and the same step is
+    then retried. That is exactly what the activity layer does.
+    """
+    state = new_game(seed, *SMALL)
+    level = state.level
+    walked = state
+
+    route = pathfind.find_path(
+        lambda x, y: world.is_planning_passable(level, walked.open_doors, x, y),
+        level.stairs_up, {level.stairs_down[0]},
+    )
+    assert route is not None and route[0] == level.stairs_up
+
+    for nxt in route[1:]:
+        dx, dy = nxt[0] - walked.player[0], nxt[1] - walked.player[1]
+        assert max(abs(dx), abs(dy)) == 1, "path took a non-unit step"
+        was_shut = world.is_closed_door(level, walked.open_doors, *nxt)
+        walked = step(walked, Command(CommandKind.MOVE, dx, dy))
+        if was_shut:
+            # The bump opened it and cost a turn without moving; now walk through.
+            assert nxt in walked.open_doors
+            assert walked.player != nxt
+            walked = step(walked, Command(CommandKind.MOVE, dx, dy))
+        assert walked.player == nxt, "the engine refused a step the planner proposed"
+    assert walked.player == level.stairs_down[0]
+
+
+# --------------------------------------------------------------------------
+# v4 — auto-explore end to end
+# --------------------------------------------------------------------------
+
+
+def run_activity(state: GameState, cap: int = 4000) -> tuple[GameState, int]:
+    """Drive `advance` until the activity clears, as the real loop would."""
+    ticks = 0
+    while state.activity is not None and ticks < cap:
+        state = advance(state)
+        ticks += 1
+    assert ticks < cap, "activity never finished"
+    return state, ticks
+
+
+@pytest.mark.parametrize("seed", (1234, 7, 42))
+def test_auto_explore_reveals_the_level_and_then_stops(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    started = step(state, translate_key("E"))
+    assert started.activity is not None
+    assert started.turns == state.turns, "starting an activity costs no turn"
+
+    final, ticks = run_activity(started)
+
+    truth = walkable_cells(final.level)
+    seen = {c for c in final.explored if final.level.is_walkable(*c)}
+    coverage = 100 * len(seen) / len(truth)
+    assert coverage >= 95, f"seed {seed}: only explored {coverage:.1f}%"
+    assert final.activity is None
+    assert [e.kind for e in final.events] == [EventKind.EXPLORED_EVERYTHING]
+    assert final.depth == 1, "auto-explore must never descend"
+
+
+def test_auto_explore_opens_doors_on_the_way() -> None:
+    state = step(new_game(1234, *SMALL), translate_key("E"))
+    final, _ = run_activity(state)
+    assert final.open_doors, "a full explore should have opened at least one door"
+    for coord in final.open_doors:
+        assert final.level.tile_at(*coord) is Tile.DOOR
+
+
+@pytest.mark.parametrize("seed", (1234, 7))
+def test_the_frontier_never_depends_on_unexplored_ground(seed: int) -> None:
+    """The no-cheating rule, checked at the integration level: the frontier must
+    be a function of `explored` alone."""
+    state = new_game(seed, *SMALL)
+    mine = activity.frontier_cells(state.level, state.explored, state.open_doors)
+
+    # Rebuild the level with every unexplored cell turned to wall. Anything the
+    # planner reads outside `explored` would change the answer.
+    from roguelike.level import Level as _Level, freeze_grid as _freeze
+    rows = [
+        [
+            state.level.tile_at(x, y) if (x, y) in state.explored else Tile.WALL
+            for x in range(state.level.width)
+        ]
+        for y in range(state.level.height)
+    ]
+    altered = _Level(
+        state.level.width, state.level.height, _freeze(rows), state.level.rooms,
+        state.level.player_start, state.level.seed,
+        stairs_up=state.level.stairs_up, stairs_down=state.level.stairs_down,
+        depth=state.level.depth,
+    )
+    theirs = activity.frontier_cells(altered, state.explored, state.open_doors)
+    assert mine == theirs, "frontier_cells read terrain the character has not seen"
+
+
+# --------------------------------------------------------------------------
+# v4 — travel to a known staircase
+# --------------------------------------------------------------------------
+
+
+def test_pressing_descend_off_the_stairs_travels_to_a_known_staircase() -> None:
+    explored = step(new_game(1234, *SMALL), translate_key("E"))
+    explored, _ = run_activity(explored)
+    assert explored.player != explored.level.stairs_down[0]
+
+    travelling = step(explored, DESCEND)
+    assert travelling.activity is not None
+    assert [e.kind for e in travelling.events] == [EventKind.TRAVELLING]
+    assert travelling.turns == explored.turns, "starting travel costs no turn"
+
+    arrived, _ = run_activity(travelling)
+    assert arrived.player == arrived.level.stairs_down[0]
+    assert arrived.activity is None
+    assert [e.kind for e in arrived.events] == [EventKind.ARRIVED]
+
+    # And now the staircase actually works.
+    below = step(arrived, DESCEND)
+    assert below.depth == 2
+
+
+def test_pressing_descend_with_no_known_staircase_only_reports_it() -> None:
+    state = new_game(1234, *SMALL)
+    moved = step(state, translate_key("j"))
+    if moved.player == state.player:
+        pytest.skip("could not step off the staircase")
+    if moved.level.stairs_down[0] in moved.explored:
+        pytest.skip("the down staircase is visible from the start on this seed")
+
+    refused = step(moved, DESCEND)
+    assert refused.activity is None, "must not travel toward an unknown staircase"
+    assert refused.turns == moved.turns
+    assert [e.kind for e in refused.events] == [EventKind.NO_STAIRS_DOWN]
+
+
+# --------------------------------------------------------------------------
+# v4 — auto-walk, and activity lifecycle
+# --------------------------------------------------------------------------
+
+
+def test_walk_prefix_then_a_direction_starts_a_walk() -> None:
+    state = new_game(1234, *SMALL)
+    prefixed = step(state, translate_key("w"))
+    assert prefixed.awaiting_walk is True
+    assert prefixed.turns == state.turns
+    assert [e.kind for e in prefixed.events] == [EventKind.WALK_WHICH_WAY]
+
+    walking = step(prefixed, translate_key("l"))
+    assert walking.awaiting_walk is False
+    assert walking.activity is not None
+
+    stopped, _ = run_activity(walking)
+    assert stopped.activity is None
+    assert [e.kind for e in stopped.events][0] in {
+        EventKind.NOTHING_FURTHER,
+        EventKind.STOPPED_AT_JUNCTION,
+        EventKind.STOPPED_AT_OPENING,
+    }
+
+
+def test_walk_prefix_then_a_non_direction_is_consumed() -> None:
+    state = new_game(1234, *SMALL)
+    prefixed = step(state, translate_key("w"))
+    after = step(prefixed, translate_key("q"))
+    assert after.running is True, "the consumed key must not quit"
+    assert after.awaiting_walk is False
+    assert after.activity is None
+    assert after.turns == state.turns
+
+
+def test_any_command_clears_a_running_activity() -> None:
+    started = step(new_game(1234, *SMALL), translate_key("E"))
+    assert started.activity is not None
+    for key in ("j", "q", "E"):
+        assert step(started, translate_key(key)).activity is None or key == "E"
+
+
+def test_an_activity_does_not_survive_a_level_change() -> None:
+    explored, _ = run_activity(step(new_game(1234, *SMALL), translate_key("E")))
+    at_stair = route_to(explored, explored.level.stairs_down[0])
+    assert at_stair is not None
+    travelling = step(at_stair, translate_key("E"))
+    assert travelling.activity is not None
+    below = step(travelling, DESCEND)
+    assert below.activity is None, "an activity must not cross levels"
+    assert below.depth == 2
+
+
+@pytest.mark.parametrize("seed", (1234, 7))
+def test_an_activity_never_walks_the_player_into_a_wall(seed: int) -> None:
+    """The safety invariant, now that something other than the player is driving."""
+    state = step(new_game(seed, *SMALL), translate_key("E"))
+    ticks = 0
+    while state.activity is not None and ticks < 4000:
+        state = advance(state)
+        ticks += 1
+        x, y = state.player
+        assert state.level.in_bounds(x, y)
+        assert world.is_passable(state.level, state.open_doors, x, y)

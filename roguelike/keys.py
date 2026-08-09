@@ -26,13 +26,15 @@ __all__ = [
 
 
 class CommandKind(Enum):
-    """The five things a key press can mean."""
+    """The seven things a key press can mean."""
 
     MOVE = auto()
     QUIT = auto()
     UNKNOWN = auto()
     DESCEND = auto()  # ">"
     ASCEND = auto()  # "<"
+    AUTO_EXPLORE = auto()  # "E"
+    WALK_PREFIX = auto()  # "w"
 
 
 @dataclass(frozen=True)
@@ -52,7 +54,7 @@ QUIT_COMMAND: Command = Command(CommandKind.QUIT)
 UNKNOWN_COMMAND: Command = Command(CommandKind.UNKNOWN)
 
 
-# --- Binding table (CONTRACT §5.1) ------------------------------------------
+# --- Binding table (CONTRACT §5.1, CONTRACT-v4 §5.1) -------------------------
 #
 # Each entry is a movement delta paired with the keys that request it. Keys are
 # written either as the single ASCII character they produce (so the digits are
@@ -60,25 +62,39 @@ UNKNOWN_COMMAND: Command = Command(CommandKind.UNKNOWN)
 # curses keypad constant.
 #
 # Remember: dy = -1 is NORTH.
-
+#
+# The diagonals gained Shift+arrow and Shift+hjkl bindings in v4, each rotated
+# 45 degrees CLOCKWISE from its base direction (Shift+Up -> north-east, and so
+# on); they resolve to the exact same deltas numpad 1/3/7/9 and yubn have
+# always produced, so they are added onto the existing diagonal rows rather
+# than as new ones.
+#
+# TRAP: the curses constants for Shift+Up and Shift+Down are named KEY_SR and
+# KEY_SF ("scroll reverse"/"scroll forward") for historical reasons that have
+# nothing to do with arrows. KEY_SR is Shift+Up (-> north-east, negative dy);
+# KEY_SF is Shift+Down (-> south-west, positive dy). Swapping them is the
+# single most likely bug in this table.
 _MOVEMENT_BINDINGS: tuple[tuple[tuple[int, int], tuple[int | str, ...]], ...] = (
     ((-1, 0), ("h", "4", curses.KEY_LEFT)),  # west
     ((1, 0), ("l", "6", curses.KEY_RIGHT)),  # east
     ((0, -1), ("k", "8", curses.KEY_UP)),  # north
     ((0, 1), ("j", "2", curses.KEY_DOWN)),  # south
-    ((-1, -1), ("y", "7")),  # north-west
-    ((1, -1), ("u", "9")),  # north-east
-    ((-1, 1), ("b", "1")),  # south-west
-    ((1, 1), ("n", "3")),  # south-east
+    ((-1, -1), ("y", "7", "H", curses.KEY_SLEFT)),  # north-west (Shift+Left)
+    ((1, -1), ("u", "9", "K", curses.KEY_SR)),  # north-east (Shift+Up)
+    ((-1, 1), ("b", "1", "J", curses.KEY_SF)),  # south-west (Shift+Down)
+    ((1, 1), ("n", "3", "L", curses.KEY_SRIGHT)),  # south-east (Shift+Right)
 )
 
 _QUIT_KEYS: tuple[int | str, ...] = ("q", "Q")
 
 # Stairs are used by an explicit command, as in ADOM (CONTRACT-v3 §5) — not by
-# stepping on the tile. dx == dy == 0 for both.
-_STAIR_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
+# stepping on the tile. AUTO_EXPLORE ("E") and WALK_PREFIX ("w") are new in
+# v4. All four carry dx == dy == 0.
+_NO_ARG_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
     (CommandKind.DESCEND, ">"),
     (CommandKind.ASCEND, "<"),
+    (CommandKind.AUTO_EXPLORE, "E"),
+    (CommandKind.WALK_PREFIX, "w"),
 )
 
 
@@ -95,7 +111,7 @@ def _build_bindings() -> dict[int, Command]:
             bindings[_keycode(table_key)] = command
     for table_key in _QUIT_KEYS:
         bindings[_keycode(table_key)] = QUIT_COMMAND
-    for kind, table_key in _STAIR_BINDINGS:
+    for kind, table_key in _NO_ARG_BINDINGS:
         bindings[_keycode(table_key)] = Command(kind)
     return bindings
 

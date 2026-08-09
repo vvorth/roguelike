@@ -14,7 +14,12 @@ import pytest
 
 from roguelike.level import Level, freeze_grid
 from roguelike.tiles import TILE_CHARS, DOOR_OPEN_CHAR, Tile
-from roguelike.world import is_closed_door, is_passable, is_transparent
+from roguelike.world import (
+    is_closed_door,
+    is_passable,
+    is_planning_passable,
+    is_transparent,
+)
 
 CHAR_TO_TILE = {"#": Tile.WALL, ".": Tile.FLOOR, "+": Tile.DOOR}
 
@@ -274,6 +279,140 @@ def test_tile_vocabulary_is_pinned():
         Tile.STAIRS_UP,
         Tile.STAIRS_DOWN,
     }
+
+
+# --------------------------------------------------------------------------
+# is_planning_passable (CONTRACT-v4 §13) — the predicate a *route* is planned
+# with, as opposed to the one an actual step is taken with.
+# --------------------------------------------------------------------------
+
+
+def stairs_level() -> Level:
+    """A one-room level with both staircases in it.
+
+    Built from tiles rather than characters because the character table above is the
+    v2 vocabulary and is deliberately left alone; the point here is only that the two
+    v3 stair tiles, being ``WALKABLE``, are planning-passable for free.
+    """
+    rows = [
+        [Tile.WALL] * 5,
+        [Tile.WALL, Tile.FLOOR, Tile.STAIRS_UP, Tile.STAIRS_DOWN, Tile.WALL],
+        [Tile.WALL] * 5,
+    ]
+    return Level(5, 3, freeze_grid(rows), (), (1, 1), 3)
+
+
+def test_is_planning_passable_true_for_floor():
+    level = open_level()
+    assert is_planning_passable(level, CLOSED, *FLOOR_POS) is True
+    assert is_planning_passable(level, OPEN, *FLOOR_POS) is True
+
+
+def test_is_planning_passable_true_for_an_open_door():
+    level = open_level()
+    assert is_planning_passable(level, OPEN, *DOOR_POS) is True
+
+
+def test_is_planning_passable_true_for_a_closed_door():
+    # The whole reason this function exists: a closed door may be routed *through*,
+    # because bumping it opens it. Without this, every frontier behind a door is
+    # unreachable and auto-explore stalls in the first room (CONTRACT-v4 §13).
+    level = open_level()
+    assert is_closed_door(level, CLOSED, *DOOR_POS) is True
+    assert is_planning_passable(level, CLOSED, *DOOR_POS) is True
+
+
+def test_is_planning_passable_false_for_wall():
+    level = open_level()
+    assert is_planning_passable(level, CLOSED, *WALL_POS) is False
+    assert is_planning_passable(level, OPEN, *WALL_POS) is False
+
+
+def test_is_planning_passable_false_out_of_bounds():
+    level = open_level()
+    for x, y in [(-1, -1), (-1, 0), (0, -1), (100, 2), (2, 100), (10**6, 10**6)]:
+        assert is_planning_passable(level, CLOSED, x, y) is False
+        assert is_planning_passable(level, OPEN, x, y) is False
+
+
+def test_is_planning_passable_true_for_both_staircases():
+    level = stairs_level()
+    assert is_planning_passable(level, CLOSED, 2, 1) is True  # STAIRS_UP
+    assert is_planning_passable(level, CLOSED, 3, 1) is True  # STAIRS_DOWN
+
+
+def test_is_planning_passable_differs_from_is_passable_on_exactly_the_closed_door():
+    # Swept over the whole level plus a two-cell out-of-bounds margin: the closed door
+    # is the *only* cell on which the planning predicate and the movement predicate
+    # disagree, and once the door is open they agree everywhere.
+    level = open_level()
+    coords = [
+        (x, y) for y in range(-2, level.height + 2) for x in range(-2, level.width + 2)
+    ]
+    differ_closed = {
+        (x, y)
+        for x, y in coords
+        if is_planning_passable(level, CLOSED, x, y) != is_passable(level, CLOSED, x, y)
+    }
+    differ_open = {
+        (x, y)
+        for x, y in coords
+        if is_planning_passable(level, OPEN, x, y) != is_passable(level, OPEN, x, y)
+    }
+    assert differ_closed == {DOOR_POS}
+    assert differ_open == set()
+
+
+def test_is_planning_passable_is_exactly_is_passable_or_is_closed_door_everywhere():
+    level = open_level()
+    for open_doors in (CLOSED, OPEN):
+        for y in range(-2, level.height + 2):
+            for x in range(-2, level.width + 2):
+                assert is_planning_passable(level, open_doors, x, y) == (
+                    is_passable(level, open_doors, x, y)
+                    or is_closed_door(level, open_doors, x, y)
+                )
+
+
+def test_movement_and_sight_predicates_are_unchanged_by_the_planning_predicate():
+    # Only planning may route through a closed door. Stepping onto one and seeing
+    # through one must both still be refused, or the door stops being a door.
+    level = open_level()
+    assert is_planning_passable(level, CLOSED, *DOOR_POS) is True
+    assert is_passable(level, CLOSED, *DOOR_POS) is False
+    assert is_transparent(level, CLOSED, *DOOR_POS) is False
+
+
+def test_is_planning_passable_never_raises_over_a_swept_margin():
+    level = open_level()
+    coords = [
+        (x, y) for y in range(-2, level.height + 2) for x in range(-2, level.width + 2)
+    ]
+    coords += [(-1, -1), (10**6, 10**6), (-(10**6), -(10**6))]
+    for open_doors in (CLOSED, OPEN):
+        for x, y in coords:
+            is_planning_passable(level, open_doors, x, y)
+
+
+def test_is_planning_passable_does_not_mutate_its_arguments():
+    level = open_level()
+    level_before = copy.deepcopy(level)
+    doors_before = frozenset(OPEN)
+    for y in range(-2, level.height + 2):
+        for x in range(-2, level.width + 2):
+            is_planning_passable(level, OPEN, x, y)
+    assert level == level_before
+    assert level.grid == level_before.grid
+    assert OPEN == doors_before
+
+
+def test_is_planning_passable_is_deterministic():
+    level = open_level()
+    for open_doors in (CLOSED, OPEN):
+        for pos in (FLOOR_POS, WALL_POS, DOOR_POS, (-1, -1)):
+            assert is_planning_passable(level, open_doors, *pos) == is_planning_passable(
+                level, open_doors, *pos
+            )
 
 
 # --------------------------------------------------------------------------

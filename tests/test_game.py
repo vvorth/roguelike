@@ -24,6 +24,10 @@ The rules these tests exist to pin, in order of how easy they are to break:
    changes underneath them.
 4. **No wording lives in this module.** ``step`` emits ``Event`` values;
    :func:`roguelike.events.message_for` turns them into sentences.
+5. **Timing lives in ``run`` and nowhere else** (v4). ``step`` and ``advance`` are pure, so
+   a whole auto-explore of a real generated level runs to completion in a test with no
+   screen, no clock and no waiting; the loop's 100 ms deadline is observed only through a
+   stub screen that records the number it was handed.
 """
 
 from __future__ import annotations
@@ -40,12 +44,15 @@ from pathlib import Path
 import pytest
 
 from roguelike import dungeon, events, fov, game, world
+from roguelike.activity import Activity, ActivityKind
 from roguelike.events import Event, EventKind
 from roguelike.game import (
     GameState,
     LevelState,
+    advance,
     format_stats,
     format_status_right,
+    interruption,
     new_game,
     play,
     run,
@@ -229,6 +236,95 @@ def stairs_level(
     return build_level(STAIRS_ROWS, player_start, seed, depth)
 
 
+#: 7x3. A dead-straight corridor: one cell tall, walled above and below, so every cell of
+#: it is *thin* by the 2x2 test (CONTRACT-v4 §18.2) and an auto-walk follows it to the end
+#: and stops with nowhere further to go.
+#:
+#:      0123456
+#:   0  #######
+#:   1  #.....#
+#:   2  #######
+CORRIDOR_ROWS = [
+    "#######",
+    "#.....#",
+    "#######",
+]
+
+
+#: 6x5. A corridor that turns south at (2, 1) — the bend an auto-walk must *follow*,
+#: rather than stopping at, because a corridor with exactly one way on is not a choice.
+#:
+#:      012345
+#:   0  ######
+#:   1  #..###
+#:   2  ##.###
+#:   3  ##.###
+#:   4  ######
+BEND_ROWS = [
+    "######",
+    "#..###",
+    "##.###",
+    "##.###",
+    "######",
+]
+
+
+#: 7x4. A T-junction at (3, 2): the corridor along row 2 meets a branch going north. An
+#: auto-walk arriving from the west has two ways on and must stop rather than guess.
+#:
+#:      0123456
+#:   0  #######
+#:   1  ###.###
+#:   2  #.....#
+#:   3  #######
+JUNCTION_ROWS = [
+    "#######",
+    "###.###",
+    "#.....#",
+    "#######",
+]
+
+JUNCTION_CELL = (3, 2)
+
+
+#: 10x6. A corridor along row 3 running east into a room — the auto-walk must stop on
+#: (3, 3), one cell short of the first *wide* cell, without stepping into the room.
+#:
+#:      0123456789
+#:   0  ##########
+#:   1  ##########
+#:   2  ####....##
+#:   3  #.......##
+#:   4  ####....##
+#:   5  ##########
+OPENING_ROWS = [
+    "##########",
+    "##########",
+    "####....##",
+    "#.......##",
+    "####....##",
+    "##########",
+]
+
+OPENING_STOP = (3, 3)
+
+
+#: 9x3. A corridor with a closed door in the middle of it, at (4, 1). An auto-walk bumps
+#: the door open, spends the turn, says so — and keeps walking (user decision 3).
+#:
+#:      012345678
+#:   0  #########
+#:   1  #...+...#
+#:   2  #########
+DOOR_CORRIDOR_ROWS = [
+    "#########",
+    "#...+...#",
+    "#########",
+]
+
+CORRIDOR_DOOR = (4, 1)
+
+
 MOVE_N = Command(CommandKind.MOVE, 0, -1)
 MOVE_S = Command(CommandKind.MOVE, 0, 1)
 MOVE_W = Command(CommandKind.MOVE, -1, 0)
@@ -244,8 +340,18 @@ QUIT = Command(CommandKind.QUIT)
 UNKNOWN = Command(CommandKind.UNKNOWN)
 DESCEND = Command(CommandKind.DESCEND)
 ASCEND = Command(CommandKind.ASCEND)
+AUTO_EXPLORE = Command(CommandKind.AUTO_EXPLORE)
+WALK_PREFIX = Command(CommandKind.WALK_PREFIX)
 
-ALL_KINDS = (*ALL_MOVES, QUIT, UNKNOWN, DESCEND, ASCEND)
+ALL_KINDS = (
+    *ALL_MOVES,
+    QUIT,
+    UNKNOWN,
+    DESCEND,
+    ASCEND,
+    AUTO_EXPLORE,
+    WALK_PREFIX,
+)
 
 #: Small but legal dimensions for the generated-dungeon tests, so descending stays quick.
 SMALL = (40, 18)
@@ -267,6 +373,8 @@ STATE_FIELDS = (
     "radius",
     "events",
     "outcome",
+    "activity",
+    "awaiting_walk",
 )
 
 
@@ -413,6 +521,11 @@ def test_gamestate_field_order_and_defaults() -> None:
     assert fields[10].default == fov.DEFAULT_RADIUS
     assert fields[11].default == ()          # events
     assert fields[12].default is None        # outcome
+    # v4 appends exactly two fields, both with defaults, so every v3 construction — and
+    # every positional one — keeps working untouched (CONTRACT-v4 §7).
+    assert fields[13].default is None        # activity
+    assert fields[14].default is False       # awaiting_walk
+    assert len(fields) == 15
 
 
 def test_gamestate_constructs_positionally_with_defaults() -> None:
@@ -428,6 +541,8 @@ def test_gamestate_constructs_positionally_with_defaults() -> None:
     assert state.radius == fov.DEFAULT_RADIUS
     assert state.events == ()
     assert state.outcome is None
+    assert state.activity is None
+    assert state.awaiting_walk is False
 
 
 def test_gamestate_is_frozen() -> None:
@@ -1185,8 +1300,18 @@ def test_descending_does_not_carry_the_old_level_s_fog_down() -> None:
 # ---------------------------------------------------------------------------------------
 
 
-def test_ascend_off_the_stairs_emits_no_stairs_up_and_costs_nothing() -> None:
+def test_ascend_with_no_staircase_known_still_says_so_and_costs_nothing() -> None:
+    # v3's rule, kept whole for the case it still covers: an up-staircase that has never
+    # been seen is one the character cannot walk to, so `<` still just says so
+    # (CONTRACT-v4 §7.4, user decision 2). Standing at (5, 3) the level's `<` at (3, 3) is
+    # in plain view, so the fog is cleared by hand to put it back out of knowledge — the
+    # travel case is the next test.
     state = start(stairs_level(), player=(5, 3))
+    state = dataclasses.replace(
+        state,
+        explored=state.explored - {UP_CELL},
+        visible=state.visible - {UP_CELL},
+    )
     before = snapshot(state)
     after = step(state, ASCEND)
 
@@ -1199,13 +1324,35 @@ def test_ascend_off_the_stairs_emits_no_stairs_up_and_costs_nothing() -> None:
     assert after.open_doors == before["open_doors"]
     assert after.running is True
     assert after.outcome is None
+    assert after.activity is None
 
 
-def test_ascend_on_the_down_staircase_is_still_no_stairs_up() -> None:
+def test_ascend_off_the_stairs_with_the_staircase_known_starts_travelling() -> None:
+    # The v4 half of the same key: the `<` at (3, 3) *is* explored from (5, 3), so `<`
+    # becomes a destination rather than a complaint. Still no turn — starting an activity
+    # is not an action.
+    state = start(stairs_level(), player=(5, 3))
+    assert UP_CELL in state.explored
+    after = step(state, ASCEND)
+
+    assert after.events == (Event(EventKind.TRAVELLING),)
+    assert after.activity == Activity(ActivityKind.TRAVEL, goal=UP_CELL)
+    assert after.turns == 0
+    assert after.player == state.player
+
+
+def test_ascend_on_the_down_staircase_is_still_not_a_way_up() -> None:
+    # Standing on `>` is not standing on `<`: the command does not take *this* staircase.
+    # Having walked the length of the level, the character does know where the up
+    # staircase is, so v4 sets off towards it instead of reporting nothing — and either
+    # way no turn is consumed and the depth does not change.
     state = walk_to(start(stairs_level()), DOWN_CELL)
     after = step(state, ASCEND)
-    assert after.events == (Event(EventKind.NO_STAIRS_UP),)
+    assert after.depth == state.depth
     assert after.turns == state.turns
+    assert after.player == DOWN_CELL
+    assert after.events == (Event(EventKind.TRAVELLING),)
+    assert after.activity == Activity(ActivityKind.TRAVEL, goal=UP_CELL)
 
 
 def test_ascend_at_depth_one_ends_the_game() -> None:
@@ -1978,6 +2125,8 @@ def test_import_set_matches_the_contract_import_graph() -> None:
         "roguelike.world",
         "roguelike.dungeon",
         "roguelike.events",
+        "roguelike.pathfind",   # v4 (CONTRACT-v4 §10)
+        "roguelike.activity",   # v4
     }
     assert "roguelike.game" not in roguelike_imports
     assert "roguelike.style" not in roguelike_imports
@@ -1988,14 +2137,103 @@ def test_import_set_matches_the_contract_import_graph() -> None:
     assert imported - roguelike_imports <= {"__future__", "curses", "dataclasses"}
 
 
+def test_no_module_reads_a_clock_or_sleeps() -> None:
+    """CONTRACT-v4 §0.10: ``stdscr.timeout`` is the only pacing mechanism permitted.
+
+    Both halves of the v4 loop — the ten-turns-a-second pace and instant cancellation —
+    fall out of one 100 ms deadline on ``getch``. Anything else here would be a second
+    mechanism doing a job the first already does, and a sleeping loop cannot be cancelled
+    by a keypress at all.
+    """
+    for forbidden in (
+        "time.sleep",
+        "time.time",
+        "time.monotonic",
+        "perf_counter",
+        "datetime",
+        "threading",
+        "asyncio",
+        "select.select",
+    ):
+        assert forbidden not in GAME_SOURCE
+
+    imported: set[str] = set()
+    for node in ast.walk(GAME_TREE):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert "time" not in imported
+
+    # No busy-wait: the only loop in the module is the turn loop in `run`, and it is
+    # driven by a blocking or deadlined `getch`, never by spinning on a condition.
+    loops = [
+        node
+        for node in ast.walk(GAME_TREE)
+        if isinstance(node, (ast.While, ast.For))
+    ]
+    assert len(loops) == 1
+    assert isinstance(loops[0], ast.While)
+    assert _enclosing_function(GAME_TREE, loops[0]) == "run"
+    calls_getch = any(
+        isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr == "getch"
+        for child in ast.walk(loops[0])
+    )
+    assert calls_getch, "every pass of the loop blocks on input rather than spinning"
+
+
+def test_the_loop_paces_with_timeout_and_nothing_else() -> None:
+    node = _function("run")
+    timeouts = [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr == "timeout"
+    ]
+    assert len(timeouts) == 2, "one deadline for an activity, one for ordinary play"
+    # And `timeout` is called nowhere else in the module — pacing is the loop's alone.
+    assert (
+        len(
+            [
+                child
+                for child in ast.walk(GAME_TREE)
+                if isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "timeout"
+            ]
+        )
+        == 2
+    )
+
+
+def test_advance_holds_no_terminal_and_no_pacing() -> None:
+    for name in ("advance", "interruption", "_planned_step", "_finished"):
+        node = _function(name)
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name):
+                assert child.id not in {"render", "curses", "stdscr"}
+            if isinstance(child, ast.Attribute):
+                assert child.attr not in {"timeout", "getch", "draw", "render_to_cells"}
+
+
 def test_step_does_not_touch_the_renderer_or_curses() -> None:
     for name in (
         "step",
+        "advance",
+        "interruption",
         "_take_turn",
         "_change_level",
         "_descend",
         "_ascend",
         "_stair_events",
+        "_travel_or_report",
+        "_explored_passable",
+        "_whole_level_passable",
+        "_planned_step",
+        "_finished",
         "new_game",
         "format_stats",
         "format_status_right",
@@ -2144,6 +2382,8 @@ def test_public_surface_is_exactly_the_contract_surface() -> None:
         "GameState",
         "new_game",
         "step",
+        "advance",
+        "interruption",
         "format_stats",
         "format_status_right",
         "run",
@@ -2166,6 +2406,10 @@ def test_signatures_match_the_contract() -> None:
     assert (
         str(inspect.signature(step))
         == "(state: 'GameState', command: 'Command') -> 'GameState'"
+    )
+    assert str(inspect.signature(advance)) == "(state: 'GameState') -> 'GameState'"
+    assert str(inspect.signature(interruption)) == (
+        "(before: 'GameState', after: 'GameState') -> 'Event | None'"
     )
     assert str(inspect.signature(format_stats)) == "(state: 'GameState') -> 'str'"
     assert str(inspect.signature(format_status_right)) == "(state: 'GameState') -> 'str'"
@@ -2238,15 +2482,42 @@ def test_no_out_of_scope_surface_was_added() -> None:
 
 
 def test_no_extra_command_kind_was_invented() -> None:
+    # v4 adds exactly two (CONTRACT-v4 §5) — the five above are v1-v3's, unchanged. The
+    # point of the test is unaltered: nothing beyond the contract's vocabulary exists, and
+    # this module invents no key of its own.
     assert {kind.name for kind in CommandKind} == {
         "MOVE",
         "QUIT",
         "UNKNOWN",
         "DESCEND",
         "ASCEND",
+        "AUTO_EXPLORE",
+        "WALK_PREFIX",
     }
-    for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH"):
+    for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH", "TRAVEL", "RUN"):
         assert f"CommandKind.{name}" not in GAME_SOURCE
+
+
+def test_no_extra_activity_kind_was_invented() -> None:
+    assert {kind.name for kind in ActivityKind} == {
+        "TRAVEL",
+        "AUTO_EXPLORE",
+        "AUTO_WALK",
+    }
+    for name in ("REST", "SEARCH", "FOLLOW", "DESCEND", "ASCEND"):
+        assert f"ActivityKind.{name}" not in GAME_SOURCE
+
+
+def test_no_route_cache_or_turn_cap_was_added() -> None:
+    """CONTRACT-v4 §7.5, §18.1: re-plan every turn, because it is affordable.
+
+    A cached path is the one thing that could go stale against a door opening underneath
+    it, and a ``max_turns`` cap would make finishing a level a matter of luck. Neither is
+    needed at 0.235 ms a search, so neither may be written.
+    """
+    assert "path" not in {f.name for f in dataclasses.fields(Activity)}
+    for name in ("max_turns", "_cache", "cached", "lru_cache", "memo"):
+        assert name not in GAME_SOURCE
 
 
 def test_only_the_first_down_staircase_is_used() -> None:
@@ -2282,10 +2553,17 @@ class StubScreen:
         self._current: dict[tuple[int, int], str] = {}
         self.keypad_called: bool | None = None
         self.refreshes = 0
+        #: Every value ``run`` has handed to ``timeout``, in order. This is the whole of
+        #: how v4's pacing is observable without a terminal: -1 is "block for a key", 100
+        #: is "give the player a tenth of a second to interrupt" (CONTRACT-v4 §7.7).
+        self.timeouts: list[int] = []
 
     def getch(self) -> int:
         assert self._keys, "run asked for more input than the script provides"
         return self._keys.pop(0)
+
+    def timeout(self, delay: int) -> None:
+        self.timeouts.append(delay)
 
     def erase(self) -> None:
         self._current = {}
@@ -2456,3 +2734,856 @@ def test_standing_on_the_start_staircase_the_up_command_is_the_way_out() -> None
     after = step(state, translate_key("<"))
     assert after.running is False
     assert after.outcome
+
+
+# ---------------------------------------------------------------------------------------
+# v4 — helpers for driving an activity to its end, headlessly
+# ---------------------------------------------------------------------------------------
+
+
+def corridor_state(rows: list[str], player: tuple[int, int]) -> GameState:
+    """A game standing at ``player`` on a hand-built corridor map."""
+    return start(build_level(rows, player_start=player))
+
+
+def walk(state: GameState, dx: int, dy: int) -> GameState:
+    """``w`` then a direction: the two keystrokes that start an auto-walk."""
+    return step(step(state, WALK_PREFIX), Command(CommandKind.MOVE, dx, dy))
+
+
+def finish_activity(state: GameState, limit: int = 4000) -> GameState:
+    """Call :func:`advance` until the activity clears, and return the final state.
+
+    The limit is a test harness guard, not a game rule: every activity in this project
+    terminates by running out of route or out of frontier (CONTRACT-v4 §7.5), and a run
+    that hits the limit is a bug in the engine rather than a slow level. Nothing here
+    waits, sleeps or reads a clock — ``advance`` is a pure function and this loop runs at
+    whatever speed the machine manages.
+    """
+    ticks = 0
+    while state.activity is not None:
+        assert ticks < limit, "the activity never finished"
+        state = advance(state)
+        ticks += 1
+    return state
+
+
+def event_kinds(state: GameState) -> set[EventKind]:
+    return {event.kind for event in state.events}
+
+
+# ---------------------------------------------------------------------------------------
+# step — the walk prefix (CONTRACT-v4 §7.4)
+# ---------------------------------------------------------------------------------------
+
+
+def test_walk_prefix_asks_which_way_and_costs_no_turn() -> None:
+    state = corridor_state(CORRIDOR_ROWS, (1, 1))
+    after = step(state, WALK_PREFIX)
+
+    assert after.awaiting_walk is True
+    assert after.events == (Event(EventKind.WALK_WHICH_WAY),)
+    assert events.message_for(after.events) == "Walk in which direction?"
+    assert after.turns == 0
+    assert after.player == state.player
+    assert after.activity is None
+    assert after.visible is state.visible, "no turn passed, so nothing was recomputed"
+
+
+def test_a_direction_after_the_prefix_starts_an_auto_walk_without_a_turn() -> None:
+    state = step(corridor_state(CORRIDOR_ROWS, (1, 1)), WALK_PREFIX)
+    after = step(state, MOVE_E)
+
+    assert after.activity == Activity(ActivityKind.AUTO_WALK, direction=(1, 0))
+    assert after.awaiting_walk is False, "the prefix is spent"
+    assert after.turns == 0, "advance takes every step of the walk, not step"
+    assert after.player == state.player
+
+
+@pytest.mark.parametrize("command", ALL_MOVES)
+def test_every_direction_can_start_a_walk(command: Command) -> None:
+    state = step(start(open_level()), WALK_PREFIX)
+    after = step(state, command)
+    assert after.activity == Activity(
+        ActivityKind.AUTO_WALK, direction=(command.dx, command.dy)
+    )
+    assert after.turns == 0
+
+
+@pytest.mark.parametrize(
+    "command", [QUIT, UNKNOWN, DESCEND, ASCEND, AUTO_EXPLORE, WALK_PREFIX]
+)
+def test_the_prefix_swallows_any_non_direction_command_whole(command: Command) -> None:
+    # CONTRACT-v4 §11: prefix cleared, command consumed, no turn, no action, no event —
+    # `w` followed by a typo is a typo, not an error and not half a command.
+    state = _with_a_message(step(start(stairs_level(), player=(5, 3)), WALK_PREFIX))
+    after = step(state, command)
+
+    assert after.awaiting_walk is False
+    assert after.activity is None
+    assert after.turns == state.turns
+    assert after.player == state.player
+    assert after.events == state.events, "not even the message is disturbed"
+    assert after.running is True
+
+
+def test_quit_after_the_prefix_does_not_quit() -> None:
+    # The sharpest case of the rule above, and the one a player would notice: `wq` must
+    # not end the game.
+    state = step(new_game(1234, *SMALL), WALK_PREFIX)
+    after = step(state, QUIT)
+    assert after.running is True
+    assert after.awaiting_walk is False
+    assert after.outcome is None
+
+
+def test_the_prefix_does_not_survive_a_second_command() -> None:
+    state = step(step(new_game(1234, *SMALL), WALK_PREFIX), UNKNOWN)
+    assert state.awaiting_walk is False
+    after = step(state, MOVE_E)
+    assert after.activity is None, "the direction is an ordinary move again"
+
+
+def test_translate_key_reaches_the_prefix_and_the_walk() -> None:
+    state = corridor_state(CORRIDOR_ROWS, (1, 1))
+    state = step(state, translate_key("w"))
+    assert state.awaiting_walk is True
+    state = step(state, translate_key("l"))
+    assert state.activity == Activity(ActivityKind.AUTO_WALK, direction=(1, 0))
+
+
+# ---------------------------------------------------------------------------------------
+# step — auto-explore (CONTRACT-v4 §7.4)
+# ---------------------------------------------------------------------------------------
+
+
+def test_auto_explore_starts_an_activity_and_costs_no_turn() -> None:
+    state = new_game(1234, *SMALL)
+    after = step(state, AUTO_EXPLORE)
+
+    assert after.activity == Activity(ActivityKind.AUTO_EXPLORE)
+    assert after.turns == 0
+    assert after.player == state.player
+    assert after.depth == state.depth
+    assert after.events == state.events
+
+
+def test_auto_explore_reaches_step_through_translate_key() -> None:
+    after = step(new_game(1234, *SMALL), translate_key("E"))
+    assert after.activity == Activity(ActivityKind.AUTO_EXPLORE)
+
+
+def test_auto_explore_with_nothing_left_reports_it_and_costs_no_turn() -> None:
+    # CONTRACT-v4 §11. `step` does not special-case it — starting the activity is
+    # unconditional — so the report comes from the first `advance`, which finds no
+    # frontier, clears the activity and spends no turn.
+    state = finish_activity(step(new_game(1234, *SMALL), AUTO_EXPLORE))
+    turns = state.turns
+
+    again = advance(step(state, AUTO_EXPLORE))
+    assert again.events == (Event(EventKind.EXPLORED_EVERYTHING),)
+    assert again.activity is None
+    assert again.turns == turns
+    assert again.player == state.player
+
+
+# ---------------------------------------------------------------------------------------
+# step — travel to a known staircase (CONTRACT-v4 §7.4)
+# ---------------------------------------------------------------------------------------
+
+
+def explored_stairs_state() -> GameState:
+    """Standing off the stairs on a level whose down-staircase has been seen."""
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    state = walk_to(state, UP_CELL)
+    assert DOWN_CELL in state.explored
+    assert state.player != DOWN_CELL
+    return state
+
+
+def test_descend_off_the_stairs_with_the_staircase_known_starts_travelling() -> None:
+    state = explored_stairs_state()
+    after = step(state, DESCEND)
+
+    assert after.activity == Activity(ActivityKind.TRAVEL, goal=DOWN_CELL)
+    assert after.events == (Event(EventKind.TRAVELLING),)
+    assert events.message_for(after.events) == "You travel towards the staircase."
+    assert after.turns == state.turns, "starting an activity is not an action"
+    assert after.player == state.player
+    assert after.depth == state.depth
+
+
+def test_descend_off_the_stairs_with_nothing_known_starts_no_activity() -> None:
+    # v3's rule survives intact (user decision 2): the door on this level is shut, so the
+    # eastern half — and the `>` in it — has never been seen.
+    state = start(stairs_level())
+    assert DOWN_CELL not in state.explored
+    after = step(state, DESCEND)
+
+    assert after.events == (Event(EventKind.NO_STAIRS_DOWN),)
+    assert after.activity is None
+    assert after.turns == 0
+    assert after.player == state.player
+
+
+def test_descend_underfoot_still_descends_rather_than_travelling() -> None:
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    after = step(state, DESCEND)
+    assert after.depth == 2
+    assert after.activity is None
+    assert after.turns == state.turns + 1
+
+
+def test_travel_picks_the_nearest_of_several_known_staircases() -> None:
+    rows = [
+        "###########",
+        "#>...<...>#",
+        "###########",
+    ]
+    level = build_level(rows, player_start=(5, 1))
+    state = start(level)
+    assert level.stairs_down == ((1, 1), (9, 1))
+    assert set(level.stairs_down) <= state.explored
+
+    after = step(state, DESCEND)
+    assert after.activity is not None
+    assert after.activity.goal in level.stairs_down
+
+    # (5, 1) is equidistant from both, so it proves nothing on its own; one cell either
+    # way must settle it, and the answer must be the near staircase both times.
+    west = step(start(build_level(rows, player_start=(4, 1))), DESCEND)
+    assert west.activity == Activity(ActivityKind.TRAVEL, goal=(1, 1))
+    east = step(start(build_level(rows, player_start=(6, 1))), DESCEND)
+    assert east.activity == Activity(ActivityKind.TRAVEL, goal=(9, 1))
+
+    # And the far one is chosen when the near one has not been found yet.
+    blinkered = dataclasses.replace(
+        start(build_level(rows, player_start=(4, 1))),
+        explored=start(build_level(rows, player_start=(4, 1))).explored - {(1, 1)},
+    )
+    assert step(blinkered, DESCEND).activity == Activity(
+        ActivityKind.TRAVEL, goal=(9, 1)
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# step — a command always clears a running activity (CONTRACT-v4 §7.4)
+# ---------------------------------------------------------------------------------------
+
+
+def running_explore(seed: int = 1234) -> GameState:
+    """A game part-way through an auto-explore, so there is an activity to interrupt."""
+    state = advance(advance(step(new_game(seed, *SMALL), AUTO_EXPLORE)))
+    assert state.activity is not None
+    return state
+
+
+@pytest.mark.parametrize("command", ALL_KINDS)
+def test_any_command_clears_a_running_activity(command: Command) -> None:
+    """CONTRACT-v4 §7.4, stated as strongly as it can be: **a command means the same
+    thing whether or not something was running**. The activity is cleared before the
+    command is looked at, so no command can inherit one — and a command that starts an
+    activity of its own (``E``, or ``>`` off the stairs) starts the one it always would.
+    """
+    state = running_explore()
+    idle = dataclasses.replace(state, activity=None)
+    assert step(state, command) == step(idle, command)
+
+
+def test_a_move_during_an_activity_clears_it_and_is_an_ordinary_move() -> None:
+    state = running_explore()
+    after = step(state, MOVE_E)
+    assert after.activity is None
+    # The move itself is unchanged by the cancellation: it either moved, opened a door, or
+    # was rejected, exactly as it would have with no activity running.
+    assert after == step(dataclasses.replace(state, activity=None), MOVE_E)
+
+
+def test_quit_during_an_activity_clears_it_and_quits() -> None:
+    state = running_explore()
+    after = step(state, QUIT)
+    assert after.activity is None
+    assert after.running is False
+
+
+def test_a_travel_activity_does_not_survive_a_descent() -> None:
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    state = dataclasses.replace(
+        state, activity=Activity(ActivityKind.TRAVEL, goal=UP_CELL)
+    )
+    after = step(state, DESCEND)
+    assert after.depth == 2
+    assert after.activity is None
+
+
+def test_an_explore_activity_does_not_survive_a_descent_or_the_ascent_back() -> None:
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    state = dataclasses.replace(state, activity=Activity(ActivityKind.AUTO_EXPLORE))
+    below = step(state, DESCEND)
+    assert below.depth == 2 and below.activity is None
+
+    below = dataclasses.replace(below, activity=Activity(ActivityKind.AUTO_EXPLORE))
+    above = step(below, ASCEND)
+    assert above.depth == 1 and above.activity is None
+
+
+# ---------------------------------------------------------------------------------------
+# advance — the idle cases (CONTRACT-v4 §7.5, §11)
+# ---------------------------------------------------------------------------------------
+
+
+def test_advance_with_no_activity_returns_the_state_unchanged() -> None:
+    state = new_game(1234, *SMALL)
+    assert advance(state) is state
+
+
+@pytest.mark.parametrize("seed", [1234, 7, 42])
+def test_advance_is_idle_however_many_times_it_is_called(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    for _ in range(5):
+        assert advance(state) is state
+    assert state.turns == 0
+
+
+def test_advance_does_nothing_once_the_game_has_stopped() -> None:
+    state = dataclasses.replace(
+        new_game(1234, *SMALL),
+        running=False,
+        activity=Activity(ActivityKind.AUTO_EXPLORE),
+    )
+    assert advance(state) is state
+
+
+# ---------------------------------------------------------------------------------------
+# advance — auto-walk (CONTRACT-v4 §7.5, §19.2)
+# ---------------------------------------------------------------------------------------
+
+
+def test_auto_walk_follows_a_corridor_to_its_end() -> None:
+    state = walk(corridor_state(CORRIDOR_ROWS, (1, 1)), 1, 0)
+    final = finish_activity(state)
+
+    assert final.player == (5, 1), "the last cell of the corridor"
+    assert final.activity is None
+    assert final.events == (Event(EventKind.NOTHING_FURTHER),)
+    assert events.message_for(final.events) == "There is nowhere further to go."
+    assert final.turns == 4, "one turn per cell walked, and none for stopping"
+
+
+def test_auto_walk_follows_a_bend() -> None:
+    # The corridor turns south at (2, 1); a walk started eastwards must go round it
+    # rather than stopping, because a corridor with one way on is not a choice.
+    state = walk(corridor_state(BEND_ROWS, (1, 1)), 1, 0)
+    final = finish_activity(state)
+
+    assert final.player == (2, 3)
+    assert final.events == (Event(EventKind.NOTHING_FURTHER),)
+    assert final.turns == 3
+
+
+def test_auto_walk_stops_at_a_junction() -> None:
+    state = walk(corridor_state(JUNCTION_ROWS, (1, 2)), 1, 0)
+    final = finish_activity(state)
+
+    assert final.player == JUNCTION_CELL
+    assert final.activity is None
+    assert final.events == (Event(EventKind.STOPPED_AT_JUNCTION),)
+    assert events.message_for(final.events) == "You stop at a junction."
+
+
+def test_auto_walk_stops_before_an_opening_without_entering_it() -> None:
+    state = walk(corridor_state(OPENING_ROWS, (1, 3)), 1, 0)
+    final = finish_activity(state)
+
+    assert final.player == OPENING_STOP
+    assert final.activity is None
+    assert final.events == (Event(EventKind.STOPPED_AT_OPENING),)
+    assert events.message_for(final.events) == "You stop before the opening."
+    assert final.level.is_walkable(4, 3), "the room really is one step further on"
+
+
+def test_auto_walk_into_a_wall_stops_at_once_without_a_turn() -> None:
+    state = walk(corridor_state(CORRIDOR_ROWS, (1, 1)), -1, 0)
+    final = advance(state)
+
+    assert final.player == (1, 1)
+    assert final.turns == 0
+    assert final.activity is None
+    assert final.events == (Event(EventKind.NOTHING_FURTHER),)
+
+
+def test_auto_walk_opens_a_door_and_keeps_walking() -> None:
+    # User decision 3, and the rule most easily got wrong: the door opens, costs its turn,
+    # says so — and the walk is still running afterwards.
+    state = walk(corridor_state(DOOR_CORRIDOR_ROWS, (1, 1)), 1, 0)
+
+    opened = None
+    while state.activity is not None and opened is None:
+        before = state
+        state = advance(state)
+        if state.open_doors != before.open_doors:
+            opened = state
+
+    assert opened is not None, "the walk reached the door"
+    assert opened.open_doors == frozenset({CORRIDOR_DOOR})
+    assert opened.events == (Event(EventKind.DOOR_OPENED),)
+    assert opened.turns == before.turns + 1, "opening a door costs its turn"
+    assert opened.player == before.player, "and does not move you"
+    assert opened.activity is not None, "and does not stop the walk"
+
+    final = finish_activity(state)
+    assert final.player == (7, 1), "the walk carried on past the door"
+    assert final.events == (Event(EventKind.NOTHING_FURTHER),)
+
+
+def test_auto_walk_carries_came_from_forward_so_it_never_doubles_back() -> None:
+    state = walk(corridor_state(CORRIDOR_ROWS, (1, 1)), 1, 0)
+    assert state.activity is not None and state.activity.came_from is None
+
+    seen = [state.player]
+    while state.activity is not None:
+        previous = state.player
+        state = advance(state)
+        if state.activity is not None and state.player != previous:
+            assert state.activity.came_from == previous
+            seen.append(state.player)
+    assert seen == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+    assert len(set(seen)) == len(seen), "no cell is visited twice"
+
+
+def test_auto_walk_never_changes_depth() -> None:
+    state = walk(start(stairs_level(), player=(5, 3)), 1, 0)
+    final = finish_activity(state)
+    assert final.depth == 1
+    assert final.saved == {}
+
+
+# ---------------------------------------------------------------------------------------
+# advance — travel (CONTRACT-v4 §7.5)
+# ---------------------------------------------------------------------------------------
+
+
+def test_travel_walks_to_the_staircase_and_arrives() -> None:
+    state = step(explored_stairs_state(), DESCEND)
+    final = finish_activity(state)
+
+    assert final.player == DOWN_CELL
+    assert final.activity is None
+    assert final.events == (Event(EventKind.ARRIVED),)
+    assert events.message_for(final.events) == "You arrive at the staircase."
+    assert final.turns > state.turns, "walking there costs a turn per step"
+    assert final.depth == 1, "travel does not take the staircase for you"
+
+
+def test_travel_leaves_the_player_standing_on_the_staircase_ready_to_descend() -> None:
+    state = finish_activity(step(explored_stairs_state(), DESCEND))
+    after = step(state, DESCEND)
+    assert after.depth == 2
+
+
+def test_travel_to_the_cell_already_underfoot_arrives_at_once() -> None:
+    state = dataclasses.replace(
+        start(stairs_level(), player=(5, 3)),
+        activity=Activity(ActivityKind.TRAVEL, goal=(5, 3)),
+    )
+    after = advance(state)
+    assert after.events == (Event(EventKind.ARRIVED),)
+    assert after.activity is None
+    assert after.turns == state.turns
+
+
+def test_travel_to_an_unreachable_goal_reports_nowhere_further() -> None:
+    # A staircase seen but walled off. It cannot arise from today's generator, which
+    # connects everything; the fog is set by hand so the seam is pinned anyway.
+    level = build_level(["#####", "#.#>#", "#####"], player_start=(1, 1))
+    state = start(level)
+    state = dataclasses.replace(state, explored=state.explored | {(3, 1)})
+
+    started = step(state, DESCEND)
+    assert started.activity == Activity(ActivityKind.TRAVEL, goal=(3, 1))
+    assert started.events == (Event(EventKind.TRAVELLING),)
+
+    after = advance(started)
+    assert after.events == (Event(EventKind.NOTHING_FURTHER),)
+    assert after.activity is None
+    assert after.turns == state.turns
+    assert after.player == (1, 1)
+
+
+def test_travel_never_routes_over_ground_that_has_not_been_seen() -> None:
+    # The character walks a route they could have worked out. Forgetting the middle of the
+    # corridor must make the far staircase unreachable, not merely a longer walk.
+    state = explored_stairs_state()
+    blinkered = dataclasses.replace(
+        state, explored=state.explored - {(12, y) for y in range(state.level.height)}
+    )
+    started = step(blinkered, DESCEND)
+    assert started.activity is not None
+    final = finish_activity(started)
+    assert final.player != DOWN_CELL
+    assert final.events == (Event(EventKind.NOTHING_FURTHER),)
+
+
+# ---------------------------------------------------------------------------------------
+# advance — auto-explore, end to end on real generated levels
+# ---------------------------------------------------------------------------------------
+
+
+def walkable_cells(level: Level) -> set[tuple[int, int]]:
+    return {
+        (x, y)
+        for y in range(level.height)
+        for x in range(level.width)
+        if level.is_walkable(x, y)
+    }
+
+
+@pytest.mark.parametrize("seed", [1234, 7, 42])
+def test_auto_explore_explores_the_level_and_says_when_it_is_done(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    walkable = walkable_cells(state.level)
+
+    running = step(state, AUTO_EXPLORE)
+    announcements = 0
+    ticks = 0
+    while running.activity is not None:
+        assert ticks < 4000, "the exploration never terminated"
+        running = advance(running)
+        announcements += EventKind.EXPLORED_EVERYTHING in event_kinds(running)
+        ticks += 1
+
+    covered = len(running.explored & walkable) / len(walkable)
+    assert covered >= 0.95, f"seed {seed} only reached {covered:.1%}"
+    assert running.activity is None
+    assert announcements == 1, "the level is finished exactly once"
+    assert running.events == (Event(EventKind.EXPLORED_EVERYTHING),)
+    assert running.depth == 1, "auto-explore never descends (user decision 1)"
+    assert running.saved == {}
+    assert running.running is True
+
+
+def test_auto_explore_opens_doors_and_carries_on() -> None:
+    state = step(new_game(1234, *SMALL), AUTO_EXPLORE)
+    opened_at = None
+    while state.activity is not None:
+        before = state
+        state = advance(state)
+        if state.open_doors > before.open_doors and opened_at is None:
+            opened_at = state
+
+    assert opened_at is not None, "the seed's level has a door on the way"
+    assert opened_at.events == (Event(EventKind.DOOR_OPENED),)
+    assert opened_at.activity is not None, "a door does not interrupt (user decision 3)"
+    assert state.open_doors >= opened_at.open_doors
+    assert len(state.open_doors) > 1, "and the ones after the first are opened too"
+    for x, y in state.open_doors:
+        assert state.level.tile_at(x, y) is Tile.DOOR
+
+
+def test_auto_explore_does_not_stall_when_the_player_stands_on_a_frontier() -> None:
+    """T20's one request of this module, and the reason ``advance`` subtracts the
+    player's own cell from the frontier goals.
+
+    A character whose own cell borders the unknown *is* standing on a frontier. Leave it
+    in the goal set and the search is asked to reach where it already is: it answers with
+    a one-cell path that has no step in it, and the activity gets nowhere — for ever, and
+    without saying so. It cannot happen at the default sight radius, where every
+    neighbour is already seen, so the case is built here on purpose with a radius of one.
+    """
+    state = start(open_level(player_start=(2, 2)), radius=1)
+    assert (1, 1) not in state.explored, "the diagonals are outside a radius of one"
+    assert state.player in game.frontier_cells(
+        state.level, state.explored, state.open_doors
+    ), "the character really is standing on a frontier"
+
+    after = advance(step(state, AUTO_EXPLORE))
+    assert after.turns == state.turns + 1, "a turn was actually taken"
+    assert after.player != state.player
+    assert after.activity is not None
+
+
+def test_auto_explore_only_ever_grows_what_is_known() -> None:
+    state = step(new_game(7, *SMALL), AUTO_EXPLORE)
+    while state.activity is not None:
+        before = state
+        state = advance(state)
+        assert state.explored >= before.explored
+        assert state.open_doors >= before.open_doors
+        assert state.turns in (before.turns, before.turns + 1)
+        assert state.depth == before.depth
+        assert state.level is before.level
+
+
+def test_auto_explore_costs_one_turn_per_advance_that_did_something() -> None:
+    state = step(new_game(42, *SMALL), AUTO_EXPLORE)
+    ticks = turns_spent = 0
+    while state.activity is not None:
+        before = state
+        state = advance(state)
+        ticks += 1
+        turns_spent += state.turns - before.turns
+    assert turns_spent == state.turns
+    assert turns_spent == ticks - 1, "every tick but the last one that finished it"
+
+
+# ---------------------------------------------------------------------------------------
+# advance — purity (CONTRACT-v4 §0.10)
+# ---------------------------------------------------------------------------------------
+
+
+def activity_states() -> list[GameState]:
+    """One state per activity kind, each with a turn genuinely left to take."""
+    return [
+        step(explored_stairs_state(), DESCEND),
+        step(new_game(1234, *SMALL), AUTO_EXPLORE),
+        walk(corridor_state(CORRIDOR_ROWS, (1, 1)), 1, 0),
+        walk(corridor_state(DOOR_CORRIDOR_ROWS, (3, 1)), 1, 0),  # bumps a door open
+        dataclasses.replace(
+            start(stairs_level(), player=(5, 3)),
+            activity=Activity(ActivityKind.TRAVEL, goal=(5, 3)),  # finishes at once
+        ),
+    ]
+
+
+@pytest.mark.parametrize("index", range(5))
+def test_advance_never_mutates_its_input(index: int) -> None:
+    state = activity_states()[index]
+    before = snapshot(state)
+    level_snapshot = copy.deepcopy(state.level)
+    saved_snapshot = copy.deepcopy(state.saved)
+    activity_snapshot = copy.deepcopy(state.activity)
+
+    advance(state)
+
+    for name, value in before.items():
+        assert getattr(state, name) == value
+    assert state.level is before["level"]
+    assert state.visible is before["visible"]
+    assert state.explored is before["explored"]
+    assert state.open_doors is before["open_doors"]
+    assert state.saved is before["saved"]
+    assert state.events is before["events"]
+    assert state.activity is before["activity"]
+    assert state.level == level_snapshot
+    assert state.saved == saved_snapshot
+    assert state.activity == activity_snapshot
+
+
+@pytest.mark.parametrize("index", range(5))
+def test_advance_is_deterministic(index: int) -> None:
+    state = activity_states()[index]
+    assert advance(state) == advance(state)
+
+
+def test_advance_does_not_mutate_the_sets_or_the_saved_dict_it_was_handed() -> None:
+    entry = LevelState(room_level(), frozenset({(1, 1)}), frozenset())
+    saved = {1: entry}
+    base = walk(corridor_state(DOOR_CORRIDOR_ROWS, (3, 1)), 1, 0)
+    explored, visible, open_doors = base.explored, base.visible, base.open_doors
+    state = dataclasses.replace(base, saved=saved, depth=2)
+
+    after = advance(state)
+
+    assert saved == {1: entry}
+    assert saved is state.saved
+    assert explored == base.explored
+    assert visible == base.visible
+    assert open_doors == frozenset()
+    assert after.open_doors == frozenset({CORRIDOR_DOOR})
+    assert after.open_doors is not open_doors
+
+
+def test_advance_shares_the_level_object_rather_than_copying_it() -> None:
+    for state in activity_states():
+        assert advance(state).level is state.level
+
+
+def test_advance_recomputes_fov_exactly_when_a_turn_was_spent() -> None:
+    for state in activity_states():
+        after = advance(state)
+        if after.turns == state.turns:
+            assert after.visible is state.visible
+        else:
+            assert after.visible == fov.compute_visible(
+                after.level, after.open_doors, after.player, after.radius
+            )
+            assert after.explored == state.explored | after.visible
+
+
+# ---------------------------------------------------------------------------------------
+# interruption — the seam, pinned closed (CONTRACT-v4 §7.6)
+# ---------------------------------------------------------------------------------------
+
+
+def test_interruption_returns_none_for_every_pair_that_can_be_built() -> None:
+    # User decision 3 in test form: nothing today interrupts an activity, and if that ever
+    # changes it must be a deliberate change to this contract, not a quiet one.
+    fresh = new_game(1234, *SMALL)
+    walked = step(fresh, MOVE_E)
+    door = _at_the_door()
+    opened = step(door, MOVE_E)
+    stairs = walk_to(start(stairs_level()), DOWN_CELL)
+    descended = step(stairs, DESCEND)
+    quit_state = step(fresh, QUIT)
+
+    pairs = [
+        (fresh, fresh),
+        (fresh, walked),
+        (walked, fresh),
+        (door, opened),
+        (stairs, descended),
+        (fresh, quit_state),
+        (opened, opened),
+    ]
+    for before, after in pairs:
+        assert interruption(before, after) is None
+
+
+def test_interruption_returns_none_when_a_door_opened_under_an_activity() -> None:
+    state = walk(corridor_state(DOOR_CORRIDOR_ROWS, (3, 1)), 1, 0)
+    after = advance(state)
+    assert after.open_doors == frozenset({CORRIDOR_DOOR}), "the door really did open"
+    assert interruption(state, after) is None
+    assert after.activity is not None, "so the activity survived it"
+
+
+def test_interruption_never_mutates_either_state() -> None:
+    before_state = _at_the_door()
+    after_state = step(before_state, MOVE_E)
+    first = snapshot(before_state)
+    second = snapshot(after_state)
+
+    interruption(before_state, after_state)
+
+    for name, value in first.items():
+        assert getattr(before_state, name) == value
+    for name, value in second.items():
+        assert getattr(after_state, name) == value
+
+
+def test_advance_calls_interruption_after_every_activity_turn() -> None:
+    # The seam is worth shipping only if it is wired in; assert the call site exists.
+    node = _function("advance")
+    called = {
+        child.func.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+    assert "interruption" in called
+
+
+# ---------------------------------------------------------------------------------------
+# run — the paced loop, through the stub screen (CONTRACT-v4 §7.7)
+# ---------------------------------------------------------------------------------------
+
+
+def exploring_game(seed: int = 1234) -> GameState:
+    return step(new_game(seed, *SMALL), AUTO_EXPLORE)
+
+
+def test_run_blocks_for_a_key_when_no_activity_is_running() -> None:
+    screen = StubScreen([ord("q")])
+    run(screen, new_game(1234, *SMALL))
+    assert screen.timeouts == [-1], "ordinary play must not spin"
+
+
+def test_run_gives_an_activity_a_hundred_millisecond_deadline() -> None:
+    screen = StubScreen([-1, ord("q"), ord("q")])
+    final = run(screen, exploring_game())
+
+    assert screen.timeouts[0] == 100
+    assert screen.timeouts[-1] == -1, "and blocks again once the activity is gone"
+    assert final.running is False
+
+
+def test_no_key_within_the_deadline_advances_exactly_one_turn() -> None:
+    state = exploring_game()
+    screen = StubScreen([-1, ord("q"), ord("q")])
+    final = run(screen, state)
+
+    expected = advance(state)
+    assert final.turns == expected.turns == state.turns + 1
+    assert final.player == expected.player
+    assert final.player != state.player
+
+
+def test_a_key_cancels_the_activity_and_is_consumed_doing_so() -> None:
+    # The rule the whole design turns on: a panicked keypress stops the walk and does
+    # nothing else. If the key also acted as a command it would move you into whatever you
+    # were running from.
+    state = exploring_game()
+    moving_key = ord("l")
+    assert step(state, translate_key(moving_key)).player != state.player, (
+        "the key really would have moved the player if it had been obeyed"
+    )
+
+    screen = StubScreen([moving_key, ord("q")])
+    final = run(screen, state)
+
+    assert final.activity is None
+    assert final.events == (Event(EventKind.INTERRUPTED),)
+    assert events.message_for(final.events) == "You stop."
+    assert final.player == state.player, "the cancelling key did not also move you"
+    assert final.turns == state.turns, "and did not consume a turn"
+    assert screen.timeouts == [100, -1]
+
+
+@pytest.mark.parametrize("key", ["q", ">", "<", "E", "w", "j", "x"])
+def test_any_key_at_all_cancels_and_none_of_them_acts(key: str) -> None:
+    state = exploring_game()
+    screen = StubScreen([ord(key), ord("q")])
+    final = run(screen, state)
+
+    assert final.player == state.player
+    assert final.turns == state.turns
+    assert final.depth == state.depth
+    assert final.awaiting_walk is False
+    # `q` quits on the *second* read, never on the first: the first was consumed.
+    assert len(screen.frames) == 2
+
+
+def test_the_loop_alternates_deadline_and_block_as_the_activity_comes_and_goes() -> None:
+    state = exploring_game()
+    screen = StubScreen([-1, -1, ord("l"), ord("q")])
+    run(screen, state)
+    assert screen.timeouts == [100, 100, 100, -1]
+
+
+def test_run_draws_a_frame_for_every_turn_of_an_activity() -> None:
+    state = exploring_game()
+    screen = StubScreen([-1, -1, -1, ord("q"), ord("q")])
+    run(screen, state)
+    # Four activity reads plus the final blocking read, one frame drawn before each.
+    assert len(screen.frames) == 5
+    assert screen.refreshes == len(screen.frames)
+
+
+def test_run_can_drive_a_whole_auto_explore_to_its_end() -> None:
+    """The loop and the pure core agree: pressing ``E`` and holding still explores the
+    level, and reaches exactly the state ``advance`` alone reaches.
+
+    Every activity turn is one ``getch`` that returned nothing, so the script is a run of
+    ``-1``s — one per turn, plus the one that finds no frontier left and ends it — and
+    then a real key. Nothing here waits 100 ms for anything: the stub answers at once, and
+    the number is only ever *recorded*.
+    """
+    state = exploring_game()
+    finished = finish_activity(state)
+    ticks = finished.turns + 1
+
+    screen = StubScreen([-1] * ticks + [ord("q")])
+    final = run(screen, state)
+
+    assert final.activity is None
+    assert final.turns == finished.turns
+    assert final.explored == finished.explored
+    assert final.events == (Event(EventKind.EXPLORED_EVERYTHING),)
+    assert screen.timeouts == [100] * ticks + [-1]
+
+
+def test_run_still_plays_an_ordinary_game_with_no_activity_in_sight() -> None:
+    screen = StubScreen([ord("l"), ord("j"), ord("q")])
+    final = run(screen, new_game(1234, *SMALL))
+    assert screen.timeouts == [-1, -1, -1]
+    assert final.running is False
+    assert final.activity is None
