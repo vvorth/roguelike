@@ -22,7 +22,16 @@ from pathlib import Path
 import pytest
 
 from roguelike.level import Level, Room, freeze_grid
-from roguelike.render import Cell, Chrome, NpcGlyph, draw, init_colors, render_to_cells, to_lines
+from roguelike.render import (
+    Cell,
+    Chrome,
+    NpcGlyph,
+    draw,
+    init_colors,
+    render_text_page,
+    render_to_cells,
+    to_lines,
+)
 from roguelike.style import Role, Visibility
 from roguelike.tiles import DOOR_OPEN_CHAR, PLAYER_CHAR, TILE_CHARS, Tile
 
@@ -1034,6 +1043,7 @@ def test_public_surface():
         "Chrome",
         "NpcGlyph",
         "render_to_cells",
+        "render_text_page",
         "to_lines",
         "init_colors",
         "draw",
@@ -1373,3 +1383,61 @@ def test_draw_and_init_colors_end_to_end_with_visible_npc_and_target():
     npc_call = next(c for c in win.calls if c[0] == 2 and c[1] == 2)
     assert npc_call[2] == "j"
     assert npc_call[3] & curses.A_REVERSE
+
+
+# --- render_text_page (the help screen's frame) -----------------------------
+
+
+def _page(lines, width=20, height=4, stats="Keys", message="footer"):
+    return render_text_page(
+        tuple(lines), Chrome(stats=stats, message=message, status_right=""), width, height
+    )
+
+
+def test_a_text_page_has_the_same_shape_as_a_map_frame() -> None:
+    # One stats row, `height` body rows, one status row -- so the caller can hand
+    # either kind of frame to draw() without knowing which it has.
+    page = _page(["a", "b"], width=20, height=4)
+    assert len(page) == 6
+    assert all(len(row) == 20 for row in page)
+
+
+def test_a_text_page_puts_the_lines_in_the_body() -> None:
+    lines = to_lines(_page(["first", "second"], width=20, height=4))
+    assert lines[0].startswith("Keys")
+    assert lines[1].startswith("first")
+    assert lines[2].startswith("second")
+    assert lines[-1].startswith("footer")
+
+
+def test_short_pages_leave_the_remaining_body_rows_blank() -> None:
+    lines = to_lines(_page(["only"], width=20, height=4))
+    assert lines[1].startswith("only")
+    assert lines[2].strip() == ""
+    assert lines[3].strip() == ""
+
+
+def test_a_text_page_clips_rather_than_wrapping_a_long_line() -> None:
+    lines = to_lines(_page(["x" * 50], width=20, height=4))
+    assert lines[1] == "x" * 20
+    assert lines[2].strip() == ""
+
+
+def test_a_text_page_clips_extra_lines_rather_than_growing() -> None:
+    page = _page([str(n) for n in range(20)], width=20, height=4)
+    assert len(page) == 6
+
+
+def test_every_cell_of_a_text_page_is_plain_visible_terrain() -> None:
+    # So the help needs no new colour pair and init_colors is unchanged.
+    for row in _page(["a", "b"]):
+        for cell in row:
+            assert cell.role is Role.TERRAIN
+            assert cell.visibility is Visibility.VISIBLE
+            assert cell.reverse is False
+
+
+def test_a_text_page_with_no_lines_is_blank_but_well_formed() -> None:
+    page = _page([], width=12, height=3)
+    assert len(page) == 5
+    assert to_lines(page)[1].strip() == ""

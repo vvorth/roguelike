@@ -301,6 +301,8 @@ def test_every_bound_key_in_the_table_is_expected() -> None:
     expected |= {ord("E"), ord("w")}
     # v5 additions: fire, target-next (Tab).
     expected |= {ord("f"), curses.ascii.TAB}
+    # The help screen.
+    expected |= {ord("?")}
     assert set(keys_module._KEY_BINDINGS) == expected
 
 
@@ -659,19 +661,19 @@ def test_command_kind_members() -> None:
         "WALK_PREFIX",
         "FIRE",
         "TARGET_NEXT",
+        "HELP",
     ]
 
 
 def test_command_kind_uses_auto_values() -> None:
-    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 
-def test_command_kind_has_exactly_nine_members() -> None:
+def test_command_kind_has_exactly_ten_members() -> None:
     # The five from v3 (MOVE, QUIT, UNKNOWN, DESCEND, ASCEND), the two from v4
-    # (AUTO_EXPLORE, WALK_PREFIX), plus the two new v5 members, FIRE and
-    # TARGET_NEXT (CONTRACT-v5 §5).
-    assert len(list(CommandKind)) == 9
-    assert len(CommandKind) == 9
+    # (AUTO_EXPLORE, WALK_PREFIX), the two from v5 (FIRE, TARGET_NEXT), and HELP.
+    assert len(list(CommandKind)) == 10
+    assert len(CommandKind) == 10
 
 
 def test_module_constants_are_the_expected_kinds() -> None:

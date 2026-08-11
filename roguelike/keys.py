@@ -23,6 +23,7 @@ __all__ = [
     "Command",
     "QUIT_COMMAND",
     "UNKNOWN_COMMAND",
+    "HELP_ENTRIES",
     "translate_key",
 ]
 
@@ -39,6 +40,7 @@ class CommandKind(Enum):
     WALK_PREFIX = auto()  # "w"
     FIRE = auto()  # "f"  -- NEW in v5
     TARGET_NEXT = auto()  # Tab (curses.ascii.TAB) -- NEW in v5
+    HELP = auto()  # "?"
 
 
 @dataclass(frozen=True)
@@ -105,7 +107,41 @@ _NO_ARG_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
     (CommandKind.WALK_PREFIX, "w"),
     (CommandKind.FIRE, "f"),
     (CommandKind.TARGET_NEXT, curses.ascii.TAB),
+    (CommandKind.HELP, "?"),
 )
+
+
+# --- Help text (the one description of the bindings) -------------------------
+#
+# This table lives here, beside the binding tables, so that a key and its
+# description cannot drift apart: adding a binding without describing it is a
+# visible omission in one file rather than an invisible one across two.
+#
+# Pure data. Paginating it, fitting it to a terminal and drawing it are not
+# this module's business -- `game.py` paginates and `render.py` draws.
+HELP_ENTRIES: tuple[tuple[str, str], ...] = (
+    ("h j k l", "move west / south / north / east"),
+    ("y u b n", "move diagonally"),
+    ("1-9", "move (numpad; 5 does nothing)"),
+    ("arrows", "move"),
+    ("H J K L", "move diagonally"),
+    ("Shift+arrows", "move diagonally"),
+    ("w + direction", "walk until something interesting"),
+    ("E", "explore automatically"),
+    (">", "descend, or travel to a known down staircase"),
+    ("<", "ascend, or travel to a known up staircase"),
+    ("move into a monster", "attack it"),
+    ("f", "fire the bow; f again to shoot"),
+    ("Tab", "next target while aiming"),
+    ("?", "this help"),
+    ("q", "quit"),
+)
+"""Every binding, paired with what it does, in the order a player should read it.
+
+Deliberately a flat tuple of ``(keys, description)`` rather than a nested
+structure: the help screen is a list, and anything richer would be a layout
+decision taken in the wrong module.
+"""
 
 
 def _keycode(key: int | str) -> int:

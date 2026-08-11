@@ -133,7 +133,7 @@ from roguelike.activity import Activity, ActivityKind, frontier_cells, walk_step
 from roguelike.combat import resolve_attack
 from roguelike.events import Event, EventKind
 from roguelike.items import DAGGER, SHORTBOW, Weapon
-from roguelike.keys import Command, CommandKind, translate_key
+from roguelike.keys import HELP_ENTRIES, Command, CommandKind, translate_key
 from roguelike.level import Level
 from roguelike.movement import try_move
 from roguelike.npc import (
@@ -172,6 +172,10 @@ __all__ = [
     "level_up",
     "xp_to_next",
     "interruption",
+    "help_lines",
+    "help_page_count",
+    "help_page_lines",
+    "format_help_status",
     "format_stats",
     "format_status_right",
     "run",
@@ -391,6 +395,7 @@ class GameState:
     player_actor: Player = _NEW_PLAYER
     npcs: tuple[NPC, ...] = ()
     targeting: Targeting | None = None
+    help_page: int | None = None
 
 
 def new_game(
@@ -1467,6 +1472,12 @@ def step(state: GameState, command: Command) -> GameState:
     if not state.running:
         return state
 
+    # The help screen swallows every key, so it is answered before anything else — even
+    # before an activity is cleared, because reading the help is not a game action and
+    # must not disturb a walk in progress.
+    if state.help_page is not None:
+        return _turn_help_page(state)
+
     if state.activity is not None:
         state = replace(state, activity=None)
 
@@ -1511,6 +1522,9 @@ def step(state: GameState, command: Command) -> GameState:
 
     if command.kind is CommandKind.AUTO_EXPLORE:
         return replace(state, activity=Activity(ActivityKind.AUTO_EXPLORE))
+
+    if command.kind is CommandKind.HELP:
+        return replace(state, help_page=0)
 
     if command.kind is CommandKind.FIRE:
         return _start_targeting(state)
@@ -1793,6 +1807,71 @@ def interruption(before: GameState, after: GameState) -> Event | None:
 # --------------------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------------------
+# The help screen
+# --------------------------------------------------------------------------------------
+
+
+#: How the two columns of a help entry are laid out. The key column is wide enough for
+#: the longest entry in `keys.HELP_ENTRIES` ("move into a monster") with a gap after it.
+_HELP_KEY_WIDTH: int = 22
+
+
+def help_lines(state: GameState) -> tuple[str, ...]:
+    """Every line of the help screen, before pagination.
+
+    Built from :data:`roguelike.keys.HELP_ENTRIES`, which lives beside the binding tables,
+    so a key and its description cannot drift apart. This function owns only the *layout*
+    of those pairs — two columns — and no wording of its own.
+    """
+    return tuple(
+        f"{keys:<{_HELP_KEY_WIDTH}}{description}"
+        for keys, description in HELP_ENTRIES
+    )
+
+
+def help_page_count(state: GameState) -> int:
+    """How many pages the help occupies at this level's height. Always at least 1."""
+    body = max(1, state.level.height)
+    lines = len(help_lines(state))
+    return max(1, -(-lines // body))  # ceiling division, integer only
+
+
+def help_page_lines(state: GameState) -> tuple[str, ...]:
+    """The lines of the page currently on screen, or ``()`` when help is not showing."""
+    if state.help_page is None:
+        return ()
+    body = max(1, state.level.height)
+    start = state.help_page * body
+    return help_lines(state)[start : start + body]
+
+
+def _turn_help_page(state: GameState) -> GameState:
+    """Advance the help by one page, closing it after the last (CONTRACT §7 v5 style).
+
+    **Any key turns the page**, and turning past the last page closes the screen. One
+    rule, no special keys to remember, and no way to get stuck: keep pressing and you are
+    back in the dungeon. It costs **no turn** and emits no event — reading the help is not
+    a game action, so the world does not tick and the message already on screen survives.
+
+    This mirrors the ``w``-prefix and the ranged-targeting sub-mode, which likewise
+    swallow the next key whole rather than interpreting it as a command.
+    """
+    page = (state.help_page or 0) + 1
+    if page >= help_page_count(state):
+        return replace(state, help_page=None)
+    return replace(state, help_page=page)
+
+
+def format_help_status(state: GameState) -> str:
+    """The footer under the help: which page this is, and how to leave."""
+    total = help_page_count(state)
+    page = (state.help_page or 0) + 1
+    if total == 1:
+        return "Page 1/1  -  any key returns to the game"
+    return f"Page {page}/{total}  -  any key continues"
+
+
 def format_stats(state: GameState) -> str:
     """The top chrome row: ``HP h/m  Lv l  XP x/n  Str s Agi a Vit v`` (§7.13).
 
@@ -1913,33 +1992,52 @@ def run(stdscr, state: GameState) -> GameState:
         pass
 
     while state.running:
-        chrome = render.Chrome(
-            stats=format_stats(state),
-            message=events.message_for(state.events),
-            status_right=format_status_right(state),
-        )
-        # A monster reaches the renderer as plain data — a position, a glyph and a
-        # lower-case species name, both of the latter from the same `SPECIES_DATA` entry
-        # so they cannot disagree — because `render.py` may not import `npc.py`. The whole
-        # list goes over: "draw a monster only where it can be seen, never from memory" is
-        # enforced inside the pure renderer, not by caller discipline.
-        cells = render.render_to_cells(
-            state.level,
-            state.player,
-            state.visible,
-            state.explored,
-            state.open_doors,
-            chrome,
-            tuple(
-                render.NpcGlyph(
-                    position=npc.position,
-                    glyph=SPECIES_DATA[npc.species].glyph,
-                    species=SPECIES_DATA[npc.species].name,
-                )
-                for npc in state.npcs
-            ),
-            _target_cell(state),
-        )
+        # Only the *drawing* differs here. The keyboard is read below by exactly the same
+        # two paths as always — one deadline for an activity, one for ordinary play — so
+        # the help screen adds no third way to read a key, and no rule of its own here.
+        if state.help_page is not None:
+            # The help replaces the frame entirely: no map, no monsters, no cursor. It
+            # goes through the same `draw`, because `render_text_page` hands back a frame
+            # of exactly the same shape.
+            cells = render.render_text_page(
+                help_page_lines(state),
+                render.Chrome(
+                    stats="Keys",
+                    message=format_help_status(state),
+                    status_right="",
+                ),
+                state.level.width,
+                state.level.height,
+            )
+        else:
+            chrome = render.Chrome(
+                stats=format_stats(state),
+                message=events.message_for(state.events),
+                status_right=format_status_right(state),
+            )
+            # A monster reaches the renderer as plain data — a position, a glyph and a
+            # lower-case species name, both of the latter from the same `SPECIES_DATA`
+            # entry so they cannot disagree — because `render.py` may not import
+            # `npc.py`. The whole list goes over: "draw a monster only where it can be
+            # seen, never from memory" is enforced inside the pure renderer, not by
+            # caller discipline.
+            cells = render.render_to_cells(
+                state.level,
+                state.player,
+                state.visible,
+                state.explored,
+                state.open_doors,
+                chrome,
+                tuple(
+                    render.NpcGlyph(
+                        position=npc.position,
+                        glyph=SPECIES_DATA[npc.species].glyph,
+                        species=SPECIES_DATA[npc.species].name,
+                    )
+                    for npc in state.npcs
+                ),
+                _target_cell(state),
+            )
         render.draw(stdscr, cells)
 
         if state.activity is not None:

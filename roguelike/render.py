@@ -64,7 +64,16 @@ from roguelike.level import Level
 from roguelike.style import Role, Visibility, attr_for, role_for
 from roguelike.tiles import DOOR_OPEN_CHAR, PLAYER_CHAR, TILE_CHARS
 
-__all__ = ["Cell", "Chrome", "NpcGlyph", "render_to_cells", "to_lines", "init_colors", "draw"]
+__all__ = [
+    "Cell",
+    "Chrome",
+    "NpcGlyph",
+    "render_to_cells",
+    "render_text_page",
+    "to_lines",
+    "init_colors",
+    "draw",
+]
 
 
 @dataclass(frozen=True)
@@ -256,6 +265,44 @@ def to_lines(cells: list[list[Cell]]) -> list[str]:
     Every returned string is exactly the length of its row. Never raises.
     """
     return ["".join(cell.char for cell in row) for row in cells]
+
+
+def render_text_page(
+    lines: tuple[str, ...],
+    chrome: Chrome,
+    width: int,
+    height: int,
+) -> list[list[Cell]]:
+    """Render a full-screen page of plain text — the help screen, and nothing else yet.
+
+    Deliberately knows nothing about *what* it is drawing. It takes finished strings and
+    a :class:`Chrome`, exactly as :func:`render_to_cells` does, so that pagination,
+    wording and the decision to show a page at all stay in the turn loop where the rest
+    of the game's rules live (v1 BRIEF Q14).
+
+    The frame is the same shape :func:`render_to_cells` produces — one stats row,
+    ``height`` body rows, one status row — so the caller can hand either to
+    :func:`draw` without knowing which it has.
+
+    Lines longer than ``width`` are clipped, never wrapped: wrapping is a layout policy
+    and the caller composed these strings knowing the width. Fewer lines than ``height``
+    leaves the remaining rows blank; more are clipped, which is the caller's cue that its
+    pagination is wrong.
+
+    Every cell is ``Role.TERRAIN`` / ``Visibility.VISIBLE``, so a help page needs no new
+    colour pair and :func:`init_colors` is unchanged.
+
+    Pure: nothing is mutated, and the same arguments always produce the same frame.
+    Never raises.
+    """
+    rows: list[list[Cell]] = [_chrome_row(chrome.stats, width)]
+    for index in range(height):
+        text = lines[index] if index < len(lines) else ""
+        rows.append(_chrome_row(text, width))
+    rows.append(
+        _chrome_row(_compose_status_row(chrome.message, chrome.status_right, width), width)
+    )
+    return rows
 
 
 # --------------------------------------------------------------------------- curses

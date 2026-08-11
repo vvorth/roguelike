@@ -67,8 +67,12 @@ from roguelike.game import (
     Targeting,
     advance,
     advance_npcs,
+    format_help_status,
     format_stats,
     format_status_right,
+    help_lines,
+    help_page_count,
+    help_page_lines,
     interruption,
     level_up,
     new_game,
@@ -79,7 +83,7 @@ from roguelike.game import (
     xp_to_next,
 )
 from roguelike.items import DAGGER, SHORTBOW
-from roguelike.keys import Command, CommandKind, translate_key
+from roguelike.keys import QUIT_COMMAND, Command, CommandKind, translate_key
 from roguelike.level import Level
 from roguelike.npc import (
     NPC,
@@ -428,6 +432,7 @@ STATE_FIELDS = (
     "player_actor",
     "npcs",
     "targeting",
+    "help_page",
 )
 
 
@@ -589,7 +594,8 @@ def test_gamestate_field_order_and_defaults() -> None:
     )                                        # player_actor
     assert fields[16].default == ()          # npcs
     assert fields[17].default is None        # targeting
-    assert len(fields) == 18
+    assert fields[18].default is None        # help_page
+    assert len(fields) == 19
 
 
 def test_gamestate_constructs_positionally_with_defaults() -> None:
@@ -2516,6 +2522,10 @@ def test_public_surface_is_exactly_the_contract_surface() -> None:
         "level_up",
         "xp_to_next",
         "interruption",
+        "help_lines",
+        "help_page_count",
+        "help_page_lines",
+        "format_help_status",
         "format_stats",
         "format_status_right",
         "run",
@@ -2632,6 +2642,8 @@ def test_no_extra_command_kind_was_invented() -> None:
         # walking into a monster *is* the attack (§7.9).
         "FIRE",
         "TARGET_NEXT",
+        # The help screen. Still no ATTACK, and still no WAIT.
+        "HELP",
     }
     for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH", "TRAVEL", "RUN", "ATTACK"):
         assert f"CommandKind.{name}" not in GAME_SOURCE
@@ -5314,3 +5326,114 @@ def test_playing_a_real_game_can_end_in_death(monsters) -> None:
             break
     assert state.running is False
     assert state.outcome and "You die..." in state.outcome
+
+
+# --- The help screen --------------------------------------------------------
+#
+# `?` opens a paginated list of the key bindings. It is a sub-mode in the same
+# shape as the `w` prefix and ranged targeting: it swallows the next key whole,
+# costs no turn, and cannot leave the player stuck.
+
+
+HELP = Command(CommandKind.HELP)
+
+
+def test_question_mark_opens_the_help_at_page_zero() -> None:
+    state = new_game(1234)
+    after = step(state, HELP)
+    assert after.help_page == 0
+
+
+def test_opening_the_help_costs_no_turn_and_does_not_tick_the_world() -> None:
+    state = new_game(1234)
+    before = tuple((npc.position, npc.energy, npc.actor.hp) for npc in state.npcs)
+    after = step(state, HELP)
+    assert after.turns == state.turns
+    assert after.player == state.player
+    assert tuple((n.position, n.energy, n.actor.hp) for n in after.npcs) == before
+    assert after.player_actor.actor.hp == state.player_actor.actor.hp
+
+
+def test_any_key_turns_the_page_and_the_last_one_closes_the_help() -> None:
+    # A short level so the entries genuinely span more than one page.
+    state = new_game(1234, width=80, height=8)
+    opened = step(state, HELP)
+    total = help_page_count(opened)
+    assert total > 1, "this test needs a level short enough to paginate"
+
+    pages = []
+    current = opened
+    while current.help_page is not None:
+        pages.append(current.help_page)
+        current = step(current, MOVE_E)  # any key at all
+    assert pages == list(range(total))
+    assert current.help_page is None
+
+
+def test_a_single_page_help_closes_on_the_very_next_key() -> None:
+    state = new_game(1234)  # 22 body rows: every entry fits on one page
+    opened = step(state, HELP)
+    assert help_page_count(opened) == 1
+    assert step(opened, MOVE_E).help_page is None
+
+
+def test_keys_pressed_inside_the_help_do_not_reach_the_game() -> None:
+    state = new_game(1234)
+    opened = step(state, HELP)
+    closed = step(opened, MOVE_E)
+    assert closed.player == state.player, "a movement key must not also move the player"
+    assert closed.turns == state.turns
+
+
+def test_quitting_inside_the_help_is_swallowed_like_any_other_key() -> None:
+    # Consistent with the `w` prefix, where a stray QUIT is consumed by the prefix.
+    # Reading the help must never drop you out of the game by accident.
+    state = new_game(1234)
+    opened = step(state, HELP)
+    closed = step(opened, QUIT_COMMAND)
+    assert closed.running is True
+    assert closed.help_page is None
+
+
+def test_the_help_leaves_the_message_line_alone() -> None:
+    state = new_game(1234)
+    state = step(state, Command(CommandKind.DESCEND))  # emits an event
+    message = state.events
+    opened = step(state, HELP)
+    assert opened.events == message
+    assert step(opened, MOVE_E).events == message
+
+
+def test_every_binding_line_appears_exactly_once_across_the_pages() -> None:
+    state = new_game(1234, width=80, height=8)
+    opened = step(state, HELP)
+    collected: list[str] = []
+    current = opened
+    while current.help_page is not None:
+        collected.extend(help_page_lines(current))
+        current = step(current, MOVE_E)
+    assert collected == list(help_lines(opened))
+
+
+def test_help_lines_describe_every_binding_in_the_key_table() -> None:
+    # The help is built from keys.HELP_ENTRIES, so a binding cannot be documented
+    # in one place and bound in another. Spot-check the ones a player needs most.
+    text = "\n".join(help_lines(new_game(1234)))
+    for fragment in ("h j k l", "E", ">", "<", "f", "Tab", "?", "q"):
+        assert fragment in text
+
+
+def test_help_page_lines_is_empty_when_the_help_is_closed() -> None:
+    assert help_page_lines(new_game(1234)) == ()
+
+
+def test_the_footer_names_the_page_and_the_total() -> None:
+    state = new_game(1234, width=80, height=8)
+    opened = step(state, HELP)
+    assert format_help_status(opened).startswith("Page 1/")
+    assert str(help_page_count(opened)) in format_help_status(opened)
+
+
+def test_a_dead_game_ignores_the_help_key() -> None:
+    state = dataclasses.replace(new_game(1234), running=False)
+    assert step(state, HELP) is state
