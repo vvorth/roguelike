@@ -40,15 +40,29 @@ EXPECTED_MESSAGES = {
     EventKind.STOPPED_AT_JUNCTION: "You stop at a junction.",
     EventKind.STOPPED_AT_OPENING: "You stop before the opening.",
     EventKind.INTERRUPTED: "You stop.",
+    # -- v5: combat, death, levelling, poison, targeting (CONTRACT-v5 §16) --
+    EventKind.PLAYER_HIT_NPC: "You hit the {name}.",
+    EventKind.PLAYER_MISSED_NPC: "You miss the {name}.",
+    EventKind.NPC_HIT_PLAYER: "The {name} hits you.",
+    EventKind.NPC_MISSED_PLAYER: "The {name} misses you.",
+    EventKind.NPC_KILLED: "You kill the {name}!",
+    EventKind.PLAYER_DIED: "You die...",
+    EventKind.LEVELLED_UP: "Welcome to level {level}.",
+    EventKind.POISONED: "You feel sick.",
+    EventKind.POISON_DAMAGE: "The poison burns.",
+    EventKind.NO_TARGET: "There is nothing to shoot at.",
+    EventKind.TARGETING: "Target: {name}. [Tab] next, [f] fire, any other key cancels.",
+    EventKind.SPOTTED_HOSTILE: "A {name} comes into view!",
 }
 
 
 # --- EventKind shape ----------------------------------------------------------
 
 
-def test_event_kind_has_exactly_sixteen_members() -> None:
-    # The eight from v3, plus the eight new v4 activity-messaging kinds
-    # (CONTRACT-v4 §16), in declaration order.
+def test_event_kind_has_exactly_twenty_eight_members() -> None:
+    # The eight from v3, the eight from v4 (CONTRACT-v4 §16), plus the twelve
+    # new v5 combat/death/levelling/poison/targeting kinds (CONTRACT-v5 §16),
+    # in declaration order.
     assert [member.name for member in EventKind] == [
         "DOOR_OPENED",
         "STAIRS_HERE_UP",
@@ -66,11 +80,27 @@ def test_event_kind_has_exactly_sixteen_members() -> None:
         "STOPPED_AT_JUNCTION",
         "STOPPED_AT_OPENING",
         "INTERRUPTED",
+        "PLAYER_HIT_NPC",
+        "PLAYER_MISSED_NPC",
+        "NPC_HIT_PLAYER",
+        "NPC_MISSED_PLAYER",
+        "NPC_KILLED",
+        "PLAYER_DIED",
+        "LEVELLED_UP",
+        "POISONED",
+        "POISON_DAMAGE",
+        "NO_TARGET",
+        "TARGETING",
+        "SPOTTED_HOSTILE",
     ]
 
 
+def test_event_kind_has_exactly_twenty_eight_members_by_len() -> None:
+    assert len(list(EventKind)) == 28
+
+
 def test_event_kind_uses_auto_values() -> None:
-    assert [member.value for member in EventKind] == list(range(1, 17))
+    assert [member.value for member in EventKind] == list(range(1, 29))
 
 
 # --- MESSAGES: complete and exact --------------------------------------------
@@ -84,6 +114,10 @@ def test_messages_has_an_entry_for_every_event_kind() -> None:
 
 def test_messages_has_no_extra_entries() -> None:
     assert set(MESSAGES) == set(EventKind)
+
+
+def test_messages_has_exactly_twenty_eight_entries() -> None:
+    assert len(MESSAGES) == 28
 
 
 @pytest.mark.parametrize("kind", list(EventKind))
@@ -209,6 +243,146 @@ def test_interrupted_message() -> None:
     assert message_for([Event(EventKind.INTERRUPTED)]) == "You stop."
 
 
+# --- message_for: the twelve new v5 combat/death/levelling/poison/targeting
+# messages (CONTRACT-v5 §16) ---------------------------------------------------
+
+
+def test_player_hit_npc_message() -> None:
+    assert (
+        message_for((Event(EventKind.PLAYER_HIT_NPC, name="jackal"),))
+        == "You hit the jackal."
+    )
+
+
+def test_player_missed_npc_message() -> None:
+    assert (
+        message_for((Event(EventKind.PLAYER_MISSED_NPC, name="jackal"),))
+        == "You miss the jackal."
+    )
+
+
+def test_npc_hit_player_message() -> None:
+    assert (
+        message_for((Event(EventKind.NPC_HIT_PLAYER, name="rat"),))
+        == "The rat hits you."
+    )
+
+
+def test_npc_missed_player_message() -> None:
+    assert (
+        message_for((Event(EventKind.NPC_MISSED_PLAYER, name="rat"),))
+        == "The rat misses you."
+    )
+
+
+def test_npc_killed_message() -> None:
+    assert (
+        message_for((Event(EventKind.NPC_KILLED, name="jackal"),))
+        == "You kill the jackal!"
+    )
+
+
+def test_player_died_message() -> None:
+    assert message_for((Event(EventKind.PLAYER_DIED),)) == "You die..."
+
+
+def test_levelled_up_message() -> None:
+    assert (
+        message_for((Event(EventKind.LEVELLED_UP, level=3),))
+        == "Welcome to level 3."
+    )
+
+
+def test_poisoned_message() -> None:
+    assert message_for((Event(EventKind.POISONED),)) == "You feel sick."
+
+
+def test_poison_damage_message() -> None:
+    assert message_for((Event(EventKind.POISON_DAMAGE),)) == "The poison burns."
+
+
+def test_no_target_message() -> None:
+    assert (
+        message_for((Event(EventKind.NO_TARGET),))
+        == "There is nothing to shoot at."
+    )
+
+
+def test_targeting_message() -> None:
+    assert (
+        message_for((Event(EventKind.TARGETING, name="cave snake"),))
+        == "Target: cave snake. [Tab] next, [f] fire, any other key cancels."
+    )
+
+
+def test_spotted_hostile_message() -> None:
+    assert (
+        message_for((Event(EventKind.SPOTTED_HOSTILE, name="giant bat"),))
+        == "A giant bat comes into view!"
+    )
+
+
+# --- v5: name/level requirement -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EventKind.PLAYER_HIT_NPC,
+        EventKind.PLAYER_MISSED_NPC,
+        EventKind.NPC_HIT_PLAYER,
+        EventKind.NPC_MISSED_PLAYER,
+        EventKind.NPC_KILLED,
+        EventKind.TARGETING,
+        EventKind.SPOTTED_HOSTILE,
+    ],
+)
+def test_missing_name_raises_value_error(kind: EventKind) -> None:
+    with pytest.raises(ValueError):
+        message_for((Event(kind),))
+    with pytest.raises(ValueError):
+        message_for((Event(kind, name=None),))
+
+
+def test_missing_level_raises_value_error_for_levelled_up() -> None:
+    with pytest.raises(ValueError):
+        message_for((Event(EventKind.LEVELLED_UP),))
+    with pytest.raises(ValueError):
+        message_for((Event(EventKind.LEVELLED_UP, level=None),))
+
+
+def test_irrelevant_fields_are_ignored_for_player_died() -> None:
+    # PLAYER_DIED's template has no placeholders at all: name, level and
+    # depth must all be ignored, and none of them should raise.
+    event = Event(EventKind.PLAYER_DIED, name="rat", level=9, depth=2)
+    assert message_for((event,)) == "You die..."
+
+
+def test_irrelevant_depth_and_level_ignored_for_name_only_kinds() -> None:
+    event = Event(EventKind.NPC_KILLED, name="jackal", level=9, depth=2)
+    assert message_for((event,)) == "You kill the jackal!"
+
+
+def test_irrelevant_depth_and_name_ignored_for_level_only_kind() -> None:
+    event = Event(EventKind.LEVELLED_UP, level=3, name="rat", depth=2)
+    assert message_for((event,)) == "Welcome to level 3."
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EventKind.PLAYER_DIED,
+        EventKind.POISONED,
+        EventKind.POISON_DAMAGE,
+        EventKind.NO_TARGET,
+    ],
+)
+def test_no_placeholder_v5_kinds_ignore_all_supplied_fields(kind: EventKind) -> None:
+    plain = message_for((Event(kind),))
+    with_everything = message_for((Event(kind, depth=1, name="rat", level=2),))
+    assert plain == with_everything == MESSAGES[kind]
+
+
 # --- depth requirement -------------------------------------------------------
 
 
@@ -295,6 +469,20 @@ def test_three_events_join_in_order() -> None:
     )
 
 
+def test_three_v5_combat_events_join_in_order() -> None:
+    # v5 is the first caller that can plausibly emit more than two events in
+    # one tick (several NPCs acting), so exercise a full three-event combat
+    # line explicitly, in addition to the pre-existing v1-v4 coverage above.
+    events = (
+        Event(EventKind.PLAYER_HIT_NPC, name="jackal"),
+        Event(EventKind.NPC_KILLED, name="jackal"),
+        Event(EventKind.LEVELLED_UP, level=2),
+    )
+    assert message_for(events) == (
+        "You hit the jackal. You kill the jackal! Welcome to level 2."
+    )
+
+
 # --- purity -------------------------------------------------------------------
 
 
@@ -325,22 +513,61 @@ def test_event_defaults_depth_to_none() -> None:
     assert event.depth is None
 
 
+def test_event_defaults_name_and_level_to_none() -> None:
+    # v5: the two new fields (CONTRACT-v5 §16) must default to None so every
+    # v1-v4 construction keeps working unchanged.
+    event = Event(EventKind.DOOR_OPENED)
+    assert event.name is None
+    assert event.level is None
+
+
 def test_event_is_frozen() -> None:
     event = Event(EventKind.DOOR_OPENED)
     with pytest.raises(dataclasses.FrozenInstanceError):
         event.depth = 3  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         event.kind = EventKind.ASCENDED  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        event.name = "rat"  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        event.level = 2  # type: ignore[misc]
 
 
 def test_event_equality_is_by_value() -> None:
     assert Event(EventKind.DESCENDED, depth=2) == Event(EventKind.DESCENDED, depth=2)
     assert Event(EventKind.DESCENDED, depth=2) != Event(EventKind.DESCENDED, depth=3)
     assert Event(EventKind.DESCENDED) != Event(EventKind.ASCENDED)
+    assert Event(EventKind.NPC_KILLED, name="rat") == Event(
+        EventKind.NPC_KILLED, name="rat"
+    )
+    assert Event(EventKind.NPC_KILLED, name="rat") != Event(
+        EventKind.NPC_KILLED, name="jackal"
+    )
+    assert Event(EventKind.LEVELLED_UP, level=2) != Event(
+        EventKind.LEVELLED_UP, level=3
+    )
 
 
 def test_event_is_hashable() -> None:
     assert len({Event(EventKind.DOOR_OPENED), Event(EventKind.DOOR_OPENED)}) == 1
+
+
+def test_event_field_order_is_kind_depth_name_level() -> None:
+    # CONTRACT-v5 §16: the two new fields are appended after depth, so every
+    # existing positional construction keeps working unchanged.
+    assert [field.name for field in dataclasses.fields(Event)] == [
+        "kind",
+        "depth",
+        "name",
+        "level",
+    ]
+    event = Event(EventKind.DESCENDED, 3)
+    assert event.kind is EventKind.DESCENDED
+    assert event.depth == 3
+    assert event.name is None
+    assert event.level is None
+    full = Event(EventKind.NPC_KILLED, None, "jackal", None)
+    assert full.name == "jackal"
 
 
 # --- Structural constraints: leaf module, stdlib only, no terminal ----------
@@ -395,8 +622,10 @@ def test_no_bump_into_wall_event_exists() -> None:
 
 
 def test_no_severity_or_timestamp_fields_on_event() -> None:
+    # v5 adds exactly `name` and `level` (CONTRACT-v5 §16) — no severity, no
+    # timestamp, no priority field; the message-line cap lives in game.py.
     field_names = {field.name for field in dataclasses.fields(Event)}
-    assert field_names == {"kind", "depth"}
+    assert field_names == {"kind", "depth", "name", "level"}
 
 
 def test_importing_events_does_not_initialise_a_terminal() -> None:

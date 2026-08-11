@@ -1,10 +1,11 @@
 """Input abstraction: raw key codes in, immutable intents out.
 
 This module is a pure lookup table. It never touches the terminal, never reads
-stdin, and never blocks. `curses` is imported solely to reference the
-``KEY_LEFT``/``KEY_RIGHT``/``KEY_UP``/``KEY_DOWN`` constants by name instead of
-hardcoding their integer values; no terminal-mutating curses function is called
-here, at import time or ever (CONTRACT §0.3, §5).
+stdin, and never blocks. `curses` (and `curses.ascii`) is imported solely to
+reference constants such as ``KEY_LEFT``/``KEY_RIGHT``/``KEY_UP``/``KEY_DOWN``
+and ``curses.ascii.TAB`` by name instead of hardcoding their integer values;
+no terminal-mutating curses function is called here, at import time or ever
+(CONTRACT §0.3, §5).
 
 Coordinates are ``(x, y)`` with the origin at the top-left, so **up is
 ``dy = -1``** and down is ``dy = +1`` (CONTRACT §0.1).
@@ -13,6 +14,7 @@ Coordinates are ``(x, y)`` with the origin at the top-left, so **up is
 from __future__ import annotations
 
 import curses
+import curses.ascii
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -26,7 +28,7 @@ __all__ = [
 
 
 class CommandKind(Enum):
-    """The seven things a key press can mean."""
+    """The nine things a key press can mean."""
 
     MOVE = auto()
     QUIT = auto()
@@ -35,6 +37,8 @@ class CommandKind(Enum):
     ASCEND = auto()  # "<"
     AUTO_EXPLORE = auto()  # "E"
     WALK_PREFIX = auto()  # "w"
+    FIRE = auto()  # "f"  -- NEW in v5
+    TARGET_NEXT = auto()  # Tab (curses.ascii.TAB) -- NEW in v5
 
 
 @dataclass(frozen=True)
@@ -89,12 +93,18 @@ _QUIT_KEYS: tuple[int | str, ...] = ("q", "Q")
 
 # Stairs are used by an explicit command, as in ADOM (CONTRACT-v3 §5) — not by
 # stepping on the tile. AUTO_EXPLORE ("E") and WALK_PREFIX ("w") are new in
-# v4. All four carry dx == dy == 0.
+# v4. FIRE ("f") and TARGET_NEXT (Tab) are new in v5, for ranged combat and
+# cycling targets (CONTRACT-v5 §5). All six carry dx == dy == 0.
+#
+# Tab is referenced as `curses.ascii.TAB`, never the literal 9, matching the
+# rule already followed for KEY_SR and friends.
 _NO_ARG_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
     (CommandKind.DESCEND, ">"),
     (CommandKind.ASCEND, "<"),
     (CommandKind.AUTO_EXPLORE, "E"),
     (CommandKind.WALK_PREFIX, "w"),
+    (CommandKind.FIRE, "f"),
+    (CommandKind.TARGET_NEXT, curses.ascii.TAB),
 )
 
 

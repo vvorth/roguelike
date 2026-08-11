@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from roguelike.level import Level, Room, freeze_grid
-from roguelike.render import Cell, Chrome, draw, init_colors, render_to_cells, to_lines
+from roguelike.render import Cell, Chrome, NpcGlyph, draw, init_colors, render_to_cells, to_lines
 from roguelike.style import Role, Visibility
 from roguelike.tiles import DOOR_OPEN_CHAR, PLAYER_CHAR, TILE_CHARS, Tile
 
@@ -53,6 +53,10 @@ def make_level(rows: list[list[Tile]], player_start: tuple[int, int] = (0, 0),
 
 def all_wall_level(width: int, height: int) -> Level:
     return make_level([[W] * width for _ in range(height)])
+
+
+def all_floor_level(width: int, height: int) -> Level:
+    return make_level([[F] * width for _ in range(height)])
 
 
 def all_coords(level: Level) -> frozenset[tuple[int, int]]:
@@ -519,6 +523,235 @@ def test_in_bounds_corners_are_drawable():
         assert sum(1 for c in flat if c.char == PLAYER_CHAR) == 1
 
 
+# --------------------------------------------------------------------------- NPCs
+
+
+def test_visible_npc_is_drawn_with_its_glyph_role_and_species():
+    level = all_floor_level(4, 3)
+    npc = NpcGlyph(position=(2, 1), glyph="r", species="rat")
+    cells = render_to_cells(
+        level, (0, 0), frozenset({(2, 1)}), EMPTY, EMPTY, Chrome(), npcs=(npc,)
+    )
+    cell = cells[1 + 1][2]
+    assert cell.char == "r"
+    assert cell.role is Role.NPC
+    assert cell.visibility is Visibility.VISIBLE
+    assert cell.species == "rat"
+
+
+def test_npc_on_explored_but_not_currently_visible_cell_is_not_drawn_from_memory():
+    """THE HEADLINE CORRECTNESS RULE (CONTRACT-v5 §4/§15 v5): monsters are drawn only
+    when currently visible, never from `explored`. Terrain is remembered because a wall
+    seen an hour ago is still a wall; a monster seen an hour ago has moved, and drawing
+    it anyway would be drawing a lie. The terrain glyph must appear in its place instead.
+    """
+    level = all_floor_level(4, 3)
+    npc = NpcGlyph(position=(2, 1), glyph="r", species="rat")
+    cells = render_to_cells(
+        level, (0, 0), EMPTY, frozenset({(2, 1)}), EMPTY, Chrome(), npcs=(npc,)
+    )
+    cell = cells[1 + 1][2]
+    assert cell.char == TILE_CHARS[Tile.FLOOR]
+    assert cell.role is Role.TERRAIN
+    assert cell.visibility is Visibility.EXPLORED
+    assert cell.species is None
+
+
+def test_npc_never_drawn_from_explored_even_when_also_elsewhere_visible():
+    """A second, stronger form of the headline rule: an NPC that is visible at one cell
+    must not "leak" a stale glyph onto a merely-explored cell it once occupied — there is
+    only ever one `NpcGlyph.position` per call, so this pins that the explored branch of
+    the visibility check never consults `npcs` at all."""
+    level = all_floor_level(4, 3)
+    npc = NpcGlyph(position=(2, 1), glyph="r", species="rat")
+    cells = render_to_cells(
+        level,
+        (0, 0),
+        EMPTY,
+        frozenset({(0, 1), (1, 1), (2, 1), (3, 1)}),
+        EMPTY,
+        Chrome(),
+        npcs=(npc,),
+    )
+    row = cells[1 + 1]
+    assert all(c.role is Role.TERRAIN for c in row)
+    assert all(c.char == TILE_CHARS[Tile.FLOOR] for c in row)
+
+
+def test_npc_on_unseen_cell_is_not_drawn_and_reveals_no_terrain():
+    level = all_floor_level(4, 3)
+    npc = NpcGlyph(position=(2, 1), glyph="r", species="rat")
+    cells = render_to_cells(level, (99, 99), EMPTY, EMPTY, EMPTY, Chrome(), npcs=(npc,))
+    cell = cells[1 + 1][2]
+    assert cell.char == " "
+    assert cell.role is Role.TERRAIN
+    assert cell.visibility is Visibility.UNSEEN
+    assert cell.species is None
+
+
+def test_player_glyph_wins_over_npc_on_same_cell():
+    """The occupancy rule upstream is supposed to make this unreachable, but the
+    renderer must not depend on an invariant it cannot check (CONTRACT-v5 §4/§15 v5)."""
+    level = all_floor_level(3, 3)
+    npc = NpcGlyph(position=(1, 1), glyph="j", species="jackal")
+    cells = render_to_cells(
+        level, (1, 1), frozenset({(1, 1)}), EMPTY, EMPTY, Chrome(), npcs=(npc,)
+    )
+    cell = cells[1 + 1][1]
+    assert cell.char == PLAYER_CHAR
+    assert cell.role is Role.PLAYER
+    assert cell.species is None
+
+
+def test_multiple_npcs_of_different_species_render_distinct_glyphs_simultaneously():
+    level = all_floor_level(5, 3)
+    npcs = (
+        NpcGlyph((0, 1), "r", "rat"),
+        NpcGlyph((1, 1), "j", "jackal"),
+        NpcGlyph((2, 1), "B", "giant bat"),
+        NpcGlyph((3, 1), "s", "cave snake"),
+    )
+    visible = frozenset({(0, 1), (1, 1), (2, 1), (3, 1)})
+    cells = render_to_cells(level, (99, 99), visible, EMPTY, EMPTY, Chrome(), npcs=npcs)
+    row = cells[1 + 1]
+    assert (row[0].char, row[0].species) == ("r", "rat")
+    assert (row[1].char, row[1].species) == ("j", "jackal")
+    assert (row[2].char, row[2].species) == ("B", "giant bat")
+    assert (row[3].char, row[3].species) == ("s", "cave snake")
+    assert all(c.role is Role.NPC for c in row[:4])
+
+
+@pytest.mark.parametrize("pos", [(-1, 0), (0, -1), (5, 0), (0, 3), (-1, -1), (99, 99)])
+def test_npc_out_of_bounds_position_is_not_drawn_and_does_not_raise(pos):
+    level = small_level()  # 5 wide, 3 high
+    npc = NpcGlyph(position=pos, glyph="r", species="rat")
+    cells = render_to_cells(
+        level, (99, 99), all_coords(level), EMPTY, EMPTY, Chrome(), npcs=(npc,)
+    )
+    flat = [c for row in cells[1:-1] for c in row]
+    assert all(c.role is not Role.NPC for c in flat)
+
+
+def test_render_to_cells_defaults_to_no_npcs_and_no_target():
+    """`npcs` and `target` are appended with defaults, so every v1-v4 call site keeps
+    working unchanged — asserted here by comparing an explicit-defaults call against
+    the bare five/six-argument call the rest of this file still uses throughout."""
+    level = all_floor_level(3, 3)
+    explicit = render_to_cells(
+        level, (0, 0), all_coords(level), EMPTY, EMPTY, Chrome(), npcs=(), target=None
+    )
+    implicit = render_to_cells(level, (0, 0), all_coords(level), EMPTY, EMPTY, Chrome())
+    assert explicit == implicit
+
+
+def test_npcs_tuple_and_target_are_not_mutated():
+    level = all_floor_level(3, 3)
+    npcs = (NpcGlyph((1, 1), "r", "rat"),)
+    target = (1, 1)
+    visible = frozenset({(1, 1)})
+    render_to_cells(level, (0, 0), visible, EMPTY, EMPTY, Chrome(), npcs, target)
+    assert npcs == (NpcGlyph((1, 1), "r", "rat"),)
+    assert target == (1, 1)
+
+
+def test_repeated_calls_with_npcs_and_target_are_equal():
+    level = all_floor_level(3, 3)
+    npcs = (NpcGlyph((1, 1), "r", "rat"),)
+    visible = frozenset({(1, 1)})
+    first = render_to_cells(level, (0, 0), visible, EMPTY, EMPTY, Chrome(), npcs, (1, 1))
+    second = render_to_cells(level, (0, 0), visible, EMPTY, EMPTY, Chrome(), npcs, (1, 1))
+    assert first == second
+
+
+# ------------------------------------------------------------------ ranged target cursor
+
+
+def test_ranged_target_cell_carries_a_reverse_glyph_unchanged():
+    level = all_floor_level(4, 3)
+    npc = NpcGlyph(position=(2, 1), glyph="s", species="cave snake")
+    visible = frozenset({(2, 1)})
+    cells = render_to_cells(
+        level, (0, 0), visible, EMPTY, EMPTY, Chrome(), npcs=(npc,), target=(2, 1)
+    )
+    cell = cells[1 + 1][2]
+    assert cell.reverse is True
+    # The target highlight applies to the NPC's cell even though the NPC glyph is drawn
+    # over terrain: the glyph is still the species glyph, not a cursor character.
+    assert cell.char == "s"
+    assert cell.role is Role.NPC
+    assert cell.species == "cave snake"
+
+
+def test_no_target_selected_means_no_cell_carries_reverse():
+    level = all_floor_level(4, 3)
+    npc = NpcGlyph(position=(2, 1), glyph="s", species="cave snake")
+    visible = frozenset({(2, 1)})
+    cells = render_to_cells(
+        level,
+        (0, 0),
+        visible,
+        EMPTY,
+        EMPTY,
+        Chrome(stats="HP 1", message="m", status_right="r"),
+        npcs=(npc,),
+    )
+    flat = [c for row in cells for c in row]
+    assert all(c.reverse is False for c in flat)
+
+
+def test_only_the_target_cell_carries_reverse_and_no_other():
+    level = all_floor_level(5, 4)
+    visible = all_coords(level)
+    npc = NpcGlyph((4, 3), "B", "giant bat")
+    cells = render_to_cells(
+        level, (0, 0), visible, EMPTY, EMPTY, Chrome(), npcs=(npc,), target=(3, 2)
+    )
+    hits = [(y, x) for y, row in enumerate(cells) for x, c in enumerate(row) if c.reverse]
+    assert hits == [(2 + 1, 3)]
+
+
+def test_target_on_a_terrain_cell_highlights_it_without_changing_its_glyph():
+    level = all_floor_level(4, 3)
+    cells = render_to_cells(
+        level, (99, 99), all_coords(level), EMPTY, EMPTY, Chrome(), target=(1, 1)
+    )
+    cell = cells[1 + 1][1]
+    assert cell.reverse is True
+    assert cell.char == TILE_CHARS[Tile.FLOOR]
+    assert cell.role is Role.TERRAIN
+
+
+def test_target_out_of_bounds_does_not_raise_and_nothing_is_reversed():
+    level = small_level()
+    cells = render_to_cells(
+        level, (99, 99), all_coords(level), EMPTY, EMPTY, Chrome(), target=(999, 999)
+    )
+    flat = [c for row in cells for c in row]
+    assert all(c.reverse is False for c in flat)
+
+
+def test_chrome_rows_never_carry_a_target_highlight():
+    level = all_floor_level(4, 2)
+    cells = render_to_cells(
+        level, (0, 0), all_coords(level), EMPTY, EMPTY, Chrome(stats="s"), target=(0, 0)
+    )
+    assert all(c.reverse is False for c in cells[0])
+    assert all(c.reverse is False for c in cells[-1])
+
+
+# ------------------------------------------------------------------------- stats row
+
+
+def test_stats_row_longer_than_terminal_is_clipped_not_wrapped_or_raised():
+    level = all_wall_level(8, 2)
+    long_stats = "HP 25/25  Lv 3  XP 40/225  Str 10 Agi 12 Vit 8"
+    cells = render_to_cells(level, (0, 0), EMPTY, EMPTY, EMPTY, Chrome(stats=long_stats))
+    assert len(cells) == level.height + 2
+    stats_line = "".join(c.char for c in cells[0])
+    assert len(stats_line) == 8
+    assert stats_line == long_stats[:8]
+
+
 # ------------------------------------------------------------------------------ purity
 
 
@@ -681,10 +914,17 @@ def test_render_source_contains_no_glyph_literals(glyph):
     assert f"'{glyph}'" not in src
 
 
-@pytest.mark.parametrize("color_number", [250, 238, 180, 94, 231])
+@pytest.mark.parametrize("color_number", [250, 238, 180, 94, 231, 173, 140])
 def test_render_source_contains_no_bare_palette_colour_literals(color_number):
-    """None of the binding palette's 256-colour indices (style.py §15.1) may be
-    re-spelled here; they must only ever be reached via style.attr_for."""
+    """None of the binding palette's 256-colour indices (style.py §15.1, §24.1) may be
+    re-spelled here; they must only ever be reached via style.attr_for.
+
+    ``70`` (the cave snake's colour) is deliberately excluded from this sweep — it is
+    indistinguishable from other incidental small integers already legitimately present
+    in the source (line lengths, offsets, and the like), so it cannot be tested this way
+    without false positives; the other four 256-colour indices are distinctive enough
+    that this is still a meaningful regression guard.
+    """
     src = _render_source()
     assert str(color_number) not in src
 
@@ -721,6 +961,9 @@ def test_render_imports_only_permitted_modules():
         "roguelike.generator",
         "roguelike.fov",
         "roguelike.events",
+        "roguelike.npc",
+        "roguelike.combat",
+        "roguelike.stats",
     ],
 )
 def test_render_does_not_import_sibling_modules(forbidden):
@@ -789,6 +1032,7 @@ def test_public_surface():
     assert module.__all__ == [
         "Cell",
         "Chrome",
+        "NpcGlyph",
         "render_to_cells",
         "to_lines",
         "init_colors",
@@ -815,6 +1059,24 @@ def test_cell_is_a_frozen_dataclass():
     cell = Cell("@", Role.PLAYER, Visibility.VISIBLE)
     with pytest.raises(dataclasses.FrozenInstanceError):
         cell.char = "#"  # type: ignore[misc]
+
+
+def test_cell_species_and_reverse_default_to_none_and_false():
+    cell = Cell("#", Role.TERRAIN, Visibility.VISIBLE)
+    assert cell.species is None
+    assert cell.reverse is False
+
+
+def test_npc_glyph_is_a_frozen_dataclass():
+    import dataclasses
+
+    assert dataclasses.is_dataclass(NpcGlyph)
+    npc = NpcGlyph((1, 2), "r", "rat")
+    assert npc.position == (1, 2)
+    assert npc.glyph == "r"
+    assert npc.species == "rat"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        npc.glyph = "j"  # type: ignore[misc]
 
 
 # ------------------------------------------------------------------ draw (fake window)
@@ -1016,3 +1278,98 @@ def test_init_colors_can_be_called_multiple_times():
     init_colors(colors=256)
     init_colors(colors=8)
     init_colors(colors=0)  # must not raise or accumulate state incorrectly
+
+
+def test_init_colors_populates_npc_attr_table_for_every_species():
+    import roguelike.render as render_module
+
+    init_colors(colors=256)
+    assert set(render_module._NPC_ATTRS.keys()) == {"rat", "jackal", "giant bat", "cave snake"}
+
+
+# --------------------------------------------------------------- draw: NPCs and A_REVERSE
+
+
+def test_draw_uses_the_npc_attr_table_keyed_by_species_not_cell_attrs():
+    import roguelike.render as render_module
+
+    saved_cell, saved_npc = dict(render_module._CELL_ATTRS), dict(render_module._NPC_ATTRS)
+    try:
+        render_module._CELL_ATTRS = {}
+        render_module._NPC_ATTRS = {"rat": 42}
+        cells = [[Cell("r", Role.NPC, Visibility.VISIBLE, species="rat")]]
+        win = FakeWindow(24, 80)
+        draw(win, cells)
+        assert win.calls == [(0, 0, "r", 42)]
+    finally:
+        render_module._CELL_ATTRS = saved_cell
+        render_module._NPC_ATTRS = saved_npc
+
+
+def test_draw_falls_back_to_zero_for_an_unrecognised_npc_species():
+    import roguelike.render as render_module
+
+    saved_npc = dict(render_module._NPC_ATTRS)
+    try:
+        render_module._NPC_ATTRS = {}
+        cells = [[Cell("x", Role.NPC, Visibility.VISIBLE, species="dragon")]]
+        win = FakeWindow(24, 80)
+        draw(win, cells)
+        assert win.calls == [(0, 0, "x", 0)]
+    finally:
+        render_module._NPC_ATTRS = saved_npc
+
+
+def test_draw_applies_a_reverse_on_top_of_the_looked_up_attribute():
+    import roguelike.render as render_module
+
+    saved_cell = dict(render_module._CELL_ATTRS)
+    try:
+        render_module._CELL_ATTRS = {(Role.TERRAIN, Visibility.VISIBLE): 5}
+        cells = [[Cell("#", Role.TERRAIN, Visibility.VISIBLE, reverse=True)]]
+        win = FakeWindow(24, 80)
+        draw(win, cells)
+        (y, x, text, attr) = win.calls[0]
+        assert text == "#"
+        assert attr & curses.A_REVERSE
+        assert attr & 5 == 5  # the underlying attribute survives underneath the flag
+    finally:
+        render_module._CELL_ATTRS = saved_cell
+
+
+def test_draw_without_reverse_never_sets_a_reverse_bit():
+    import roguelike.render as render_module
+
+    saved_cell = dict(render_module._CELL_ATTRS)
+    try:
+        render_module._CELL_ATTRS = {(Role.TERRAIN, Visibility.VISIBLE): 5}
+        cells = [[Cell("#", Role.TERRAIN, Visibility.VISIBLE, reverse=False)]]
+        win = FakeWindow(24, 80)
+        draw(win, cells)
+        (_, _, _, attr) = win.calls[0]
+        assert not attr & curses.A_REVERSE
+    finally:
+        render_module._CELL_ATTRS = saved_cell
+
+
+def test_draw_and_init_colors_end_to_end_with_visible_npc_and_target():
+    """A realistic end-to-end smoke test: a visible NPC and a ranged target both survive
+    render_to_cells -> init_colors -> draw with no TTY and no exception."""
+    level = all_floor_level(4, 3)
+    npc = NpcGlyph(position=(2, 1), glyph="j", species="jackal")
+    cells = render_to_cells(
+        level,
+        (0, 0),
+        frozenset({(2, 1)}),
+        EMPTY,
+        EMPTY,
+        Chrome(stats="HP 10/10  Lv 1  XP 0/25  Str 5 Agi 5 Vit 5"),
+        npcs=(npc,),
+        target=(2, 1),
+    )
+    init_colors(colors=256)
+    win = FakeWindow(24, 80)
+    draw(win, cells)
+    npc_call = next(c for c in win.calls if c[0] == 2 and c[1] == 2)
+    assert npc_call[2] == "j"
+    assert npc_call[3] & curses.A_REVERSE

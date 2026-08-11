@@ -28,6 +28,16 @@ The rules these tests exist to pin, in order of how easy they are to break:
    a whole auto-explore of a real generated level runs to completion in a test with no
    screen, no clock and no waiting; the loop's 100 ms deadline is observed only through a
    stub screen that records the number it was handed.
+6. **A turn consumed is one world-tick, and only a turn consumed** (v5). Walking into a
+   wall leaves every monster's position and energy and the player's hit points exactly as
+   they were — the headline rule of point 1, extended to everything the world now does.
+
+**Monsters are opt-in in this file.** Every generated level is populated at generation
+time (CONTRACT-v5 §24.4), which would put wandering animals in the middle of two hundred
+tests about fog, staircases and pathfinding that have nothing to say about them. The
+``_unpopulated`` fixture below turns spawning off by default; a test that wants the real
+population asks for the ``monsters`` fixture by name, and the v5 sections mostly build
+their monsters by hand so that every fight is exact rather than incidental.
 """
 
 from __future__ import annotations
@@ -36,6 +46,8 @@ import ast
 import copy
 import dataclasses
 import inspect
+import random
+import re
 import subprocess
 import sys
 from collections import deque
@@ -43,24 +55,62 @@ from pathlib import Path
 
 import pytest
 
-from roguelike import dungeon, events, fov, game, world
+from roguelike import combat, dungeon, events, fov, game, world
 from roguelike.activity import Activity, ActivityKind
 from roguelike.events import Event, EventKind
 from roguelike.game import (
+    ENERGY_THRESHOLD,
+    MAX_EVENTS,
     GameState,
     LevelState,
+    Player,
+    Targeting,
     advance,
+    advance_npcs,
     format_stats,
     format_status_right,
     interruption,
+    level_up,
     new_game,
     play,
+    roll_seed,
     run,
     step,
+    xp_to_next,
 )
+from roguelike.items import DAGGER, SHORTBOW
 from roguelike.keys import Command, CommandKind, translate_key
 from roguelike.level import Level
+from roguelike.npc import (
+    NPC,
+    SPECIES_DATA,
+    AiState,
+    Species,
+    spawn_npcs,
+)
+from roguelike.stats import Actor, Stats, derive
+from roguelike.status import REGEN_TURNS, StatusEffect, StatusKind
 from roguelike.tiles import Tile
+
+
+@pytest.fixture(autouse=True)
+def _unpopulated(request, monkeypatch):
+    """Play a monsterless dungeon unless the test asks for ``monsters``.
+
+    Spawning is real and is tested (see the v5 sections); switching it off by default is
+    what keeps two hundred v1-v4 tests about terrain, fog and routing saying what they
+    were written to say, rather than quietly becoming tests about whether a jackal
+    happened to wander into the corridor.
+    """
+    if "monsters" in request.fixturenames:
+        return
+    monkeypatch.setattr(game, "spawn_npcs", lambda rng, level, first_actor_id=1: ())
+
+
+@pytest.fixture
+def monsters():
+    """Opt back in to real spawning (CONTRACT-v5 §24.4)."""
+    return True
 
 # ---------------------------------------------------------------------------------------
 # Test levels — hand-built so the assertions are exact
@@ -375,6 +425,9 @@ STATE_FIELDS = (
     "outcome",
     "activity",
     "awaiting_walk",
+    "player_actor",
+    "npcs",
+    "targeting",
 )
 
 
@@ -490,11 +543,16 @@ def _down(state: GameState) -> tuple[int, int]:
 # ---------------------------------------------------------------------------------------
 
 
-def test_levelstate_field_order_and_no_defaults() -> None:
+def test_levelstate_field_order_and_defaults() -> None:
+    # CONTRACT-v5 §24.5 appends `npcs`, with a default, so every v3/v4 three-argument
+    # construction still works — asserted directly below.
     fields = dataclasses.fields(LevelState)
-    assert [f.name for f in fields] == ["level", "explored", "open_doors"]
-    for field in fields:
+    assert [f.name for f in fields] == ["level", "explored", "open_doors", "npcs"]
+    for field in fields[:3]:
         assert field.default is dataclasses.MISSING
+    assert fields[3].default == ()
+    entry = LevelState(room_level(), frozenset(), frozenset())
+    assert entry.npcs == ()
 
 
 def test_levelstate_is_frozen_and_compares_by_value() -> None:
@@ -525,7 +583,13 @@ def test_gamestate_field_order_and_defaults() -> None:
     # every positional one — keeps working untouched (CONTRACT-v4 §7).
     assert fields[13].default is None        # activity
     assert fields[14].default is False       # awaiting_walk
-    assert len(fields) == 15
+    # v5 appends exactly three, on the same terms (CONTRACT-v5 §7 v5).
+    assert fields[15].default == Player(
+        actor=Actor(stats=Stats(10, 10, 10), hp=45)
+    )                                        # player_actor
+    assert fields[16].default == ()          # npcs
+    assert fields[17].default is None        # targeting
+    assert len(fields) == 18
 
 
 def test_gamestate_constructs_positionally_with_defaults() -> None:
@@ -543,6 +607,12 @@ def test_gamestate_constructs_positionally_with_defaults() -> None:
     assert state.outcome is None
     assert state.activity is None
     assert state.awaiting_walk is False
+    assert state.npcs == ()
+    assert state.targeting is None
+    assert state.player_actor.actor.hp == 45
+    assert state.player_actor.level == 1
+    assert state.player_actor.melee is DAGGER
+    assert state.player_actor.ranged is SHORTBOW
 
 
 def test_gamestate_is_frozen() -> None:
@@ -1636,15 +1706,53 @@ def test_no_event_is_emitted_for_bumping_a_wall() -> None:
 # ---------------------------------------------------------------------------------------
 
 
-def test_format_stats_is_empty() -> None:
-    assert format_stats(start(room_level())) == ""
-    assert format_stats(new_game(1234, *SMALL)) == ""
+def test_format_stats_is_the_v5_layout() -> None:
+    # CONTRACT-v5 §7.13, character for character, at the baseline the game starts from.
+    assert (
+        format_stats(start(room_level()))
+        == "HP 45/45  Lv 1  XP 0/25  Str 10 Agi 10 Vit 10"
+    )
+    assert format_stats(new_game(1234, *SMALL)) == format_stats(start(room_level()))
 
 
-def test_format_stats_stays_empty_after_playing() -> None:
-    state = step(_at_the_door(), MOVE_E)
-    assert format_stats(state) == ""
-    assert type(format_stats(state)) is str
+def test_format_stats_shows_real_values_not_a_template() -> None:
+    state = start(room_level())
+    state = dataclasses.replace(
+        state,
+        player_actor=Player(
+            actor=Actor(stats=Stats(str_=12, agi=9, vit=13), hp=37), xp=17, level=3
+        ),
+    )
+    assert format_stats(state) == "HP 37/57  Lv 3  XP 17/225  Str 12 Agi 9 Vit 13"
+
+
+def test_format_stats_uses_two_spaces_between_fields_and_one_inside_the_stat_block() -> None:
+    text = format_stats(start(room_level()))
+    assert type(text) is str
+    assert text.count("  ") == 3
+    assert "Str 10 Agi 10 Vit 10" in text
+    assert text == text.strip()  # padding is the renderer's job (CONTRACT-v3 §4.2)
+
+
+def test_format_stats_max_hp_comes_from_stats_derive_not_a_second_formula() -> None:
+    for vit in (1, 5, 10, 20):
+        state = dataclasses.replace(
+            start(room_level()),
+            player_actor=Player(actor=Actor(stats=Stats(10, 10, vit), hp=1)),
+        )
+        assert f"/{derive(Stats(10, 10, vit)).max_hp}  Lv" in format_stats(state)
+
+
+def test_format_stats_tracks_damage_taken() -> None:
+    state = start(room_level())
+    hurt = dataclasses.replace(
+        state,
+        player_actor=dataclasses.replace(
+            state.player_actor,
+            actor=dataclasses.replace(state.player_actor.actor, hp=12),
+        ),
+    )
+    assert format_stats(hurt).startswith("HP 12/45")
 
 
 def test_format_status_right_exact_literal() -> None:
@@ -2127,6 +2235,11 @@ def test_import_set_matches_the_contract_import_graph() -> None:
         "roguelike.events",
         "roguelike.pathfind",   # v4 (CONTRACT-v4 §10)
         "roguelike.activity",   # v4
+        "roguelike.stats",      # v5 (CONTRACT-v5 §10 v5)
+        "roguelike.items",      # v5
+        "roguelike.status",     # v5
+        "roguelike.combat",     # v5
+        "roguelike.npc",        # v5
     }
     assert "roguelike.game" not in roguelike_imports
     assert "roguelike.style" not in roguelike_imports
@@ -2134,7 +2247,12 @@ def test_import_set_matches_the_contract_import_graph() -> None:
     assert "roguelike.generator" not in roguelike_imports, (
         "generation is reached through dungeon now (CONTRACT-v3 §10)"
     )
-    assert imported - roguelike_imports <= {"__future__", "curses", "dataclasses"}
+    assert imported - roguelike_imports <= {
+        "__future__",
+        "curses",
+        "dataclasses",
+        "random",  # v5: `random.Random(roll_seed(...))`, never a module-level draw
+    }
 
 
 def test_no_module_reads_a_clock_or_sleeps() -> None:
@@ -2165,21 +2283,27 @@ def test_no_module_reads_a_clock_or_sleeps() -> None:
             imported.add(node.module or "")
     assert "time" not in imported
 
-    # No busy-wait: the only loop in the module is the turn loop in `run`, and it is
-    # driven by a blocking or deadlined `getch`, never by spinning on a condition.
-    loops = [
-        node
+    # No busy-wait. v5 adds two `while` loops — the energy accumulator (§24.3) and the
+    # levelling loop (§7.11) — and both are bounded by arithmetic that shrinks on every
+    # pass. The turn loop in `run` is still the only one that waits for anything, and it
+    # waits on `getch`, never by spinning on a condition.
+    whiles = {
+        _enclosing_function(GAME_TREE, node)
         for node in ast.walk(GAME_TREE)
-        if isinstance(node, (ast.While, ast.For))
-    ]
-    assert len(loops) == 1
-    assert isinstance(loops[0], ast.While)
-    assert _enclosing_function(GAME_TREE, loops[0]) == "run"
+        if isinstance(node, ast.While)
+    }
+    assert whiles == {"run", "advance_npcs", "level_up"}
+
+    loop = next(
+        node
+        for node in ast.walk(_function("run"))
+        if isinstance(node, ast.While)
+    )
     calls_getch = any(
         isinstance(child, ast.Call)
         and isinstance(child.func, ast.Attribute)
         and child.func.attr == "getch"
-        for child in ast.walk(loops[0])
+        for child in ast.walk(loop)
     )
     assert calls_getch, "every pass of the loop blocks on input rather than spinning"
 
@@ -2379,10 +2503,18 @@ def test_play_prints_the_outcome_after_the_wrapper_returns() -> None:
 def test_public_surface_is_exactly_the_contract_surface() -> None:
     assert game.__all__ == [
         "LevelState",
+        "Player",
+        "Targeting",
         "GameState",
+        "ENERGY_THRESHOLD",
+        "MAX_EVENTS",
         "new_game",
+        "roll_seed",
         "step",
         "advance",
+        "advance_npcs",
+        "level_up",
+        "xp_to_next",
         "interruption",
         "format_stats",
         "format_status_right",
@@ -2446,7 +2578,10 @@ def test_module_has_future_annotations_import() -> None:
 
 
 def test_no_third_party_imports() -> None:
-    stdlib_or_project = {"__future__", "curses", "dataclasses", "roguelike"}
+    # `random` is v5's only new stdlib import, and it is imported for the *type* — every
+    # generator is built from `roll_seed` inside a function (CONTRACT-v5 §0.12). The next
+    # test pins that no module-level draw exists.
+    stdlib_or_project = {"__future__", "curses", "dataclasses", "random", "roguelike"}
     for node in ast.walk(GAME_TREE):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -2493,8 +2628,12 @@ def test_no_extra_command_kind_was_invented() -> None:
         "ASCEND",
         "AUTO_EXPLORE",
         "WALK_PREFIX",
+        # v5 adds exactly two (CONTRACT-v5 §5 v5). There is deliberately no ATTACK:
+        # walking into a monster *is* the attack (§7.9).
+        "FIRE",
+        "TARGET_NEXT",
     }
-    for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH", "TRAVEL", "RUN"):
+    for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH", "TRAVEL", "RUN", "ATTACK"):
         assert f"CommandKind.{name}" not in GAME_SOURCE
 
 
@@ -2517,7 +2656,9 @@ def test_no_route_cache_or_turn_cap_was_added() -> None:
     """
     assert "path" not in {f.name for f in dataclasses.fields(Activity)}
     for name in ("max_turns", "_cache", "cached", "lru_cache", "memo"):
-        assert name not in GAME_SOURCE
+        # Whole words: v5's monsters carry a `memory` field (CONTRACT-v5 §24.2), which is
+        # not a memo table, and the point of this test is that no cache exists.
+        assert re.search(rf"\b{name}\b", GAME_SOURCE) is None
 
 
 def test_only_the_first_down_staircase_is_used() -> None:
@@ -2610,7 +2751,11 @@ def test_run_lays_the_chrome_out_through_the_renderer() -> None:
     state = new_game(1234, width, height)
     run(screen, state)
 
-    assert screen.row(0, 0, width) == " " * width, "the stats row is reserved and blank"
+    # v5 fills the row that stood reserved and blank for three versions (§7.13); it is
+    # padded to the full width by the renderer, exactly as the empty string was.
+    stats_row = screen.row(0, 0, width)
+    assert stats_row == format_stats(state).ljust(width)[:width]
+    assert stats_row.startswith("HP 45/45  Lv 1  XP 0/25")
     status = screen.row(0, height + 1, width)
     assert status.endswith("Level 1  Seed 1234")
     assert status.strip() == "Level 1  Seed 1234", "no message yet"
@@ -3587,3 +3732,1585 @@ def test_run_still_plays_an_ordinary_game_with_no_activity_in_sight() -> None:
     assert screen.timeouts == [-1, -1, -1]
     assert final.running is False
     assert final.activity is None
+
+
+# =======================================================================================
+# v5 — combat, monsters, targeting, levelling and death (CONTRACT-v5 §7 v5)
+#
+# Monsters are built by hand here rather than spawned, so every fight is exact: the same
+# level, the same species, the same starting energy, the same seed. Spawning itself is
+# `npc.py`'s to test, and is exercised end to end further down through the `monsters`
+# fixture.
+# =======================================================================================
+
+FIRE = Command(CommandKind.FIRE)
+TARGET_NEXT = Command(CommandKind.TARGET_NEXT)
+
+#: Salts, restated from CONTRACT-v5 §0.12 so a test never has to read the module to know
+#: which stream a roll came from. The player is permanently actor 0.
+SALT_ATTACK = 1
+
+
+def make_npc(
+    position: tuple[int, int],
+    species: Species = Species.RAT,
+    actor_id: int = 1,
+    *,
+    stats: Stats | None = None,
+    hp: int | None = None,
+    energy: int = 0,
+    ai_state: AiState = AiState.HUNTING,
+    memory: int = 0,
+    effects: tuple[StatusEffect, ...] = (),
+) -> NPC:
+    """One monster, exactly as described. ``stats`` overrides the species' own."""
+    stats = SPECIES_DATA[species].stats if stats is None else stats
+    hp = derive(stats).max_hp if hp is None else hp
+    return NPC(
+        actor_id=actor_id,
+        species=species,
+        actor=Actor(stats=stats, hp=hp, status_effects=effects),
+        position=position,
+        energy=energy,
+        ai_state=ai_state,
+        memory=memory,
+    )
+
+
+def with_npcs(state: GameState, *npcs: NPC) -> GameState:
+    return dataclasses.replace(state, npcs=tuple(npcs))
+
+
+def with_player(
+    state: GameState,
+    *,
+    stats: Stats | None = None,
+    hp: int | None = None,
+    xp: int = 0,
+    level: int = 1,
+    regen_counter: int = 0,
+    effects: tuple[StatusEffect, ...] = (),
+) -> GameState:
+    stats = Stats(10, 10, 10) if stats is None else stats
+    hp = derive(stats).max_hp if hp is None else hp
+    return dataclasses.replace(
+        state,
+        player_actor=Player(
+            actor=Actor(stats=stats, hp=hp, status_effects=effects),
+            xp=xp,
+            level=level,
+            regen_counter=regen_counter,
+        ),
+    )
+
+
+#: A player who cannot plausibly die, for tests that need to watch a monster act for
+#: dozens of ticks without the run ending underneath them.
+UNKILLABLE = Stats(str_=10, agi=10, vit=200)
+
+
+def tick(state: GameState) -> GameState:
+    """One world-tick, seeded the way a consumed turn seeds it.
+
+    ``_take_turn`` advances ``turns`` *before* ``advance_npcs`` runs, and every roll of the
+    tick is derived from that counter — so a test that calls ``advance_npcs`` twice on the
+    same ``turns`` would replay one tick, not run two. It also replaces ``events`` with
+    what the action produced, which is why they are cleared here: ``advance_npcs`` appends
+    to them (§7.14), so a helper that left last tick's line in place would accumulate.
+    """
+    return advance_npcs(
+        dataclasses.replace(state, turns=state.turns + 1, events=())
+    )
+
+
+def player_attack_result(
+    state: GameState, target: NPC, weapon, strength_applies: bool
+):
+    """Replay the exact roll ``step`` will make, through the real combat module.
+
+    Nothing is guessed: the seed comes from :func:`roll_seed` with the player's permanent
+    ``actor_id`` 0 and the attack salt, and the arithmetic comes from
+    :func:`roguelike.combat.resolve_attack` itself. A test can therefore assert the damage
+    the game *should* deal without restating a formula that lives elsewhere.
+    """
+    rng = random.Random(roll_seed(state.master_seed, state.turns, 0, SALT_ATTACK))
+    return combat.resolve_attack(
+        rng,
+        state.player_actor.actor,
+        target.actor,
+        weapon.damage_min,
+        weapon.damage_max,
+        strength_applies,
+    )
+
+
+def seed_where_player(state: GameState, target: NPC, weapon, hit: bool) -> int:
+    """The first master seed at which the player's next swing hits (or misses)."""
+    for seed in range(500):
+        candidate = dataclasses.replace(state, master_seed=seed)
+        if player_attack_result(candidate, target, weapon, True).hit is hit:
+            return seed
+    raise AssertionError("no seed produced the requested outcome")
+
+
+def fight_level() -> Level:
+    """A 9x7 hall: a wide-open interior where every neighbour of the centre is floor."""
+    return hall_level()
+
+
+#: 9x5, two 3x3 rooms with a solid wall between them and **no door**. A monster in the
+#: eastern room can neither see nor reach the player in the western one, so the world
+#: ticks — status effects, regeneration, energy — without a fight breaking out in the
+#: middle of a test about poison. `two_room_level` cannot be used for this: its door would
+#: be opened within a turn or two and the monster would come through.
+CAGE_ROWS = [
+    "#########",
+    "#...#...#",
+    "#...#...#",
+    "#...#...#",
+    "#########",
+]
+
+CAGE_PLAYER = (2, 2)
+CAGE_CELL = (6, 2)
+
+
+def caged(
+    species: Species = Species.RAT,
+    *,
+    stats: Stats | None = None,
+    energy: int = 0,
+    effects: tuple[StatusEffect, ...] = (),
+    hp: int | None = None,
+) -> GameState:
+    """A game with exactly one monster that can never reach or see the player."""
+    return with_npcs(
+        start(build_level(CAGE_ROWS, player_start=CAGE_PLAYER)),
+        make_npc(
+            CAGE_CELL,
+            species,
+            stats=stats,
+            energy=energy,
+            effects=effects,
+            hp=hp,
+            ai_state=AiState.WANDERING,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# Bump-to-attack (CONTRACT-v5 §7.9)
+# ---------------------------------------------------------------------------------------
+
+
+def test_walking_into_a_monster_attacks_it_and_costs_a_turn() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3)))
+    after = step(state, MOVE_E)
+
+    assert after.player == (4, 3), "the attacker does not move into the cell"
+    assert after.turns == state.turns + 1
+    assert after.events[0].kind in {
+        EventKind.PLAYER_HIT_NPC,
+        EventKind.PLAYER_MISSED_NPC,
+    }
+    assert after.events[0].name == "rat"
+
+
+def test_a_hit_reduces_the_monsters_hit_points_by_the_rolled_damage() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3)))
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[0], DAGGER, True)
+    )
+    expected = player_attack_result(state, state.npcs[0], DAGGER, True)
+
+    after = step(state, MOVE_E)
+    assert after.events[0].kind is EventKind.PLAYER_HIT_NPC
+    assert after.npcs[0].actor.hp == expected.defender_hp
+    assert after.npcs[0].actor.hp < state.npcs[0].actor.hp
+
+
+def test_a_miss_leaves_the_monster_untouched_but_still_costs_the_turn() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3)))
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[0], DAGGER, False)
+    )
+
+    after = step(state, MOVE_E)
+    assert after.events[0].kind is EventKind.PLAYER_MISSED_NPC
+    assert after.npcs[0].actor == state.npcs[0].actor
+    assert after.turns == state.turns + 1
+
+
+def test_melee_applies_the_strength_modifier() -> None:
+    # CONTRACT-v5 §23.2: a wielded melee weapon takes (STR - 10) // 2. With STR 16 that is
+    # +3, which is only visible against a defender the roll cannot floor to 1.
+    state = with_player(start(fight_level()), stats=Stats(str_=16, agi=10, vit=10))
+    state = with_npcs(state, make_npc((5, 3), Species.CAVE_SNAKE))
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[0], DAGGER, True)
+    )
+
+    with_strength = player_attack_result(state, state.npcs[0], DAGGER, True)
+    without = player_attack_result(state, state.npcs[0], DAGGER, False)
+    assert with_strength.damage == without.damage + 3, "the fixture must distinguish them"
+
+    after = step(state, MOVE_E)
+    assert after.npcs[0].actor.hp == with_strength.defender_hp
+
+
+def test_attacking_diagonally_works_in_all_eight_directions() -> None:
+    for command, cell in (
+        (MOVE_N, (4, 2)),
+        (MOVE_S, (4, 4)),
+        (MOVE_E, (5, 3)),
+        (MOVE_W, (3, 3)),
+        (MOVE_NE, (5, 2)),
+        (MOVE_NW, (3, 2)),
+        (MOVE_SE, (5, 4)),
+        (MOVE_SW, (3, 4)),
+    ):
+        state = with_npcs(start(fight_level()), make_npc(cell))
+        after = step(state, command)
+        assert after.player == (4, 3)
+        assert after.turns == 1
+        assert after.events[0].kind in {
+            EventKind.PLAYER_HIT_NPC,
+            EventKind.PLAYER_MISSED_NPC,
+        }
+
+
+def test_a_monster_does_not_block_a_step_to_a_different_cell() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3)))
+    after = step(state, MOVE_N)
+    assert after.player == (4, 2)
+    assert after.npcs[0].position == (5, 3) or after.npcs[0].position != (4, 2)
+
+
+def test_killing_a_monster_removes_it_and_says_so() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3), hp=1))
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[0], DAGGER, True)
+    )
+    after = step(state, MOVE_E)
+    assert after.npcs == ()
+    assert [e.kind for e in after.events] == [
+        EventKind.PLAYER_HIT_NPC,
+        EventKind.NPC_KILLED,
+    ]
+    assert after.events[1].name == "rat"
+
+
+# ---------------------------------------------------------------------------------------
+# The headline rule, extended: no turn means no world-tick (CONTRACT-v5 §7.8)
+# ---------------------------------------------------------------------------------------
+
+
+def test_walking_into_a_wall_does_not_tick_the_world() -> None:
+    """The single most important test in this file's v5 half.
+
+    A rejected move has consumed no turn since v1. v5's consequence is that nothing else
+    may happen either: no monster moves, none of them banks energy, no poison burns and
+    nothing regenerates. Asserted field by field rather than by equality, so a failure
+    says *what* moved.
+    """
+    state = with_player(
+        with_npcs(
+            start(fight_level()),
+            make_npc((7, 1), Species.JACKAL, 1, energy=90),
+            make_npc((1, 5), Species.GIANT_BAT, 2, energy=40),
+        ),
+        hp=30,
+        regen_counter=9,
+        effects=(StatusEffect(StatusKind.POISONED, 3, 2),),
+    )
+    state = dataclasses.replace(state, player=(1, 1))
+
+    after = step(state, MOVE_NW)  # into the corner wall
+
+    assert after is state, "nothing happened at all, so nothing was rebuilt"
+    assert after.turns == state.turns
+    assert [(n.position, n.energy) for n in after.npcs] == [
+        (n.position, n.energy) for n in state.npcs
+    ]
+    assert after.player_actor == state.player_actor
+    assert after.player_actor.actor.hp == 30
+    assert after.player_actor.regen_counter == 9
+    assert after.visible is state.visible
+
+
+@pytest.mark.parametrize(
+    "command",
+    [QUIT, UNKNOWN, WALK_PREFIX, AUTO_EXPLORE, TARGET_NEXT],
+    ids=["quit", "unknown", "walk-prefix", "auto-explore", "target-next"],
+)
+def test_no_command_without_a_turn_ticks_the_world(command: Command) -> None:
+    state = with_npcs(
+        start(fight_level()), make_npc((7, 5), Species.JACKAL, 1, energy=99)
+    )
+    after = step(state, command)
+    assert after.turns == state.turns
+    assert after.npcs == state.npcs
+
+
+def test_a_move_that_is_accepted_does_tick_the_world() -> None:
+    state = with_npcs(
+        start(fight_level()), make_npc((7, 5), Species.JACKAL, 1, energy=0)
+    )
+    after = step(state, MOVE_N)
+    assert after.turns == 1
+    assert after.npcs[0] != state.npcs[0], "the jackal took its action"
+
+
+def test_bumping_a_door_open_ticks_the_world() -> None:
+    state = with_npcs(_at_the_door(), make_npc((1, 1), Species.JACKAL, 1, energy=0))
+    after = step(state, MOVE_E)
+    assert after.turns == state.turns + 1
+    assert DOOR_CELL in after.open_doors
+    assert after.npcs[0].energy != state.npcs[0].energy
+
+
+def test_taking_a_staircase_ticks_the_world() -> None:
+    state = with_npcs(
+        walk_to(start(stairs_level()), DOWN_CELL),
+        make_npc((4, 1), Species.JACKAL, 1, energy=0),
+    )
+    before_turns = state.turns
+    after = step(state, DESCEND)
+    assert after.turns == before_turns + 1
+    assert after.depth == 2
+    # The departed level's monsters are filed away untouched — the tick belongs to the
+    # level the player is now standing on.
+    assert after.saved[1].npcs == state.npcs
+
+
+# ---------------------------------------------------------------------------------------
+# NPC turns and the energy rule (CONTRACT-v5 §24.3)
+# ---------------------------------------------------------------------------------------
+
+
+def actions_taken(before: NPC, after: NPC, speed: int) -> int:
+    """How many actions a monster took, read off its energy: bank speed, spend 100 each."""
+    spent = before.energy + speed - after.energy
+    assert spent % ENERGY_THRESHOLD == 0
+    return spent // ENERGY_THRESHOLD
+
+
+def test_a_baseline_speed_monster_acts_exactly_once_per_tick() -> None:
+    state = caged(stats=Stats(10, 10, 10))
+    assert derive(state.npcs[0].actor.stats).speed == 100
+    for _ in range(10):
+        after = tick(state)
+        assert actions_taken(state.npcs[0], after.npcs[0], 100) == 1
+        state = after
+
+
+def test_a_fast_monster_acts_eighteen_times_in_ten_ticks() -> None:
+    # Speed 180 (the giant bat): two actions on some ticks, one on others, never a
+    # fractional action and never a lost one.
+    state = caged(Species.GIANT_BAT)
+    assert derive(state.npcs[0].actor.stats).speed == 180
+    counts = []
+    for _ in range(10):
+        after = tick(state)
+        counts.append(actions_taken(state.npcs[0], after.npcs[0], 180))
+        state = after
+    assert sum(counts) == 18
+    assert set(counts) == {1, 2}
+
+
+def test_a_slow_monster_acts_eight_times_in_ten_ticks() -> None:
+    state = caged(Species.CAVE_SNAKE)
+    assert derive(state.npcs[0].actor.stats).speed == 80
+    counts = []
+    for _ in range(10):
+        after = tick(state)
+        counts.append(actions_taken(state.npcs[0], after.npcs[0], 80))
+        state = after
+    assert sum(counts) == 8
+    assert set(counts) == {0, 1}
+
+
+def test_energy_carries_across_ticks_rather_than_resetting() -> None:
+    state = caged(Species.CAVE_SNAKE, energy=0)
+    first = tick(state)
+    assert first.npcs[0].energy == 80, "banked, not spent"
+    second = tick(first)
+    assert second.npcs[0].energy == 60, "160 banked, one action spent"
+
+
+def test_monsters_act_in_actor_id_order() -> None:
+    # Two hunters, one free cell between them and the player. The lower actor_id plans
+    # first and takes it; the higher one must find another way, because `game.py` folds
+    # each accepted move into `occupied` before the next monster plans.
+    rows = [
+        "#####",
+        "#...#",
+        "#.#.#",
+        "#...#",
+        "#####",
+    ]
+    state = start(build_level(rows, player_start=(1, 2)))
+    state = with_npcs(
+        state,
+        make_npc((3, 1), actor_id=1, stats=Stats(10, 10, 10)),
+        make_npc((3, 3), actor_id=2, stats=Stats(10, 10, 10)),
+    )
+    after = tick(state)
+    assert after.npcs[0].position == (2, 1)
+    assert after.npcs[1].position != (2, 1)
+    positions = [n.position for n in after.npcs]
+    assert len(set(positions)) == len(positions)
+
+
+def test_two_monsters_never_take_the_same_cell_over_a_long_run() -> None:
+    state = with_player(
+        with_npcs(
+            start(fight_level()),
+            make_npc((1, 1), Species.RAT, 1, ai_state=AiState.WANDERING),
+            make_npc((7, 1), Species.JACKAL, 2, ai_state=AiState.WANDERING),
+            make_npc((1, 5), Species.GIANT_BAT, 3, ai_state=AiState.WANDERING),
+            make_npc((7, 5), Species.CAVE_SNAKE, 4, ai_state=AiState.WANDERING),
+        ),
+        stats=UNKILLABLE,
+    )
+    for _ in range(60):
+        state = tick(state)
+        cells = [n.position for n in state.npcs]
+        assert len(set(cells)) == len(cells), "monsters do not stack"
+        assert state.player not in cells, "and never stand on the player"
+
+
+def test_a_monster_adjacent_to_the_player_attacks_it() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL))
+    hits = 0
+    for _ in range(6):
+        before_hp = state.player_actor.actor.hp
+        state = tick(state)
+        kinds = [e.kind for e in state.events]
+        assert kinds and kinds[0] in {
+            EventKind.NPC_HIT_PLAYER,
+            EventKind.NPC_MISSED_PLAYER,
+        }
+        assert state.events[0].name == "jackal"
+        if kinds[0] is EventKind.NPC_HIT_PLAYER:
+            hits += 1
+            assert state.player_actor.actor.hp < before_hp
+    assert hits, "six jackal bites at 85% cannot all miss"
+
+
+def test_a_hunting_monster_walks_towards_the_player() -> None:
+    state = with_player(
+        with_npcs(start(fight_level()), make_npc((7, 5), Species.RAT)), stats=UNKILLABLE
+    )
+    first = tick(state)
+    assert max(
+        abs(first.npcs[0].position[0] - 4), abs(first.npcs[0].position[1] - 3)
+    ) < max(abs(7 - 4), abs(5 - 3))
+
+
+def test_an_uneventful_tick_on_an_empty_level_returns_the_same_state() -> None:
+    # CONTRACT-v5 §11.1: still the same object — but as the *result* of a tick in which
+    # nothing happened, not because the function refused to run.
+    state = start(fight_level())
+    assert state.npcs == ()
+    assert advance_npcs(state) is state
+    assert advance_npcs(with_player(state, hp=45, regen_counter=0)) is not None
+
+
+def test_a_wounded_player_regenerates_on_a_level_with_nothing_alive_on_it() -> None:
+    """CONTRACT-v5 §11.1, the defect this amendment corrects.
+
+    Gating the whole tick on ``state.npcs`` froze healing the moment a floor was cleared —
+    and most of a level's turns are walked after its monsters are dead. Regeneration is
+    what takes floor clears from 0.0% to 61.5% (RESEARCH-v5 §7), so freezing it there
+    silently restores the unplayable balance.
+    """
+    empty = with_player(start(fight_level()), hp=10)
+    assert empty.npcs == ()
+    for _ in range(40):
+        empty = tick(empty)
+    assert empty.player_actor.actor.hp == 14
+
+
+def test_regeneration_does_not_depend_on_a_monster_being_alive() -> None:
+    # The same wounded player, the same forty ticks, with and without something on the
+    # level: the status phase is not gated on `state.npcs`.
+    empty = with_player(start(fight_level()), hp=10)
+    occupied = with_player(caged(), hp=10)
+    for _ in range(40):
+        empty = tick(empty)
+        occupied = tick(occupied)
+    assert empty.player_actor.actor.hp == occupied.player_actor.actor.hp == 14
+
+
+def test_poison_burns_and_expires_on_a_level_with_nothing_alive_on_it() -> None:
+    state = with_player(
+        start(fight_level()), hp=40, effects=(StatusEffect(StatusKind.POISONED, 5, 2),)
+    )
+    assert state.npcs == ()
+    for expected_hp, expected_left in ((38, 4), (36, 3), (34, 2), (32, 1), (30, 0)):
+        state = tick(state)
+        assert state.player_actor.actor.hp == expected_hp
+        assert EventKind.POISON_DAMAGE in {e.kind for e in state.events}
+        effects = state.player_actor.actor.status_effects
+        assert (effects[0].remaining_turns if effects else 0) == expected_left
+    assert state.player_actor.actor.status_effects == (), "five turns, five burns"
+    after = tick(state)
+    assert after.player_actor.actor.hp == 30, "and then it is over"
+
+
+def test_poison_can_kill_on_an_empty_level_through_the_same_death_path() -> None:
+    state = with_player(
+        start(fight_level()), hp=1, effects=(StatusEffect(StatusKind.POISONED, 5, 2),)
+    )
+    dead = tick(state)
+    assert dead.running is False
+    assert dead.player_actor.actor.hp <= 0
+    assert dead.outcome == events.message_for(dead.events)
+    assert [e.kind for e in dead.events] == [
+        EventKind.POISON_DAMAGE,
+        EventKind.PLAYER_DIED,
+    ]
+    assert "The poison burns. You die..." == events.message_for(dead.events)
+
+
+def test_a_full_health_player_banks_no_healing_while_untouched() -> None:
+    # The counter does not run at full health, which is what makes an uneventful tick
+    # genuinely uneventful. A player wounded after a quiet stretch therefore waits the
+    # whole REGEN_TURNS rather than being healed by ticks banked while unhurt.
+    state = start(fight_level())
+    for _ in range(REGEN_TURNS * 2):
+        state = tick(state)
+    assert state.player_actor.regen_counter == 0
+    state = with_player(state, hp=44)
+    for _ in range(REGEN_TURNS - 1):
+        state = tick(state)
+    assert state.player_actor.actor.hp == 44
+    assert tick(state).player_actor.actor.hp == 45
+
+
+def test_a_wandering_monster_that_sees_the_player_starts_hunting() -> None:
+    state = with_player(
+        with_npcs(
+            start(fight_level()),
+            make_npc((7, 5), Species.RAT, ai_state=AiState.WANDERING),
+        ),
+        stats=UNKILLABLE,
+    )
+    after = tick(state)
+    assert after.npcs[0].ai_state is AiState.HUNTING
+    assert after.npcs[0].memory == 0
+
+
+def test_a_hunter_that_loses_sight_forgets_after_forget_ticks() -> None:
+    # A monster sealed in its own little room can never see the player, so `memory` grows
+    # by one on every action and the revert happens on the action after FORGET_TICKS.
+    rows = [
+        "#######",
+        "#.#...#",
+        "#.#...#",
+        "#######",
+    ]
+    state = with_player(
+        with_npcs(
+            start(build_level(rows, player_start=(5, 1))),
+            make_npc((1, 1), stats=Stats(10, 10, 10), ai_state=AiState.HUNTING),
+        ),
+        stats=UNKILLABLE,
+    )
+    memories = []
+    for _ in range(7):
+        state = tick(state)
+        memories.append((state.npcs[0].ai_state, state.npcs[0].memory))
+    assert memories[0] == (AiState.HUNTING, 1)
+    assert memories[4] == (AiState.HUNTING, 5)
+    assert memories[5] == (AiState.WANDERING, 0), "past FORGET_TICKS it gives up"
+
+
+def test_a_monster_bumps_a_closed_door_open_and_says_so_only_when_it_is_seen() -> None:
+    # 9x5 two rooms joined by a door at (4, 2); the player stands in the west room and can
+    # see the door, and a hunter in the east room must open it to reach them.
+    state = start(two_room_level())
+    state = with_player(
+        with_npcs(state, make_npc((5, 2), stats=Stats(10, 10, 10))), stats=UNKILLABLE
+    )
+    assert DOOR_CELL in state.visible
+
+    after = tick(state)
+    assert DOOR_CELL in after.open_doors
+    assert after.npcs[0].position == (5, 2), "opening the door spends the action"
+    assert [e.kind for e in after.events] == [EventKind.DOOR_OPENED]
+
+    unseen = dataclasses.replace(state, visible=state.visible - {DOOR_CELL})
+    quiet = tick(unseen)
+    assert DOOR_CELL in quiet.open_doors
+    assert quiet.events == (), "an off-screen door does not narrate itself"
+
+
+# ---------------------------------------------------------------------------------------
+# Levels are frozen while the player is elsewhere (CONTRACT-v5 §24.5)
+# ---------------------------------------------------------------------------------------
+
+
+def test_monsters_on_a_level_the_player_has_left_do_not_move() -> None:
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    state = with_npcs(
+        state,
+        make_npc((4, 1), Species.JACKAL, 1, energy=17, ai_state=AiState.WANDERING),
+        make_npc((5, 5), Species.RAT, 2, energy=63, ai_state=AiState.HUNTING, memory=2),
+    )
+    upstairs = state.npcs
+
+    below = step(state, DESCEND)
+    assert below.saved[1].npcs == upstairs
+
+    for _ in range(8):
+        below = step(below, MOVE_N if below.turns % 2 else MOVE_S)
+        assert below.saved[1].npcs == upstairs, "frozen, tick after tick"
+
+    back = step(below, ASCEND)
+    # Arriving is itself a consumed turn, so the level the player steps back onto ticks
+    # exactly once — never once per turn spent below.
+    assert back.depth == 1
+    assert [n.actor_id for n in back.npcs] == [1, 2]
+    for before_npc, after_npc in zip(upstairs, back.npcs):
+        speed = derive(before_npc.actor.stats).speed
+        assert actions_taken(before_npc, after_npc, speed) <= 2
+        assert max(
+            abs(after_npc.position[0] - before_npc.position[0]),
+            abs(after_npc.position[1] - before_npc.position[1]),
+        ) <= 2
+
+
+def test_a_level_is_populated_once_and_never_repopulated(monsters) -> None:
+    # Level 1 is hand-built and empty; level 2 is generated, and therefore populated, the
+    # first time the player descends onto it.
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    first = step(state, DESCEND)
+    below = first.npcs
+    back = step(first, ASCEND)
+    again = step(back, DESCEND)
+    assert [n.actor_id for n in again.npcs] == [n.actor_id for n in below]
+    assert [n.species for n in again.npcs] == [n.species for n in below]
+
+
+def test_a_new_game_is_populated_from_the_levels_own_seed(monsters) -> None:
+    first = new_game(1234, *SMALL)
+    again = new_game(1234, *SMALL)
+    assert first.npcs == again.npcs
+    assert first.npcs == spawn_npcs(random.Random(first.level.seed), first.level)
+    assert len(first.npcs) <= 6
+    assert new_game(99, *SMALL).npcs != first.npcs
+
+
+# ---------------------------------------------------------------------------------------
+# Status effects, regeneration and death (CONTRACT-v5 §22, §7.12)
+# ---------------------------------------------------------------------------------------
+
+
+def test_poison_burns_once_per_tick_and_expires() -> None:
+    state = caged()
+    state = with_player(
+        state, hp=40, effects=(StatusEffect(StatusKind.POISONED, 3, 2),)
+    )
+    first = tick(state)
+    assert first.player_actor.actor.hp == 38
+    assert EventKind.POISON_DAMAGE in {e.kind for e in first.events}
+    second = tick(first)
+    assert second.player_actor.actor.hp == 36
+    third = tick(second)
+    assert third.player_actor.actor.hp == 34
+    assert third.player_actor.actor.status_effects == (), "three turns, three burns"
+    fourth = tick(third)
+    assert fourth.player_actor.actor.hp == 34
+
+
+def test_poison_ticks_for_an_actor_whose_energy_did_not_cross_the_threshold() -> None:
+    # A cave snake at speed 80 takes no action on the first tick. Its poison must burn
+    # anyway: CONTRACT-v5 §22.3 decouples the status cadence from the energy scheduler.
+    state = caged(
+        Species.CAVE_SNAKE,
+        energy=0,
+        effects=(StatusEffect(StatusKind.POISONED, 4, 3),),
+    )
+    poisoned = state.npcs[0]
+    after = tick(state)
+    assert actions_taken(poisoned, after.npcs[0], 80) == 0, "it did not act"
+    assert after.npcs[0].actor.hp == poisoned.actor.hp - 3, "but it still burned"
+
+
+def test_the_player_regenerates_one_hit_point_every_regen_turns() -> None:
+    state = with_player(caged(), hp=20, regen_counter=0)
+    for turn in range(1, REGEN_TURNS):
+        state = tick(state)
+        assert state.player_actor.actor.hp == 20, f"not yet at tick {turn}"
+    state = tick(state)
+    assert state.player_actor.actor.hp == 21
+    assert state.player_actor.regen_counter == 0
+
+
+def test_regeneration_is_capped_at_max_hp() -> None:
+    state = with_player(caged(), regen_counter=REGEN_TURNS - 1)
+    assert state.player_actor.actor.hp == 45
+    after = tick(state)
+    assert after.player_actor.actor.hp == 45
+
+
+def test_monsters_do_not_regenerate() -> None:
+    state = caged(Species.JACKAL, hp=3)
+    for _ in range(REGEN_TURNS * 3):
+        state = tick(state)
+        assert state.npcs[0].actor.hp <= 3
+
+
+def test_death_by_a_blow_ends_the_run() -> None:
+    state = with_player(
+        with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL)), hp=1
+    )
+    for _ in range(20):
+        state = tick(state)
+        if not state.running:
+            break
+    assert state.running is False
+    assert EventKind.PLAYER_DIED in {e.kind for e in state.events}
+    assert state.outcome == events.message_for(state.events)
+    assert "You die..." in state.outcome
+    assert state.activity is None
+
+
+def test_death_by_poison_reaches_exactly_the_same_end_state_shape() -> None:
+    poisoned = with_player(
+        caged(), hp=2, effects=(StatusEffect(StatusKind.POISONED, 5, 2),)
+    )
+    by_poison = tick(poisoned)
+
+    by_blow = with_player(
+        with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL)), hp=1
+    )
+    for _ in range(20):
+        by_blow = tick(by_blow)
+        if not by_blow.running:
+            break
+
+    for ended in (by_poison, by_blow):
+        assert ended.running is False
+        assert ended.player_actor.actor.hp <= 0
+        assert ended.outcome == events.message_for(ended.events)
+        assert EventKind.PLAYER_DIED in {e.kind for e in ended.events}
+    assert "The poison burns." in events.message_for(by_poison.events)
+    assert "You die..." in events.message_for(by_poison.events)
+    # One path, one shape: the only difference is which event got there first.
+    assert (by_poison.running, by_poison.activity, by_poison.targeting) == (
+        by_blow.running,
+        by_blow.activity,
+        by_blow.targeting,
+    )
+
+
+def test_when_poison_kills_the_player_no_monster_acts_that_tick() -> None:
+    monsters_before = (
+        make_npc((5, 3), Species.JACKAL, 1, energy=99),
+        make_npc((7, 5), Species.RAT, 2, energy=99),
+    )
+    state = with_player(
+        with_npcs(start(fight_level()), *monsters_before),
+        hp=1,
+        effects=(StatusEffect(StatusKind.POISONED, 5, 2),),
+    )
+    after = tick(state)
+    assert after.running is False
+    assert after.npcs == monsters_before, "the tick stopped before anyone moved"
+    assert {e.kind for e in after.events} == {
+        EventKind.POISON_DAMAGE,
+        EventKind.PLAYER_DIED,
+    }
+
+
+def test_a_dead_player_is_inert_for_every_command() -> None:
+    state = with_player(
+        caged(), hp=1, effects=(StatusEffect(StatusKind.POISONED, 5, 5),)
+    )
+    dead = tick(state)
+    assert dead.running is False
+    for command in (*ALL_MOVES, DESCEND, ASCEND, FIRE, AUTO_EXPLORE, UNKNOWN):
+        assert step(dead, command) is dead
+    assert advance(dead) is dead
+
+
+def test_a_cave_snake_can_poison_the_player() -> None:
+    state = with_player(
+        with_npcs(start(fight_level()), make_npc((5, 3), Species.CAVE_SNAKE)),
+        stats=UNKILLABLE,
+    )
+    for _ in range(40):
+        state = tick(state)
+        if state.player_actor.actor.status_effects:
+            break
+    effects = state.player_actor.actor.status_effects
+    assert [e.kind for e in effects] == [StatusKind.POISONED]
+    assert effects[0].remaining_turns <= 5 and effects[0].magnitude == 2
+    assert EventKind.POISONED in {e.kind for e in state.events}
+
+
+# ---------------------------------------------------------------------------------------
+# Ranged targeting (CONTRACT-v5 §7.10)
+# ---------------------------------------------------------------------------------------
+
+
+def test_fire_with_nothing_in_range_says_so_and_costs_no_turn() -> None:
+    state = start(fight_level())
+    after = step(state, FIRE)
+    assert [e.kind for e in after.events] == [EventKind.NO_TARGET]
+    assert after.turns == state.turns
+    assert after.targeting is None
+
+
+def test_fire_with_a_target_starts_choosing_and_costs_no_turn() -> None:
+    state = with_npcs(start(fight_level()), make_npc((7, 3), Species.JACKAL))
+    after = step(state, FIRE)
+    assert after.turns == state.turns
+    assert after.targeting == Targeting(((7, 3),), 0)
+    assert [e.kind for e in after.events] == [EventKind.TARGETING]
+    assert after.events[0].name == "jackal"
+    assert "jackal" in events.message_for(after.events)
+
+
+def test_the_target_list_is_visible_monsters_in_range_sorted_by_distance() -> None:
+    state = with_npcs(
+        start(fight_level()),
+        make_npc((7, 3), Species.RAT, 1),
+        make_npc((5, 3), Species.JACKAL, 2),
+        make_npc((5, 1), Species.GIANT_BAT, 3),
+    )
+    after = step(state, FIRE)
+    assert after.targeting is not None
+    assert after.targeting.targets == ((5, 3), (5, 1), (7, 3))
+
+
+def test_a_monster_in_range_but_not_visible_is_excluded() -> None:
+    state = with_npcs(
+        start(fight_level()),
+        make_npc((7, 3), Species.RAT, 1),
+        make_npc((5, 3), Species.JACKAL, 2),
+    )
+    state = dataclasses.replace(state, visible=state.visible - {(5, 3)})
+    after = step(state, FIRE)
+    assert after.targeting is not None
+    assert after.targeting.targets == ((7, 3),)
+
+
+def test_a_monster_beyond_the_bows_range_is_excluded() -> None:
+    # The shortbow reaches 6 cells (CONTRACT-v5 §21); a 20x7 hall has room to prove it.
+    state = start(stairs_level(player_start=(3, 3)))
+    state = with_npcs(
+        state,
+        make_npc((3 + SHORTBOW.range, 3), Species.RAT, 1),
+        make_npc((3 + SHORTBOW.range + 1, 3), Species.JACKAL, 2),
+    )
+    after = step(state, FIRE)
+    assert after.targeting is not None
+    assert after.targeting.targets == ((3 + SHORTBOW.range, 3),)
+
+
+def test_tab_cycles_the_targets_and_wraps_without_costing_a_turn() -> None:
+    state = with_npcs(
+        start(fight_level()),
+        make_npc((5, 3), Species.RAT, 1),
+        make_npc((7, 3), Species.JACKAL, 2),
+    )
+    chosen = step(state, FIRE)
+    assert chosen.targeting.index == 0
+    second = step(chosen, TARGET_NEXT)
+    assert second.targeting.index == 1
+    assert second.turns == state.turns
+    assert second.events[0].name == "jackal"
+    wrapped = step(second, TARGET_NEXT)
+    assert wrapped.targeting.index == 0
+    assert wrapped.events[0].name == "rat"
+    assert wrapped.turns == state.turns
+
+
+def test_target_next_with_nothing_being_targeted_does_nothing() -> None:
+    state = with_npcs(start(fight_level()), make_npc((7, 3)))
+    assert step(state, TARGET_NEXT) is state
+
+
+def test_firing_resolves_a_ranged_attack_and_consumes_a_turn() -> None:
+    state = with_player(start(fight_level()), stats=Stats(str_=16, agi=10, vit=10))
+    state = with_npcs(state, make_npc((7, 3), Species.CAVE_SNAKE))
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[0], SHORTBOW, True)
+    )
+    chosen = step(state, FIRE)
+
+    # CONTRACT-v5 §23.2: a bow's power is the bow's. `resolve_attack` cannot tell a bow
+    # from a dagger, so passing strength_applies=False is this call site's responsibility,
+    # and STR 16 is what makes the mistake visible.
+    without_strength = player_attack_result(chosen, chosen.npcs[0], SHORTBOW, False)
+    with_strength = player_attack_result(chosen, chosen.npcs[0], SHORTBOW, True)
+    assert with_strength.damage == without_strength.damage + 3
+
+    fired = step(chosen, FIRE)
+    assert fired.turns == chosen.turns + 1
+    assert fired.targeting is None
+    assert fired.player == (4, 3), "shooting does not move you"
+    assert fired.npcs[0].actor.hp == without_strength.defender_hp
+    assert [e.kind for e in fired.events] == [EventKind.PLAYER_HIT_NPC]
+
+
+def test_firing_at_the_selected_target_not_the_nearest_one() -> None:
+    state = with_npcs(
+        start(fight_level()),
+        make_npc((5, 3), Species.RAT, 1, hp=1),
+        make_npc((7, 3), Species.JACKAL, 2, hp=1),
+    )
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[1], SHORTBOW, True)
+    )
+    fired = step(step(step(state, FIRE), TARGET_NEXT), FIRE)
+    assert [n.actor_id for n in fired.npcs] == [1], "the jackal was the one shot"
+    killed = [e for e in fired.events if e.kind is EventKind.NPC_KILLED]
+    assert [e.name for e in killed] == ["jackal"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [MOVE_N, QUIT, DESCEND, ASCEND, UNKNOWN, AUTO_EXPLORE, WALK_PREFIX],
+    ids=["move", "quit", "descend", "ascend", "unknown", "explore", "walk"],
+)
+def test_any_other_key_cancels_targeting_and_is_consumed_whole(command: Command) -> None:
+    state = with_npcs(start(fight_level()), make_npc((7, 3), Species.JACKAL))
+    chosen = step(state, FIRE)
+    after = step(chosen, command)
+    assert after.targeting is None
+    assert after.turns == chosen.turns, "no turn"
+    assert after.player == chosen.player, "no action"
+    assert after.events == chosen.events, "not even a new message"
+    assert after.running is True
+    assert after.activity is None
+    assert after.awaiting_walk is False
+
+
+def test_targeting_does_not_survive_a_level_change() -> None:
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    state = with_npcs(state, make_npc((17, 3), Species.JACKAL))
+    chosen = step(state, FIRE)
+    assert chosen.targeting is not None
+    # A command while targeting is swallowed by the cancel, so the descent takes two
+    # presses — and the second one lands on a state with no targeting at all.
+    below = step(step(chosen, DESCEND), DESCEND)
+    assert below.depth == 2
+    assert below.targeting is None
+
+
+def test_a_target_that_has_died_cancels_the_shot_with_no_turn() -> None:
+    state = with_npcs(
+        start(fight_level()),
+        make_npc((5, 3), Species.RAT, 1),
+        make_npc((7, 3), Species.JACKAL, 2),
+    )
+    chosen = step(state, FIRE)
+    assert chosen.targeting.targets[chosen.targeting.index] == (5, 3)
+
+    # The rat is gone by the time the arrow is loosed: the list is rebuilt, the shot is
+    # cancelled, and no turn is spent (CONTRACT-v5 §11 v5).
+    vanished = dataclasses.replace(chosen, npcs=(chosen.npcs[1],))
+    after = step(vanished, FIRE)
+    assert after.turns == vanished.turns
+    assert after.targeting == Targeting(((7, 3),), 0)
+    assert [e.kind for e in after.events] == [EventKind.TARGETING]
+
+
+def test_a_last_target_that_has_died_leaves_nothing_to_shoot_at() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3), Species.RAT))
+    chosen = step(state, FIRE)
+    vanished = dataclasses.replace(chosen, npcs=())
+    after = step(vanished, FIRE)
+    assert after.targeting is None
+    assert [e.kind for e in after.events] == [EventKind.NO_TARGET]
+    assert after.turns == vanished.turns
+
+
+def test_firing_ticks_the_world() -> None:
+    state = with_npcs(
+        start(fight_level()), make_npc((7, 3), Species.JACKAL, energy=99)
+    )
+    fired = step(step(state, FIRE), FIRE)
+    assert fired.turns == state.turns + 1
+    assert fired.npcs and fired.npcs[0].energy != 99
+
+
+# ---------------------------------------------------------------------------------------
+# Levelling (CONTRACT-v5 §7.11)
+# ---------------------------------------------------------------------------------------
+
+
+def test_xp_to_next_is_twenty_five_l_squared() -> None:
+    assert xp_to_next(1) == 25
+    assert xp_to_next(2) == 100
+    assert xp_to_next(3) == 225
+    assert xp_to_next(4) == 400
+
+
+def test_a_kill_credits_exactly_the_species_xp_value() -> None:
+    for species in Species:
+        state = with_npcs(start(fight_level()), make_npc((5, 3), species, hp=1))
+        state = dataclasses.replace(
+            state, master_seed=seed_where_player(state, state.npcs[0], DAGGER, True)
+        )
+        after = step(state, MOVE_E)
+        assert after.npcs == ()
+        assert after.player_actor.xp == SPECIES_DATA[species].xp_value
+
+
+def test_reaching_the_first_threshold_levels_the_character_up() -> None:
+    state = with_player(start(fight_level()), xp=24, level=1, hp=30)
+    state = with_npcs(state, make_npc((5, 3), Species.RAT, hp=1))  # 5 xp
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[0], DAGGER, True)
+    )
+    after = step(state, MOVE_E)
+
+    player = after.player_actor
+    assert player.level == 2
+    assert player.xp == 4, "29 earned, 25 spent, the remainder carried"
+    assert player.actor.stats.vit == 11, "VIT every level"
+    assert player.actor.hp == 30 + (derive(player.actor.stats).max_hp - 45)
+    assert player.actor.hp == 34, "raised by the max-HP delta, not healed to full"
+    assert player.actor.hp < derive(player.actor.stats).max_hp
+    assert EventKind.LEVELLED_UP in {e.kind for e in after.events}
+    assert [e.level for e in after.events if e.kind is EventKind.LEVELLED_UP] == [2]
+
+
+def test_the_stat_gained_alternates_by_the_parity_of_the_level_reached() -> None:
+    """CONTRACT-v5 §7.11's loop: ``level += 1`` **then** ``if level is odd: str_ += 1 else:
+    agi += 1`` — the parity of the level just *reached*.
+
+    So the level-2 character gains AGI and the level-3 character gains STR. This is also
+    what the RESEARCH-v5 simulation that produced every published balance number computed,
+    so the rule, the pseudocode and the measured curve all agree.
+    """
+    state = with_player(start(fight_level()), xp=25, level=1)
+    second = level_up(state)
+    assert second.player_actor.level == 2
+    assert second.player_actor.actor.stats == Stats(str_=10, agi=11, vit=11)
+
+    third = level_up(with_player(second, stats=second.player_actor.actor.stats, xp=100, level=2))
+    assert third.player_actor.level == 3
+    assert third.player_actor.actor.stats == Stats(str_=11, agi=11, vit=12)
+
+
+def test_one_kill_crossing_two_thresholds_levels_twice() -> None:
+    # 25 to reach level 2 and 100 to reach level 3: 130 XP in one go must land on level 3
+    # with 5 carried over, not on level 2 with 105 banked.
+    state = with_player(start(fight_level()), xp=130, level=1, hp=45)
+    after = level_up(state)
+    assert after.player_actor.level == 3
+    assert after.player_actor.xp == 5
+    assert [e.level for e in after.events if e.kind is EventKind.LEVELLED_UP] == [2, 3]
+    assert after.player_actor.actor.stats == Stats(str_=11, agi=11, vit=12)
+    assert after.player_actor.actor.hp == 45 + (
+        derive(after.player_actor.actor.stats).max_hp - 45
+    )
+
+
+def test_level_up_with_nothing_to_spend_returns_the_same_state() -> None:
+    state = with_player(start(fight_level()), xp=24, level=1)
+    assert level_up(state) is state
+
+
+def test_max_hp_after_levelling_comes_from_stats_derive() -> None:
+    state = level_up(with_player(start(fight_level()), xp=25, level=1))
+    stats = state.player_actor.actor.stats
+    assert f"/{derive(stats).max_hp}" in format_stats(state)
+    assert derive(stats).max_hp == 5 + stats.vit * 4
+
+
+def test_levelling_never_heals_to_full() -> None:
+    state = with_player(start(fight_level()), xp=25, level=1, hp=3)
+    after = level_up(state)
+    assert after.player_actor.actor.hp == 3 + (
+        derive(after.player_actor.actor.stats).max_hp - 45
+    )
+    assert after.player_actor.actor.hp < derive(after.player_actor.actor.stats).max_hp
+
+
+# ---------------------------------------------------------------------------------------
+# interruption — the v4 seam, now live (CONTRACT-v5 §7.14)
+# ---------------------------------------------------------------------------------------
+
+
+def test_a_hostile_coming_into_view_cancels_the_activity() -> None:
+    # A short corridor with a monster round the corner: the first step of the walk brings
+    # its cell into view for the first time.
+    rows = [
+        "#######",
+        "#.....#",
+        "#######",
+    ]
+    state = corridor_state(rows, (1, 1))
+    hidden = dataclasses.replace(state, visible=frozenset({(1, 1), (2, 1)}))
+    hidden = with_npcs(hidden, make_npc((5, 1), Species.JACKAL, ai_state=AiState.WANDERING))
+    walking = walk(hidden, 1, 0)
+
+    after = advance(walking)
+    assert after.activity is None, "the walk stopped"
+    spotted = [e for e in after.events if e.kind is EventKind.SPOTTED_HOSTILE]
+    assert [e.name for e in spotted] == ["jackal"]
+    assert "A jackal comes into view!" in events.message_for(after.events)
+
+
+def test_the_nearest_newcomer_is_the_one_named() -> None:
+    before = start(fight_level())
+    before = dataclasses.replace(before, visible=frozenset({(4, 3)}))
+    after = with_npcs(
+        start(fight_level()),
+        make_npc((7, 5), Species.CAVE_SNAKE, 1),
+        make_npc((5, 3), Species.JACKAL, 2),
+    )
+    event = interruption(before, after)
+    assert event is not None
+    assert event.kind is EventKind.SPOTTED_HOSTILE
+    assert event.name == "jackal"
+
+
+def test_an_already_visible_monster_merely_moving_does_not_interrupt() -> None:
+    before = with_npcs(start(fight_level()), make_npc((6, 3), Species.RAT))
+    after = with_npcs(start(fight_level()), make_npc((5, 3), Species.RAT))
+    assert (6, 3) in before.visible and (5, 3) in before.visible
+    assert interruption(before, after) is None
+
+
+def test_taking_damage_interrupts() -> None:
+    before = start(fight_level())
+    after = with_player(start(fight_level()), hp=40)
+    event = interruption(before, after)
+    assert event is not None and event.kind is EventKind.INTERRUPTED
+
+
+def test_being_newly_poisoned_interrupts() -> None:
+    before = start(fight_level())
+    after = with_player(
+        start(fight_level()), effects=(StatusEffect(StatusKind.POISONED, 5, 2),)
+    )
+    event = interruption(before, after)
+    assert event is not None and event.kind is EventKind.INTERRUPTED
+
+
+def test_an_unchanged_poison_does_not_interrupt_again() -> None:
+    effects = (StatusEffect(StatusKind.POISONED, 5, 2),)
+    before = with_player(start(fight_level()), effects=effects)
+    after = with_player(
+        start(fight_level()), effects=(StatusEffect(StatusKind.POISONED, 4, 2),)
+    )
+    assert interruption(before, after) is None
+
+
+def test_opening_a_door_still_does_not_interrupt() -> None:
+    state = walk(corridor_state(DOOR_CORRIDOR_ROWS, (3, 1)), 1, 0)
+    after = advance(state)
+    assert after.open_doors == frozenset({CORRIDOR_DOOR})
+    assert interruption(state, after) is None
+    assert after.activity is not None
+
+
+def test_the_interruption_event_is_appended_not_substituted() -> None:
+    """CONTRACT-v5 §7.14's amendment to §7.5, which is the whole point of the change.
+
+    Substituting would leave the player reading a bare ``You stop.`` with no idea what
+    stopped them — the jackal's bite, the only informative half, thrown away.
+    """
+    rows = [
+        "#######",
+        "#.....#",
+        "#######",
+    ]
+    state = corridor_state(rows, (2, 1))
+    state = with_npcs(state, make_npc((3, 1), Species.JACKAL, energy=99))
+    state = with_player(state, hp=40)
+    walking = walk(state, -1, 0)
+
+    for seed in range(200):
+        attempt = advance(dataclasses.replace(walking, master_seed=seed))
+        kinds = [e.kind for e in attempt.events]
+        if EventKind.NPC_HIT_PLAYER in kinds:
+            break
+    else:  # pragma: no cover - 200 jackal bites at 85% cannot all miss
+        raise AssertionError("no seed produced a bite")
+
+    assert attempt.activity is None, "the walk was cancelled"
+    line = events.message_for(attempt.events)
+    assert "The jackal hits you." in line
+    assert "You stop." in line
+    assert kinds == [EventKind.NPC_HIT_PLAYER, EventKind.INTERRUPTED]
+
+
+def test_a_monster_standing_in_the_way_stops_an_activity_without_a_fight() -> None:
+    state = corridor_state(CORRIDOR_ROWS, (1, 1))
+    state = with_npcs(state, make_npc((2, 1), Species.JACKAL, ai_state=AiState.WANDERING))
+    walking = walk(state, 1, 0)
+    after = advance(walking)
+    assert after.activity is None
+    assert after.turns == walking.turns, "no auto-fight, and no turn"
+    assert after.npcs[0].actor.hp == state.npcs[0].actor.hp
+
+
+def test_an_activity_turn_ticks_the_world_exactly_once() -> None:
+    state = with_player(
+        with_npcs(
+            corridor_state(CORRIDOR_ROWS, (1, 1)),
+            make_npc((5, 1), Species.CAVE_SNAKE, energy=0, ai_state=AiState.HUNTING),
+        ),
+        stats=UNKILLABLE,
+    )
+    walking = walk(state, 1, 0)
+    after = advance(walking)
+    assert after.turns == walking.turns + 1
+    assert actions_taken(walking.npcs[0], after.npcs[0], 80) in (0, 1)
+    assert after.npcs[0].energy == 80
+
+
+# ---------------------------------------------------------------------------------------
+# The message line (CONTRACT-v5 §16.1)
+# ---------------------------------------------------------------------------------------
+
+
+def test_the_cap_keeps_three_events_in_emission_order() -> None:
+    emitted = (
+        Event(EventKind.PLAYER_MISSED_NPC, name="rat"),
+        Event(EventKind.NPC_HIT_PLAYER, name="jackal"),
+        Event(EventKind.DOOR_OPENED),
+        Event(EventKind.NPC_KILLED, name="rat"),
+        Event(EventKind.NPC_MISSED_PLAYER, name="bat"),
+    )
+    capped = game._capped(emitted)
+    assert len(capped) == MAX_EVENTS
+    assert [e.kind for e in capped] == [
+        EventKind.PLAYER_MISSED_NPC,
+        EventKind.NPC_HIT_PLAYER,
+        EventKind.NPC_KILLED,
+    ]
+
+
+def test_the_cap_prefers_the_higher_priority_band() -> None:
+    lower = [Event(EventKind.DOOR_OPENED)] * 3
+    assert [e.kind for e in game._capped(tuple(lower + [Event(EventKind.PLAYER_DIED)]))] == [
+        EventKind.DOOR_OPENED,
+        EventKind.DOOR_OPENED,
+        EventKind.PLAYER_DIED,
+    ]
+    band_two = Event(EventKind.NPC_HIT_PLAYER, name="rat")
+    band_three = Event(EventKind.PLAYER_HIT_NPC, name="rat")
+    capped = game._capped((band_three, band_three, band_three, band_two))
+    assert capped.count(band_two) == 1
+
+
+def test_within_a_band_the_earlier_event_wins() -> None:
+    first = Event(EventKind.NPC_HIT_PLAYER, name="rat")
+    second = Event(EventKind.NPC_HIT_PLAYER, name="jackal")
+    third = Event(EventKind.NPC_HIT_PLAYER, name="bat")
+    fourth = Event(EventKind.NPC_HIT_PLAYER, name="snake")
+    capped = game._capped((first, second, third, fourth))
+    assert capped == (first, second, third)
+
+
+def test_under_the_cap_nothing_is_reordered_or_dropped() -> None:
+    pair = (Event(EventKind.PLAYER_HIT_NPC, name="rat"), Event(EventKind.DOOR_OPENED))
+    assert game._capped(pair) == pair
+
+
+def test_six_monsters_acting_never_exceed_the_cap() -> None:
+    state = with_player(
+        with_npcs(
+            start(fight_level()),
+            make_npc((3, 2), Species.RAT, 1),
+            make_npc((4, 2), Species.RAT, 2),
+            make_npc((5, 2), Species.JACKAL, 3),
+            make_npc((3, 4), Species.JACKAL, 4),
+            make_npc((4, 4), Species.GIANT_BAT, 5),
+            make_npc((5, 4), Species.GIANT_BAT, 6),
+        ),
+        stats=UNKILLABLE,
+    )
+    for _ in range(12):
+        state = tick(state)
+        assert len(state.events) <= MAX_EVENTS
+        assert len(events.message_for(state.events)) < 80
+
+
+def test_an_unseen_monsters_bite_is_still_reported() -> None:
+    state = with_player(
+        with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL)), hp=40
+    )
+    state = dataclasses.replace(state, visible=state.visible - {(5, 3)})
+    for _ in range(10):
+        state = tick(state)
+        kinds = {e.kind for e in state.events}
+        if EventKind.NPC_HIT_PLAYER in kinds:
+            break
+        assert EventKind.NPC_MISSED_PLAYER not in kinds, "a miss you cannot see is silent"
+        state = dataclasses.replace(state, visible=state.visible - {(5, 3)})
+    assert EventKind.NPC_HIT_PLAYER in {e.kind for e in state.events}
+
+
+def test_hitting_a_monster_you_cannot_see_is_not_reported() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL))
+    state = dataclasses.replace(state, visible=state.visible - {(5, 3)})
+    after = step(state, MOVE_E)
+    assert after.turns == state.turns + 1, "the swing happened"
+    assert after.npcs[0].actor.hp <= state.npcs[0].actor.hp
+    kinds = {e.kind for e in after.events}
+    assert EventKind.PLAYER_HIT_NPC not in kinds
+    assert EventKind.PLAYER_MISSED_NPC not in kinds
+
+
+def test_being_poisoned_is_always_reported() -> None:
+    state = with_player(
+        with_npcs(start(fight_level()), make_npc((5, 3), Species.CAVE_SNAKE)),
+        stats=UNKILLABLE,
+    )
+    state = dataclasses.replace(state, visible=state.visible - {(5, 3)})
+    for _ in range(40):
+        state = dataclasses.replace(state, visible=state.visible - {(5, 3)})
+        state = tick(state)
+        if state.player_actor.actor.status_effects:
+            break
+    assert EventKind.POISONED in {e.kind for e in state.events}
+
+
+# ---------------------------------------------------------------------------------------
+# Randomness: derived, never stored (CONTRACT-v5 §0.12)
+# ---------------------------------------------------------------------------------------
+
+
+def test_roll_seed_matches_the_contract_formula() -> None:
+    for master, turns, actor, salt in (
+        (0, 0, 0, 0),
+        (1234, 7, 3, 1),
+        (99, 1000, 6, 4),
+        (-5, 2, 1, 2),
+    ):
+        assert roll_seed(master, turns, actor, salt) == (
+            master * 0x9E3779B1
+            + turns * 0x85EBCA77
+            + actor * 0xC2B2AE35
+            + salt * 0x27D4EB2F
+        ) & 0x7FFFFFFF
+        assert 0 <= roll_seed(master, turns, actor, salt) <= 0x7FFFFFFF
+
+
+def test_roll_seed_separates_actors_salts_and_turns() -> None:
+    base = roll_seed(1234, 10, 1, 1)
+    assert base != roll_seed(1234, 10, 2, 1), "different actor"
+    assert base != roll_seed(1234, 10, 1, 2), "different salt"
+    assert base != roll_seed(1234, 11, 1, 1), "different turn"
+    assert base != roll_seed(1235, 10, 1, 1), "different run"
+
+
+def _contains_random(value: object, seen: set[int]) -> bool:
+    if id(value) in seen:
+        return False
+    seen.add(id(value))
+    if isinstance(value, random.Random):
+        return True
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(
+            _contains_random(getattr(value, f.name), seen)
+            for f in dataclasses.fields(value)
+        )
+    if isinstance(value, (tuple, list, frozenset, set)):
+        return any(_contains_random(item, seen) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_random(item, seen) for item in value.values())
+    return False
+
+
+def test_no_generator_is_stored_anywhere_on_a_state(monsters) -> None:
+    # CONTRACT-v5 §0.12: a stored Random is mutable, and two states built from one parent
+    # by replace() would share and corrupt a single stream.
+    for cls in (GameState, LevelState, Player, Targeting, NPC):
+        for field in dataclasses.fields(cls):
+            assert "Random" not in str(field.type)
+    state = new_game(1234, *SMALL)
+    state = step(state, MOVE_E)
+    state = step(state, MOVE_S)
+    assert not _contains_random(state, set())
+
+
+def test_no_module_level_random_draw_exists() -> None:
+    # The only permitted use of `random` is constructing a generator from a derived seed.
+    calls = [
+        node
+        for node in ast.walk(GAME_TREE)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "random"
+    ]
+    assert calls, "the module does build generators"
+    for call in calls:
+        assert call.func.attr == "Random"
+        assert _enclosing_function(GAME_TREE, call) is not None
+        inner = call.args[0]
+        if isinstance(inner, ast.Call):
+            # every roll: a fresh generator from a seed derived off the state
+            assert isinstance(inner.func, ast.Name) and inner.func.id == "roll_seed"
+        else:
+            # spawning: the level's own seed, so a population is as reproducible as the
+            # rooms it lives in (CONTRACT-v5 §24.4)
+            assert isinstance(inner, ast.Attribute) and inner.attr == "seed"
+
+
+def test_the_same_seed_and_keys_produce_the_same_fight(monsters) -> None:
+    keys = "jjjklllhhhkkjjjfffEllljjjkkkhhhfffjjjlllhhhkkkjjjlllwwjjkkllhh"
+    first = new_game(4242, *SMALL)
+    second = new_game(4242, *SMALL)
+    assert len(keys) >= 50
+    for key in keys:
+        first = step(first, translate_key(key))
+        second = step(second, translate_key(key))
+    assert first == second
+    assert first.npcs == second.npcs
+    assert first.player_actor == second.player_actor
+
+
+def test_a_scripted_fight_is_reproducible_across_hash_seeds() -> None:
+    script = """
+from roguelike.game import new_game, step, advance
+from roguelike.keys import translate_key
+
+state = new_game(20260810, 40, 18)
+for key in "EjjjlllkkkhhhfffjjjlllkkkhhhfffjjjlllkkkhhhEfffjjjlllkkkhhh":
+    state = step(state, translate_key(key))
+    for _ in range(6):
+        state = advance(state)
+    if not state.running:
+        break
+print(
+    state.turns,
+    state.player,
+    state.player_actor.actor.hp,
+    state.player_actor.xp,
+    state.player_actor.level,
+    [(n.actor_id, n.position, n.energy, n.actor.hp) for n in state.npcs],
+    sorted(state.open_doors),
+    len(state.explored),
+)
+"""
+    root = str(Path(game.__file__).resolve().parent.parent)
+    outputs = []
+    for hash_seed in ("0", "1234"):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            cwd=root,
+            env={"PYTHONHASHSEED": hash_seed, "PATH": "/usr/bin:/bin"},
+            check=True,
+        )
+        outputs.append(result.stdout)
+    assert outputs[0] == outputs[1]
+    assert outputs[0].strip(), "the replay produced a state to compare"
+
+
+# ---------------------------------------------------------------------------------------
+# Purity, again, for every v5 path
+# ---------------------------------------------------------------------------------------
+
+
+def v5_states() -> list[GameState]:
+    fight = with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL))
+    return [
+        fight,
+        with_player(fight, hp=20, effects=(StatusEffect(StatusKind.POISONED, 3, 2),)),
+        step(fight, FIRE),
+        with_npcs(start(fight_level()), make_npc((7, 5), Species.RAT)),
+    ]
+
+
+@pytest.mark.parametrize("index", range(4))
+def test_step_never_mutates_a_v5_state(index: int) -> None:
+    state = v5_states()[index]
+    before = snapshot(state)
+    copied = copy.deepcopy(state.npcs)
+    for command in (MOVE_E, FIRE, TARGET_NEXT, MOVE_N, UNKNOWN):
+        step(state, command)
+    advance_npcs(state)
+    interruption(state, state)
+    for name, value in before.items():
+        assert getattr(state, name) == value
+    assert state.npcs == copied
+
+
+def test_advance_npcs_rebuilds_saved_rather_than_mutating_it() -> None:
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    state = with_npcs(state, make_npc((4, 1), Species.RAT))
+    below = step(state, DESCEND)
+    assert state.saved == {}
+    assert below.saved is not state.saved
+    assert 1 in below.saved
+
+
+def test_a_fight_leaves_the_input_monsters_untouched() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL, hp=25))
+    original = state.npcs[0]
+    step(state, MOVE_E)
+    tick(state)
+    assert original.actor.hp == 25
+    assert original.position == (5, 3)
+    assert original.energy == 0
+
+
+# ---------------------------------------------------------------------------------------
+# End to end, with the real population (CONTRACT-v5 §24.4)
+# ---------------------------------------------------------------------------------------
+
+
+def test_a_real_game_spawns_monsters_at_a_safe_distance(monsters) -> None:
+    for seed in (1234, 7, 42):
+        state = new_game(seed, *SMALL)
+        assert state.npcs, "a generated level is populated"
+        for npc in state.npcs:
+            assert max(
+                abs(npc.position[0] - state.player[0]),
+                abs(npc.position[1] - state.player[1]),
+            ) >= 8
+
+
+def test_auto_explore_with_monsters_stops_instead_of_walking_into_them(monsters) -> None:
+    state = step(new_game(1234, *SMALL), AUTO_EXPLORE)
+    for _ in range(400):
+        state = advance(state)
+        if state.activity is None or not state.running:
+            break
+    assert state.activity is None
+    assert EventKind.SPOTTED_HOSTILE in {e.kind for e in state.events} or not state.running
+
+
+def test_the_loop_draws_monsters_and_the_target_cursor(monsters) -> None:
+    # `run` holds no rules, but it is the only place the renderer's v5 signature is used.
+    state = with_npcs(
+        start(fight_level()), make_npc((5, 3), Species.JACKAL), make_npc((6, 1), Species.RAT, 2)
+    )
+    # `f` opens targeting; the next key is swallowed by the cancel, so quitting from a
+    # targeting cursor genuinely takes two presses.
+    screen = StubScreen([ord("f"), ord("q"), ord("q")])
+    run(screen, state)
+    frame = screen.frames[-1]
+    glyphs = {frame.get((y + 1, x)) for (x, y) in ((5, 3), (6, 1))}
+    assert glyphs == {"j", "r"}
+
+
+def test_playing_a_real_game_can_end_in_death(monsters) -> None:
+    # Not a balance assertion: the point is that the death path is reachable through the
+    # ordinary loop, with no special casing, and that it ends the run cleanly.
+    state = with_player(
+        with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL)), hp=1
+    )
+    for index in range(30):
+        state = step(state, MOVE_W if index % 2 == 0 else MOVE_E)
+        if not state.running:
+            break
+    assert state.running is False
+    assert state.outcome and "You die..." in state.outcome

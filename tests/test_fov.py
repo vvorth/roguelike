@@ -1,8 +1,11 @@
-"""Tests for :mod:`roguelike.fov` — permissive field of view (CONTRACT-v2 §14).
+"""Tests for :mod:`roguelike.fov` — permissive field of view (CONTRACT-v2 §14) and
+point-to-point line of sight (CONTRACT-v5 §14 v5).
 
-Every level here is built by hand from a character grid (see :func:`make_level`); the
-generator is never imported. ``'@'`` in a grid marks the player start and is otherwise a
-floor cell, so the test levels read as pictures of what is being asserted.
+Almost every level here is built by hand from a character grid (see :func:`make_level`).
+``'@'`` in a grid marks the player start and is otherwise a floor cell, so the test
+levels read as pictures of what is being asserted. The generator is imported only where
+a criterion demands a *generated* level — the agreement, asymmetry and performance
+checks on `has_line_of_sight`, and the regression guard that pins `compute_visible`.
 
 No curses, no TTY, no ``conftest.py``.
 """
@@ -12,15 +15,18 @@ from __future__ import annotations
 import ast
 import copy
 import inspect
+import random
+import time
 from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
 from roguelike import fov
+from roguelike.generator import generate_level
 from roguelike.level import Level
 from roguelike.tiles import Tile
-from roguelike.world import is_transparent
+from roguelike.world import is_passable, is_transparent
 
 # --------------------------------------------------------------------------------------
 # Level-building helper — a picture in, a Level out.
@@ -225,7 +231,8 @@ def test_default_radius_is_20():
 
 
 def test_module_exports_exactly_the_contract_surface():
-    assert set(fov.__all__) == {"DEFAULT_RADIUS", "compute_visible"}
+    # v5 adds exactly one name (CONTRACT-v5 §9 v5, baseline table) and nothing else.
+    assert fov.__all__ == ["DEFAULT_RADIUS", "compute_visible", "has_line_of_sight"]
 
 
 def test_compute_visible_signature_matches_the_contract():
@@ -1056,3 +1063,759 @@ def test_nothing_outside_the_reachable_half_of_a_sealed_level_is_ever_seen():
     for y in (4, 5):
         for x in range(level.width):
             assert (x, y) not in result, (x, y)
+
+
+# ======================================================================================
+# REGRESSION GUARD on `compute_visible` (CONTRACT-v5 §14 v5)
+#
+# v5 adds `has_line_of_sight` to this module and changes `compute_visible` **not at all**.
+# `tests/test_activity.py` is frozen and drives the real `compute_visible` through a full
+# auto-explore run, so a behavioural drift here breaks a test no v5 worker may repair.
+# These assertions exist to make such a drift fail *here*, loudly, first: exact visible
+# sets rendered as pictures, exact cell counts at three radii, the mirror symmetry of a
+# symmetric room, the door open/closed difference, and exact counts over 44 origins on
+# two generated levels. Every value below was captured from the pre-v5 implementation.
+# ======================================================================================
+
+
+def stripped_picture(
+    level: Level, visible: frozenset[tuple[int, int]], origin
+) -> list[str]:
+    """:func:`picture` as a list of right-stripped lines, for exact comparison.
+
+    Right-stripping both sides loses nothing: only spaces are removed, and a space means
+    "not visible", which the shorter line still says.
+    """
+    return [line.rstrip() for line in picture(level, visible, origin).lstrip("\n").split("\n")]
+
+
+CLUTTER_ROWS = [
+    "#####################",
+    "#...................#",
+    "#..#....#......#....#",
+    "#...................#",
+    "#....#.......#......#",
+    "#.........@.........#",
+    "#...#..........#....#",
+    "#...................#",
+    "#.#.......#.......#.#",
+    "#...................#",
+    "#####################",
+]
+CLUTTER_ORIGIN = (10, 5)
+
+SYMMETRIC_ROOM_ROWS = [
+    "#########",
+    "#.......#",
+    "#.......#",
+    "#.......#",
+    "#...@...#",
+    "#.......#",
+    "#.......#",
+    "#.......#",
+    "#########",
+]
+SYMMETRIC_ROOM_ORIGIN = (4, 4)
+
+#: Seeds of the generated levels used by the guard and by the `has_line_of_sight`
+#: agreement checks. `generate_level` is deterministic and frozen, so these are stable.
+GENERATED_SEEDS = (1, 2)
+
+
+def generated_origins(level: Level, count: int = 22) -> list[tuple[int, int]]:
+    """An even, deterministic spread of ``count`` passable cells across ``level``."""
+    floors = sorted(
+        (x, y)
+        for y in range(level.height)
+        for x in range(level.width)
+        if is_passable(level, frozenset(), x, y)
+    )
+    step = max(1, len(floors) // count)
+    return [floors[i] for i in range(0, len(floors), step)][:count]
+
+
+#: Captured from the pre-v5 implementation: `len(compute_visible(level, frozenset(), o,
+#: 20))` for each origin of `generated_origins(generate_level(seed))`.
+GENERATED_VISIBLE_COUNTS: dict[int, tuple[int, ...]] = {
+    1: (144, 144, 144, 144, 144, 90, 90, 90, 66, 56, 112,
+        112, 112, 112, 112, 112, 112, 169, 169, 169, 169, 169),
+    2: (48, 72, 72, 42, 54, 54, 54, 12, 80, 80, 48,
+        168, 168, 168, 168, 168, 66, 66, 144, 54, 144, 144),
+}
+
+
+def test_regression_compute_visible_exact_picture_with_the_door_closed():
+    level = make_level(TWO_ROOMS_ROWS)
+    result = fov.compute_visible(level, frozenset(), (3, 3), 20)
+    assert stripped_picture(level, result, (3, 3)) == [
+        "#######",
+        "#.....#",
+        "#.....#",
+        "#..@..+",
+        "#.....#",
+        "#.....#",
+        "#######",
+    ]
+
+
+def test_regression_compute_visible_exact_picture_with_the_door_open():
+    level = make_level(TWO_ROOMS_ROWS)
+    result = fov.compute_visible(level, frozenset({DOOR_CELL}), (3, 3), 20)
+    assert stripped_picture(level, result, (3, 3)) == [
+        "#######",
+        "#.....#",
+        "#.....#.....#",
+        "#..@..+.....#",
+        "#.....#.....#",
+        "#.....#",
+        "#######",
+    ]
+
+
+def test_regression_compute_visible_exact_picture_on_a_cluttered_room():
+    """The strongest single assertion here: every pillar shadow, cell for cell."""
+    level = make_level(CLUTTER_ROWS)
+    result = fov.compute_visible(level, frozenset(), CLUTTER_ORIGIN, 20)
+    assert stripped_picture(level, result, CLUTTER_ORIGIN) == [
+        "  ##### #########",
+        "  ...............",
+        "# .#....#......#",
+        "  .............",
+        "#....#.......#......#",
+        "#.........@.........#",
+        "#...#..........#....#",
+        " ..................",
+        "#.#.......#.......#",
+        "#......... .........#",
+        "########## ##########",
+    ]
+
+
+@pytest.mark.parametrize("radius, expected", [(3, 29), (5, 79), (20, 197)])
+def test_regression_compute_visible_exact_counts_at_three_radii(radius, expected):
+    level = make_level(CLUTTER_ROWS)
+    result = fov.compute_visible(level, frozenset(), CLUTTER_ORIGIN, radius)
+    assert len(result) == expected
+
+
+def test_regression_compute_visible_is_symmetric_in_a_symmetric_room():
+    """From the exact centre of a square room the visible set has the room's symmetry.
+
+    Mirrored left-right, mirrored top-bottom and transposed — a drift that shaved one
+    cell off any wall run would break at least one of the three.
+    """
+    level = make_level(SYMMETRIC_ROOM_ROWS)
+    result = fov.compute_visible(level, frozenset(), SYMMETRIC_ROOM_ORIGIN, 20)
+    n = level.width - 1
+    assert {(n - x, y) for x, y in result} == set(result)
+    assert {(x, n - y) for x, y in result} == set(result)
+    assert {(y, x) for x, y in result} == set(result)
+    assert len(result) == 81  # the whole 9x9 level, ring included
+
+
+def test_regression_compute_visible_wall_ring_has_no_holes_from_every_cell():
+    level = make_level(SYMMETRIC_ROOM_ROWS)
+    ring = room_ring(level)
+    for y in range(1, level.height - 1):
+        for x in range(1, level.width - 1):
+            result = fov.compute_visible(level, frozenset(), (x, y), 20)
+            assert set(ring) <= result, picture(level, result, (x, y))
+
+
+@pytest.mark.parametrize("seed", GENERATED_SEEDS)
+def test_regression_compute_visible_exact_counts_over_generated_origins(seed):
+    level = generate_level(seed)
+    origins = generated_origins(level)
+    counts = tuple(
+        len(fov.compute_visible(level, frozenset(), origin, 20)) for origin in origins
+    )
+    assert counts == GENERATED_VISIBLE_COUNTS[seed], list(zip(origins, counts))
+
+
+@pytest.mark.parametrize("seed", GENERATED_SEEDS)
+def test_regression_compute_visible_always_contains_its_origin(seed):
+    level = generate_level(seed)
+    for origin in generated_origins(level, count=40):
+        assert origin in fov.compute_visible(level, frozenset(), origin, 20)
+
+
+def test_regression_opening_a_door_only_ever_adds_cells_on_a_generated_level():
+    level = generate_level(1)
+    doors = [
+        (x, y)
+        for y in range(level.height)
+        for x in range(level.width)
+        if level.grid[y][x] is Tile.DOOR
+    ]
+    assert doors, "the generator is expected to produce doors"
+    origin = generated_origins(level)[0]
+    shut = fov.compute_visible(level, frozenset(), origin, 20)
+    for door in doors:
+        opened = fov.compute_visible(level, frozenset({door}), origin, 20)
+        assert shut <= opened
+
+
+# ======================================================================================
+# `has_line_of_sight` — surface (CONTRACT-v5 §14 v5)
+# ======================================================================================
+
+
+def test_has_line_of_sight_signature_matches_the_contract():
+    sig = inspect.signature(fov.has_line_of_sight)
+    assert list(sig.parameters) == ["level", "open_doors", "observer", "target"]
+    for name in sig.parameters:
+        assert sig.parameters[name].default is inspect.Parameter.empty
+
+
+def test_has_line_of_sight_takes_no_radius_or_mode_parameter():
+    """No radius, no `symmetric=`, no "fast mode" — extra surface is a defect."""
+    sig = inspect.signature(fov.has_line_of_sight)
+    assert "radius" not in sig.parameters
+    assert "symmetric" not in sig.parameters
+    for parameter in sig.parameters.values():
+        assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+
+def test_has_line_of_sight_returns_a_real_bool():
+    level = open_level(9, 9, (1, 1))
+    result = fov.has_line_of_sight(level, frozenset(), (1, 1), (7, 7))
+    assert result is True
+    assert isinstance(result, bool)
+
+
+def test_fov_module_contains_no_float_literal():
+    """CONTRACT-v5 §14 v5: the doubled-integer scheme, no floating point anywhere."""
+    tree = ast.parse(_fov_source())
+    floats = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, float)
+    ]
+    assert floats == []
+
+
+def test_fov_public_functions_are_exactly_two():
+    public = {
+        node.name
+        for node in ast.parse(_fov_source()).body
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+    }
+    assert public == {"compute_visible", "has_line_of_sight"}
+
+
+# ======================================================================================
+# `has_line_of_sight` — semantics
+# ======================================================================================
+
+
+def test_a_cell_always_sees_itself_on_floor_wall_and_closed_door():
+    level = make_level(TWO_ROOMS_ROWS)
+    doors = frozenset()
+    for y in range(level.height):
+        for x in range(level.width):
+            assert fov.has_line_of_sight(level, doors, (x, y), (x, y)), (x, y)
+    assert level.grid[3][6] is Tile.DOOR  # closed: not in `doors`
+    assert fov.has_line_of_sight(level, doors, DOOR_CELL, DOOR_CELL)
+    assert level.grid[0][0] is Tile.WALL
+    assert fov.has_line_of_sight(level, doors, (0, 0), (0, 0))
+
+
+def test_two_cells_in_the_same_open_room_see_each_other():
+    level = make_level(ROOM_ROWS)
+    doors = frozenset()
+    floor = [(x, y) for y in range(1, 5) for x in range(1, 8)]
+    for a in floor:
+        for b in floor:
+            assert fov.has_line_of_sight(level, doors, a, b), (a, b)
+
+
+def test_two_cells_separated_by_a_wall_do_not_see_each_other():
+    level = make_level(TWO_ROOMS_ROWS)
+    doors = frozenset()
+    for y in (1, 2, 4, 5):  # every row except the door's
+        assert not fov.has_line_of_sight(level, doors, (3, 3), (9, y)), y
+        assert not fov.has_line_of_sight(level, doors, (9, y), (3, 3)), y
+
+
+def test_a_closed_door_blocks_and_the_same_door_open_does_not():
+    """Identical coordinates; the only thing that varies is `open_doors`."""
+    level = make_level(TWO_ROOMS_ROWS)
+    observer = (3, 3)
+    target = (9, 3)
+    assert not fov.has_line_of_sight(level, frozenset(), observer, target)
+    assert fov.has_line_of_sight(level, frozenset({DOOR_CELL}), observer, target)
+    # and the door's own cell is visible either way — you see its face
+    assert fov.has_line_of_sight(level, frozenset(), observer, DOOR_CELL)
+    assert fov.has_line_of_sight(level, frozenset({DOOR_CELL}), observer, DOOR_CELL)
+
+
+def test_an_unrelated_open_door_entry_changes_nothing():
+    level = make_level(TWO_ROOMS_ROWS)
+    observer, target = (3, 3), (9, 3)
+    assert not fov.has_line_of_sight(level, frozenset({(0, 0), (60, 60)}), observer, target)
+
+
+def test_sight_is_not_limited_by_distance():
+    """No radius parameter: a clear corridor is visible end to end, however long."""
+    rows = [
+        "#" * 34,
+        "#" + "." * 32 + "#",
+        "#" * 34,
+    ]
+    level = make_level(rows)
+    doors = frozenset()
+    assert fov.has_line_of_sight(level, doors, (1, 1), (32, 1))
+    assert fov.has_line_of_sight(level, doors, (32, 1), (1, 1))
+    # and further than DEFAULT_RADIUS in an open room, too
+    wide = open_level(60, 3, (0, 1))
+    assert fov.has_line_of_sight(wide, doors, (0, 1), (59, 1))
+    assert 59 > fov.DEFAULT_RADIUS
+
+
+def test_a_pillar_casts_a_shadow_for_the_point_to_point_test_too():
+    level = make_level(PILLAR_ROWS)
+    doors = frozenset()
+    assert not fov.has_line_of_sight(level, doors, (1, 3), (9, 3))
+    assert fov.has_line_of_sight(level, doors, (1, 3), PILLAR_CELL)  # its face
+
+
+# ======================================================================================
+# Agreement with `compute_visible` — the criterion that proves the geometry was reused
+# ======================================================================================
+
+
+def assert_agrees_everywhere(
+    level: Level, doors: frozenset[tuple[int, int]], origin: tuple[int, int], radius: int
+) -> None:
+    visible = fov.compute_visible(level, doors, origin, radius)
+    ox, oy = origin
+    for y in range(level.height):
+        for x in range(level.width):
+            if (x - ox) ** 2 + (y - oy) ** 2 > radius * radius:
+                continue
+            assert fov.has_line_of_sight(level, doors, origin, (x, y)) == (
+                (x, y) in visible
+            ), (origin, (x, y))
+
+
+@pytest.mark.parametrize("seed", GENERATED_SEEDS)
+def test_agreement_with_compute_visible_on_a_generated_level(seed):
+    """For every cell within radius 20 of several origins, the two must agree.
+
+    They can only agree if the same observer-at-cell-centre geometry is in use and the
+    bounding box is big enough; a box one cell too tight shows up here first.
+    """
+    level = generate_level(seed)
+    doors = frozenset()
+    for origin in generated_origins(level, count=6):
+        assert_agrees_everywhere(level, doors, origin, 20)
+
+
+def test_agreement_with_compute_visible_from_every_cell_of_a_cluttered_level():
+    level = make_level(CLUTTER_ROWS)
+    doors = frozenset()
+    for y in range(level.height):
+        for x in range(level.width):
+            assert_agrees_everywhere(level, doors, (x, y), 50)
+
+
+@pytest.mark.parametrize("doors", [frozenset(), frozenset({DOOR_CELL})])
+def test_agreement_with_compute_visible_with_the_door_shut_and_open(doors):
+    level = make_level(TWO_ROOMS_ROWS)
+    for y in range(level.height):
+        for x in range(level.width):
+            assert_agrees_everywhere(level, doors, (x, y), 50)
+
+
+def test_agreement_with_compute_visible_around_a_diagonal_wall_join():
+    rows = [
+        ".........",
+        ".#.......",
+        "..#......",
+        "...#.....",
+        "....#....",
+        ".....#...",
+        "......#..",
+        ".......#.",
+        ".........",
+    ]
+    level = make_level(rows)
+    for y in range(level.height):
+        for x in range(level.width):
+            assert_agrees_everywhere(level, frozenset(), (x, y), 50)
+
+
+# ======================================================================================
+# The bounding box, and the one-cell margin (CONTRACT-v5 §14 v5)
+# ======================================================================================
+
+#: A 7x7 open level with one pillar. From (0, 0) the cell (6, 2) is visible, but the
+#: *only* sample point of it that has a clear line is its bottom-left corner (6, 3) —
+#: which lies outside the rectangle spanned by the two cell centres, (0.5, 0.5) to
+#: (6.5, 2.5). The clear line bulges below that rectangle.
+BULGE_ROWS = [
+    ".......",
+    "....#..",
+    ".......",
+    ".......",
+    ".......",
+    ".......",
+    ".......",
+]
+BULGE_OBSERVER = (0, 0)
+BULGE_TARGET = (6, 2)
+
+
+def test_the_clear_line_bulges_outside_the_centre_to_centre_rectangle():
+    """The winning line leaves the rectangle spanned by the two cell centres.
+
+    A bounding box drawn around the two *points* rather than the two *cells* would miss
+    the sample point this line ends on, so this pair pins the box's extent.
+    """
+    level = make_level(BULGE_ROWS)
+    doors = frozenset()
+    ox, oy = BULGE_OBSERVER
+    tx, ty = BULGE_TARGET
+
+    # Opacity over the whole level, so nothing here depends on the module's own box.
+    opaque = {
+        (x, y): not is_transparent(level, doors, x, y)
+        for y in range(level.height)
+        for x in range(level.width)
+    }
+    clear = [
+        (sample_dx, sample_dy)
+        for sample_dx, sample_dy in fov._SAMPLE_OFFSETS
+        if fov._segment_is_clear(
+            2 * ox + 1, 2 * oy + 1, 2 * tx + sample_dx, 2 * ty + sample_dy,
+            ox, oy, tx, ty, opaque,
+        )
+    ]
+    # (0, 2) is the bottom-left corner: doubled y = 2*2 + 2 = 6, i.e. y = 3, strictly
+    # below both cell centres, so the winning segment leaves their rectangle.
+    assert clear == [(0, 2)]
+    sample_y = 2 * ty + clear[0][1]
+    assert sample_y > max(2 * oy + 1, 2 * ty + 1)
+
+    assert fov.has_line_of_sight(level, doors, BULGE_OBSERVER, BULGE_TARGET)
+    assert BULGE_TARGET in fov.compute_visible(level, doors, BULGE_OBSERVER, 20)
+
+
+def test_the_bulge_pair_agrees_with_compute_visible_everywhere_on_that_level():
+    level = make_level(BULGE_ROWS)
+    for y in range(level.height):
+        for x in range(level.width):
+            assert_agrees_everywhere(level, frozenset(), (x, y), 50)
+
+
+def consulted_cells(monkeypatch, level, doors, observer, target):
+    """Every cell `has_line_of_sight` asks `world.is_transparent` about."""
+    seen: set[tuple[int, int]] = set()
+    real = fov.is_transparent
+
+    def spy(lvl, open_doors, x, y):
+        seen.add((x, y))
+        return real(lvl, open_doors, x, y)
+
+    monkeypatch.setattr(fov, "is_transparent", spy)
+    answer = fov.has_line_of_sight(level, doors, observer, target)
+    monkeypatch.undo()
+    return answer, seen
+
+
+def test_opacity_is_snapshotted_over_the_bounding_box_grown_by_one(monkeypatch):
+    """The box is the two cells' bounding box **grown by one cell** — not tighter.
+
+    The margin is the contract's (§14 v5): it is what keeps the diagonal-corner rule's
+    flanking lookups inside the snapshot instead of letting them fall off the edge and
+    default to opaque. Shrink the box to the tight rectangle and this fails.
+    """
+    level = open_level(40, 20, (2, 2))
+    _, seen = consulted_cells(monkeypatch, level, frozenset(), (10, 8), (14, 11))
+    assert seen == {(x, y) for x in range(9, 16) for y in range(7, 13)}
+
+
+def test_the_margin_is_a_guarantee_with_slack_not_a_knife_edge():
+    """Measured: `_segment_is_clear` never reads outside the pair's *tight* box.
+
+    Recorded because it is the one thing a reviewer cannot see by reading the code: the
+    segment stays inside the two cells' bounding rectangle, and so do the diagonal rule's
+    two flanking cells, because both of their coordinates are coordinates of cells the
+    segment does enter. The contract's one-cell margin is therefore a guarantee with a
+    cell to spare rather than a bound that is exactly tight — which is the safe direction
+    to be wrong in, and is why agreement with `compute_visible` is exact.
+    """
+    level = make_level(CLUTTER_ROWS)
+    doors = frozenset()
+    opaque_everywhere = {
+        (x, y): not is_transparent(level, doors, x, y)
+        for y in range(level.height)
+        for x in range(level.width)
+    }
+
+    class Recording(dict):
+        def __init__(self, source):
+            super().__init__(source)
+            self.reads: set[tuple[int, int]] = set()
+
+        def get(self, key, default=None):
+            self.reads.add(key)
+            return super().get(key, default)
+
+    cells = [(x, y) for y in range(level.height) for x in range(level.width)]
+    for observer in cells:
+        for target in cells:
+            if observer == target:
+                continue
+            ox, oy = observer
+            tx, ty = target
+            recorder = Recording(opaque_everywhere)
+            for sample_dx, sample_dy in fov._SAMPLE_OFFSETS:
+                fov._segment_is_clear(
+                    2 * ox + 1, 2 * oy + 1, 2 * tx + sample_dx, 2 * ty + sample_dy,
+                    ox, oy, tx, ty, recorder,
+                )
+            for rx, ry in recorder.reads:
+                assert min(ox, tx) <= rx <= max(ox, tx), (observer, target, (rx, ry))
+                assert min(oy, ty) <= ry <= max(oy, ty), (observer, target, (rx, ry))
+
+
+def test_the_snapshot_box_is_clipped_to_the_level(monkeypatch):
+    level = open_level(40, 20, (2, 2))
+    _, seen = consulted_cells(monkeypatch, level, frozenset(), (0, 0), (2, 1))
+    assert seen == {(x, y) for x in range(0, 4) for y in range(0, 3)}
+    _, seen = consulted_cells(monkeypatch, level, frozenset(), (39, 19), (37, 18))
+    assert seen == {(x, y) for x in range(36, 40) for y in range(17, 20)}
+
+
+def test_the_snapshot_is_never_the_whole_radius_disc(monkeypatch):
+    """The entire optimisation: opacity is read for the pair, not for a radius-20 disc."""
+    level = open_level(80, 22, (2, 2))
+    _, seen = consulted_cells(monkeypatch, level, frozenset(), (10, 10), (13, 11))
+    assert len(seen) == 6 * 4  # x 9..14, y 9..12 — the pair's box, grown by one
+    disc = fov.compute_visible(level, frozenset(), (10, 10), 20)
+    assert len(seen) < len(disc) / 10
+
+
+def test_the_snapshot_grows_with_the_pair_and_no_further(monkeypatch):
+    level = open_level(80, 22, (2, 2))
+    for target in [(10, 10), (11, 10), (20, 10), (40, 21), (79, 0)]:
+        _, seen = consulted_cells(monkeypatch, level, frozenset(), (10, 10), target)
+        x_lo = max(0, min(10, target[0]) - 1)
+        x_hi = min(79, max(10, target[0]) + 1)
+        y_lo = max(0, min(10, target[1]) - 1)
+        y_hi = min(21, max(10, target[1]) + 1)
+        expected = {(x, y) for x in range(x_lo, x_hi + 1) for y in range(y_lo, y_hi + 1)}
+        assert seen <= expected, target
+        if target != (10, 10):  # the reflexive case short-circuits before the snapshot
+            assert seen == expected, target
+
+
+# ======================================================================================
+# Asymmetry — a defined behaviour, pinned so a future "symmetry fix" is loud
+# ======================================================================================
+
+#: The same 7x7 level with its single wall at (4, 1): `(0, 0)` sees `(6, 2)` — the only
+#: clear line ends on that cell's bottom-left corner — while `(6, 2)` does **not** see
+#: `(0, 0)`. The eye is a cell *centre* and the target is eight *boundary* samples, so
+#: the relation is directional by construction.
+ASYMMETRIC_OBSERVER = (0, 0)
+ASYMMETRIC_TARGET = (6, 2)
+
+
+def test_line_of_sight_is_not_symmetric_on_a_hand_built_level():
+    level = make_level(BULGE_ROWS)
+    doors = frozenset()
+    assert fov.has_line_of_sight(level, doors, ASYMMETRIC_OBSERVER, ASYMMETRIC_TARGET)
+    assert not fov.has_line_of_sight(
+        level, doors, ASYMMETRIC_TARGET, ASYMMETRIC_OBSERVER
+    )
+
+
+def test_the_asymmetry_is_compute_visible_s_own():
+    """Not an artifact of the new function: `compute_visible` disagrees the same way."""
+    level = make_level(BULGE_ROWS)
+    doors = frozenset()
+    assert ASYMMETRIC_TARGET in fov.compute_visible(level, doors, ASYMMETRIC_OBSERVER, 20)
+    assert ASYMMETRIC_OBSERVER not in fov.compute_visible(
+        level, doors, ASYMMETRIC_TARGET, 20
+    )
+
+
+#: Found on `generate_level(1)`: (54, 16) is a floor cell, (57, 9) a wall. The floor cell
+#: sees the wall's face; the wall cell does not see the floor cell.
+GENERATED_ASYMMETRIC_PAIR = ((54, 16), (57, 9))
+
+
+def test_line_of_sight_is_not_symmetric_on_a_generated_level():
+    level = generate_level(1)
+    doors = frozenset()
+    a, b = GENERATED_ASYMMETRIC_PAIR
+    assert fov.has_line_of_sight(level, doors, a, b)
+    assert not fov.has_line_of_sight(level, doors, b, a)
+    assert fov.has_line_of_sight(level, doors, a, b) != fov.has_line_of_sight(
+        level, doors, b, a
+    )
+
+
+def test_the_argument_order_is_observer_then_target():
+    """Swapping the arguments is a behaviour change; this is what would catch it."""
+    level = make_level(BULGE_ROWS)
+    doors = frozenset()
+    assert fov.has_line_of_sight(
+        level, doors, observer=ASYMMETRIC_OBSERVER, target=ASYMMETRIC_TARGET
+    )
+    assert not fov.has_line_of_sight(
+        level, doors, observer=ASYMMETRIC_TARGET, target=ASYMMETRIC_OBSERVER
+    )
+
+
+def test_asymmetric_pairs_are_rare_but_real_across_a_generated_level():
+    """~0.3% of pairs disagree (RESEARCH-v5 §8) — rare enough to hide, real enough to pin."""
+    level = generate_level(1)
+    doors = frozenset()
+    cells = [(x, y) for y in range(level.height) for x in range(level.width)]
+    rng = random.Random(1)
+    pairs = [(rng.choice(cells), rng.choice(cells)) for _ in range(2000)]
+    disagreements = sum(
+        1
+        for a, b in pairs
+        if a != b
+        and fov.has_line_of_sight(level, doors, a, b)
+        != fov.has_line_of_sight(level, doors, b, a)
+    )
+    assert disagreements > 0
+    assert disagreements < len(pairs) // 20  # a few per thousand, not a coin flip
+
+
+# ======================================================================================
+# Out of bounds, purity
+# ======================================================================================
+
+
+@pytest.mark.parametrize(
+    "observer, target",
+    [
+        ((-1, 0), (1, 1)),
+        ((1, 1), (-1, 0)),
+        ((0, -1), (1, 1)),
+        ((1, 1), (0, -1)),
+        ((-5, -5), (-5, -5)),
+        ((9, 1), (1, 1)),
+        ((1, 1), (9, 1)),
+        ((1, 1), (1, 9)),
+        ((1000, 1000), (1, 1)),
+        ((1, 1), (1000, 1000)),
+        ((-3, 4), (12, -7)),
+    ],
+)
+def test_out_of_bounds_returns_false_and_never_raises(observer, target):
+    level = make_level(ROOM_ROWS)
+    assert fov.has_line_of_sight(level, frozenset(), observer, target) is False
+
+
+def test_out_of_bounds_beats_the_reflexive_rule():
+    """`has_line_of_sight(a, a)` is True only for a cell that exists."""
+    level = make_level(ROOM_ROWS)
+    assert fov.has_line_of_sight(level, frozenset(), (4, 3), (4, 3)) is True
+    assert fov.has_line_of_sight(level, frozenset(), (40, 30), (40, 30)) is False
+
+
+def test_every_cell_of_a_one_by_one_level_is_handled():
+    level = make_level(["."])
+    assert fov.has_line_of_sight(level, frozenset(), (0, 0), (0, 0)) is True
+    assert fov.has_line_of_sight(level, frozenset(), (0, 0), (0, 1)) is False
+
+
+def test_has_line_of_sight_does_not_mutate_its_arguments():
+    level = make_level(TWO_ROOMS_ROWS)
+    doors = frozenset({DOOR_CELL})
+    before_level = copy.deepcopy(level)
+    before_doors = set(doors)
+    fov.has_line_of_sight(level, doors, (3, 3), (9, 3))
+    assert level == before_level
+    assert set(doors) == before_doors
+
+
+def test_has_line_of_sight_is_deterministic_and_caches_nothing():
+    level = make_level(TWO_ROOMS_ROWS)
+    observer, target = (3, 3), (9, 3)
+    shut = fov.has_line_of_sight(level, frozenset(), observer, target)
+    opened = fov.has_line_of_sight(level, frozenset({DOOR_CELL}), observer, target)
+    shut_again = fov.has_line_of_sight(level, frozenset(), observer, target)
+    opened_again = fov.has_line_of_sight(level, frozenset({DOOR_CELL}), observer, target)
+    assert (shut, opened) == (False, True)
+    assert (shut_again, opened_again) == (False, True)
+
+
+def test_has_line_of_sight_does_not_depend_on_open_doors_iteration_order():
+    level = make_level(TWO_ROOMS_ROWS)
+    entries = [DOOR_CELL, (1, 1), (11, 5), (2, 4)]
+    answers = set()
+    for _ in range(8):
+        random.shuffle(entries)
+        answers.add(fov.has_line_of_sight(level, frozenset(entries), (3, 3), (9, 3)))
+    assert answers == {True}
+
+
+def test_compute_visible_still_works_after_has_line_of_sight_calls():
+    """No shared state between the two: interleaving them changes nothing."""
+    level = make_level(CLUTTER_ROWS)
+    doors = frozenset()
+    expected = fov.compute_visible(level, doors, CLUTTER_ORIGIN, 20)
+    for target in [(1, 1), (19, 9), (10, 1), (4, 8)]:
+        fov.has_line_of_sight(level, doors, CLUTTER_ORIGIN, target)
+    assert fov.compute_visible(level, doors, CLUTTER_ORIGIN, 20) == expected
+
+
+# ======================================================================================
+# Performance — the entire reason this function exists (CONTRACT-v5 §14 v5)
+# ======================================================================================
+
+
+def random_floor_pairs(level: Level, count: int, seed: int = 2024):
+    floors = [
+        (x, y)
+        for y in range(level.height)
+        for x in range(level.width)
+        if is_passable(level, frozenset(), x, y)
+    ]
+    rng = random.Random(seed)
+    return [(rng.choice(floors), rng.choice(floors)) for _ in range(count)]
+
+
+def test_thirty_checks_on_an_eighty_by_twenty_two_level_are_fast():
+    """Reference measurement: 5.0 ms for 30. The bound is 50 ms — a 10x margin."""
+    level = generate_level(1)
+    doors = frozenset()
+    pairs = random_floor_pairs(level, 30)
+    best = None
+    for _ in range(3):
+        start = time.perf_counter()
+        for observer, target in pairs:
+            fov.has_line_of_sight(level, doors, observer, target)
+        elapsed = time.perf_counter() - start
+        best = elapsed if best is None else min(best, elapsed)
+    assert best < 0.050, f"30 checks took {best * 1000:.1f} ms"
+
+
+def test_thirty_checks_are_substantially_cheaper_than_thirty_compute_visible_calls():
+    """Measured 44x on the reference build; asserted at 5x so it cannot flake."""
+    level = generate_level(1)
+    doors = frozenset()
+    pairs = random_floor_pairs(level, 30)
+
+    start = time.perf_counter()
+    for observer, target in pairs:
+        fov.has_line_of_sight(level, doors, observer, target)
+    point_to_point = time.perf_counter() - start
+
+    start = time.perf_counter()
+    for observer, target in pairs:
+        target in fov.compute_visible(level, doors, observer, fov.DEFAULT_RADIUS)
+    whole_disc = time.perf_counter() - start
+
+    assert point_to_point * 5 < whole_disc, (
+        f"point-to-point {point_to_point * 1000:.1f} ms vs "
+        f"compute_visible {whole_disc * 1000:.1f} ms"
+    )

@@ -27,9 +27,10 @@ def test_visibility_has_exactly_three_members():
     assert names == {"UNSEEN", "EXPLORED", "VISIBLE"}
 
 
-def test_role_has_exactly_three_members():
+def test_role_has_exactly_four_members():
+    assert len(Role) == 4
     names = {m.name for m in Role}
-    assert names == {"TERRAIN", "DOOR", "PLAYER"}
+    assert names == {"TERRAIN", "DOOR", "PLAYER", "NPC"}
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +83,10 @@ def test_only_player_is_bold():
         (Role.TERRAIN, Visibility.EXPLORED),
         (Role.DOOR, Visibility.VISIBLE),
         (Role.DOOR, Visibility.EXPLORED),
+        (Role.NPC, Visibility.VISIBLE),
     ]
     for role, vis in combos:
-        assert attr_for(role, vis).bold is False
+        assert attr_for(role, vis, species="rat").bold is False
     assert attr_for(Role.PLAYER, Visibility.VISIBLE).bold is True
 
 
@@ -99,11 +101,69 @@ def test_explored_is_darker_than_visible(role):
 
 
 # ---------------------------------------------------------------------------
+# attr_for — NPC species colours at colors=256 (CONTRACT-v5 §24.1 / §4 v5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "species,expected_color",
+    [
+        ("rat", 250),
+        ("jackal", 173),
+        ("giant bat", 140),
+        ("cave snake", 70),
+    ],
+)
+def test_npc_species_colours_256(species, expected_color):
+    assert attr_for(Role.NPC, Visibility.VISIBLE, colors=256, species=species).color == (
+        expected_color
+    )
+
+
+def test_npc_species_colours_are_all_distinct():
+    colors = {
+        attr_for(Role.NPC, Visibility.VISIBLE, colors=256, species=s).color
+        for s in ("rat", "jackal", "giant bat", "cave snake")
+    }
+    assert len(colors) == 4
+
+
+def test_npc_unrecognised_species_does_not_raise_and_degrades():
+    attr = attr_for(Role.NPC, Visibility.VISIBLE, colors=256, species="dragon")
+    assert isinstance(attr.color, int)
+
+
+def test_npc_missing_species_does_not_raise_and_degrades():
+    attr = attr_for(Role.NPC, Visibility.VISIBLE, colors=256)
+    assert isinstance(attr.color, int)
+
+
+@pytest.mark.parametrize("species", ["rat", "jackal", "giant bat", "cave snake"])
+def test_npc_visible_at_colors_8_is_ansi_red(species):
+    # curses.COLOR_RED == 1, spelled as a literal (module docstring / §4 v5).
+    assert attr_for(Role.NPC, Visibility.VISIBLE, colors=8, species=species).color == 1
+
+
+@pytest.mark.parametrize("colors", [2, 0])
+@pytest.mark.parametrize("species", ["rat", "jackal", "giant bat", "cave snake", None])
+def test_npc_visible_monochrome_is_terminal_default(colors, species):
+    assert (
+        attr_for(Role.NPC, Visibility.VISIBLE, colors=colors, species=species).color == -1
+    )
+
+
+# ---------------------------------------------------------------------------
 # Caller-bug combinations raise ValueError
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("role", [Role.TERRAIN, Role.DOOR, Role.PLAYER])
+# Role.PLAYER and Role.NPC are both drawn only ever at Visibility.VISIBLE — asking for
+# their EXPLORED attribute is a caller bug for both (§4/§15 v5 extends the player's rule
+# to NPCs), so both are excluded from the EXPLORED half of the sweeps below.
+_ONLY_VISIBLE_ROLES = (Role.PLAYER, Role.NPC)
+
+
+@pytest.mark.parametrize("role", [Role.TERRAIN, Role.DOOR, Role.PLAYER, Role.NPC])
 def test_unseen_raises_for_every_role(role):
     with pytest.raises(ValueError):
         attr_for(role, Visibility.UNSEEN)
@@ -114,6 +174,13 @@ def test_player_explored_raises():
         attr_for(Role.PLAYER, Visibility.EXPLORED)
 
 
+def test_npc_explored_raises():
+    with pytest.raises(ValueError):
+        attr_for(Role.NPC, Visibility.EXPLORED)
+    with pytest.raises(ValueError):
+        attr_for(Role.NPC, Visibility.EXPLORED, species="rat")
+
+
 # ---------------------------------------------------------------------------
 # Capability ladder
 # ---------------------------------------------------------------------------
@@ -121,11 +188,12 @@ def test_player_explored_raises():
 
 def test_colors_8_no_color_exceeds_7_and_nothing_raises():
     for role in Role:
-        for visibility in (Visibility.VISIBLE,) if role is Role.PLAYER else (
-            Visibility.VISIBLE,
-            Visibility.EXPLORED,
+        for visibility in (
+            (Visibility.VISIBLE,)
+            if role in _ONLY_VISIBLE_ROLES
+            else (Visibility.VISIBLE, Visibility.EXPLORED)
         ):
-            attr = attr_for(role, visibility, colors=8)
+            attr = attr_for(role, visibility, colors=8, species="rat")
             assert attr.color <= 7
 
 
@@ -138,11 +206,12 @@ def test_colors_8_terrain_and_door_are_distinguishable():
 @pytest.mark.parametrize("colors", [2, 0])
 def test_mono_terminals_use_default_color_everywhere(colors):
     for role in Role:
-        for visibility in (Visibility.VISIBLE,) if role is Role.PLAYER else (
-            Visibility.VISIBLE,
-            Visibility.EXPLORED,
+        for visibility in (
+            (Visibility.VISIBLE,)
+            if role in _ONLY_VISIBLE_ROLES
+            else (Visibility.VISIBLE, Visibility.EXPLORED)
         ):
-            attr = attr_for(role, visibility, colors=colors)
+            attr = attr_for(role, visibility, colors=colors, species="rat")
             assert attr.color == -1
 
 
@@ -152,9 +221,9 @@ def test_full_sweep_never_raises_and_color_is_int(colors):
         for visibility in Visibility:
             if visibility is Visibility.UNSEEN:
                 continue
-            if role is Role.PLAYER and visibility is Visibility.EXPLORED:
+            if role in _ONLY_VISIBLE_ROLES and visibility is Visibility.EXPLORED:
                 continue
-            attr = attr_for(role, visibility, colors=colors)
+            attr = attr_for(role, visibility, colors=colors, species="rat")
             assert isinstance(attr.color, int)
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import curses
+import curses.ascii
 import dataclasses
 import subprocess
 import sys
@@ -298,6 +299,8 @@ def test_every_bound_key_in_the_table_is_expected() -> None:
     expected |= set(SHIFT_ARROW_BINDINGS)
     expected |= {ord(c) for c in SHIFT_LETTER_BINDINGS}
     expected |= {ord("E"), ord("w")}
+    # v5 additions: fire, target-next (Tab).
+    expected |= {ord("f"), curses.ascii.TAB}
     assert set(keys_module._KEY_BINDINGS) == expected
 
 
@@ -449,6 +452,80 @@ def test_auto_explore_and_walk_prefix_do_not_collide_with_anything_else() -> Non
     assert new_commands.isdisjoint(other_commands)
 
 
+# --- Fire and target-next (CONTRACT-v5 §5): new in v5 -----------------------
+
+
+def test_fire_as_str() -> None:
+    command = translate_key("f")
+    assert command.kind is CommandKind.FIRE
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_fire_as_int() -> None:
+    command = translate_key(ord("f"))
+    assert command.kind is CommandKind.FIRE
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_fire_str_and_int_forms_agree() -> None:
+    assert translate_key("f") == translate_key(ord("f"))
+
+
+def test_target_next_is_curses_ascii_tab() -> None:
+    command = translate_key(curses.ascii.TAB)
+    assert command.kind is CommandKind.TARGET_NEXT
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_target_next_is_code_nine_since_that_is_what_getch_returns() -> None:
+    # getch() never hands back a name like curses.ascii.TAB, only the raw
+    # integer code — assert the two agree, per the task brief.
+    assert curses.ascii.TAB == 9
+    command = translate_key(9)
+    assert command.kind is CommandKind.TARGET_NEXT
+    assert command.dx == 0
+    assert command.dy == 0
+    assert translate_key(9) == translate_key(curses.ascii.TAB)
+
+
+def test_fire_and_target_next_are_distinct_commands() -> None:
+    assert translate_key("f") != translate_key(curses.ascii.TAB)
+
+
+def test_lowercase_f_is_fire_uppercase_f_is_still_unknown() -> None:
+    # THE NAMED TRAP: binding F when the intent was f. Assert both directions
+    # explicitly.
+    assert translate_key("f").kind is CommandKind.FIRE
+    assert translate_key("F") == UNKNOWN_COMMAND
+    assert translate_key("F").kind is CommandKind.UNKNOWN
+    assert translate_key("F") != translate_key("f")
+    assert translate_key(ord("f")).kind is CommandKind.FIRE
+    assert translate_key(ord("F")) == UNKNOWN_COMMAND
+
+
+def test_t_a_i_g_remain_unknown() -> None:
+    # CONTRACT-v5 §5: "Verified unbound before assignment" — f, F, t, a, i, g
+    # all currently map to UNKNOWN; only f gains a binding in v5.
+    for char in "taig":
+        assert translate_key(char) == UNKNOWN_COMMAND
+        assert translate_key(char).kind is CommandKind.UNKNOWN
+
+
+def test_fire_and_target_next_do_not_collide_with_anything_else() -> None:
+    new_commands = {translate_key("f"), translate_key(curses.ascii.TAB)}
+    other_commands = {
+        translate_key(c)
+        for c in list(LETTER_BINDINGS)
+        + list(DIGIT_BINDINGS)
+        + list(SHIFT_LETTER_BINDINGS)
+        + ["q", "Q", ">", "<", "E", "w"]
+    }
+    assert new_commands.isdisjoint(other_commands)
+
+
 # --- Unknown keys: ordinary input, never an error ---------------------------
 
 
@@ -469,14 +546,18 @@ def test_auto_explore_and_walk_prefix_do_not_collide_with_anything_else() -> Non
         "0",
         " ",
         "\n",
-        "\t",
         "e",  # lowercase auto-explore is not bound — only "E" is
         "W",  # uppercase walk-prefix is not bound — only "w" is
+        # v5: F (not f), and the other still-unbound letters (CONTRACT-v5 §5).
+        "F",
+        "t",
+        "a",
+        "i",
+        "g",
         -1,  # getch() with no input in non-blocking mode
         0,
         4,  # the integer four, not the numpad-4 key
         1,
-        9,
         curses.KEY_HOME,
         curses.KEY_NPAGE,
         curses.KEY_RESIZE,
@@ -508,9 +589,13 @@ def test_remaining_uppercase_movement_letters_are_still_unknown() -> None:
 
 
 def test_raw_integer_digits_are_not_numpad_keys() -> None:
-    # ord('4') == 52; the int 4 is a control code, not a movement key.
+    # ord('4') == 52; the int 4 is a control code, not a movement key. The
+    # sole exception is 9, which is control code Tab (curses.ascii.TAB) and
+    # is bound to TARGET_NEXT as of v5 — see test_target_next_is_curses_ascii_tab.
     assert ord("4") == 52
     for value in range(0, 10):
+        if value == curses.ascii.TAB:
+            continue
         assert translate_key(value) == UNKNOWN_COMMAND
 
 
@@ -572,17 +657,21 @@ def test_command_kind_members() -> None:
         "ASCEND",
         "AUTO_EXPLORE",
         "WALK_PREFIX",
+        "FIRE",
+        "TARGET_NEXT",
     ]
 
 
 def test_command_kind_uses_auto_values() -> None:
-    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5, 6, 7]
+    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
-def test_command_kind_has_exactly_seven_members() -> None:
-    # The five from v3 (MOVE, QUIT, UNKNOWN, DESCEND, ASCEND) plus the two new
-    # v4 members, AUTO_EXPLORE and WALK_PREFIX (CONTRACT-v4 §5).
-    assert len(list(CommandKind)) == 7
+def test_command_kind_has_exactly_nine_members() -> None:
+    # The five from v3 (MOVE, QUIT, UNKNOWN, DESCEND, ASCEND), the two from v4
+    # (AUTO_EXPLORE, WALK_PREFIX), plus the two new v5 members, FIRE and
+    # TARGET_NEXT (CONTRACT-v5 §5).
+    assert len(list(CommandKind)) == 9
+    assert len(CommandKind) == 9
 
 
 def test_module_constants_are_the_expected_kinds() -> None:
@@ -653,6 +742,24 @@ def test_keys_references_shift_diagonal_constants_rather_than_hardcoding_them() 
         assert f"curses.{constant}" in source
     for hardcoded in ("337", "336", "393", "402"):
         assert hardcoded not in source
+
+
+def test_keys_references_tab_constant_rather_than_hardcoding_it() -> None:
+    # CONTRACT-v5 §5: Tab must be referenced as `curses.ascii.TAB`, never the
+    # literal 9 — the same rule already applied to KEY_SR and friends. Walk
+    # the AST rather than grepping for the substring "9", since "9" is also a
+    # legitimate string literal elsewhere in the table (numpad north-east).
+    source = _keys_source()
+    assert "curses.ascii.TAB" in source
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant):
+            value = node.value
+            if isinstance(value, int) and not isinstance(value, bool) and value == 9:
+                pytest.fail(
+                    "found a literal integer 9 in keys.py; Tab must be "
+                    "referenced as curses.ascii.TAB"
+                )
 
 
 def test_importing_keys_does_not_initialise_a_terminal() -> None:

@@ -17,6 +17,18 @@ turn a bump into an open.
 Diagonal moves are legal iff the destination is passable — there are no corner-cutting
 rules (v1 BRIEF Q7, unchanged).
 
+v5 adds a **third** rejection that carries detail: the destination holds another actor
+(CONTRACT-v5 §7.9). ``occupied`` is a new, defaulted parameter — every v1–v4 call site
+keeps working untouched — and a target cell in it is reported back through
+``MoveResult.blocked_by_npc`` so the caller can turn the bump into an attack. This module
+still knows nothing about monsters, combat or hit points: it is handed a set of
+coordinates and reports which one it refused, exactly as it already does for doors.
+
+**Occupancy is tested first**, before passability and before the door check, so a cell
+holding both a closed door and an actor reports ``blocked_by_npc`` — you attack the thing,
+not the door. That combination cannot arise while monsters stand only on passable cells,
+but the precedence is defined rather than accidental.
+
 Imports only from :mod:`roguelike.level` and :mod:`roguelike.world` (CONTRACT-v2 §10).
 Never touches curses.
 """
@@ -46,11 +58,17 @@ class MoveResult:
     was caused by a closed door; ``None`` for every other outcome, including a
     successful move. It lets a caller distinguish "you bumped a door" (which can be
     turned into an open) from "you walked into a wall" (which cannot).
+
+    ``blocked_by_npc`` is the same idea for the v5 rejection: the coordinates of the
+    occupied cell the step was refused by, and ``None`` for every other outcome. A caller
+    turns it into a melee attack (CONTRACT-v5 §7.9). At most one of the two detail fields
+    is ever set, and ``blocked_by_npc`` wins if a cell could somehow be both.
     """
 
     position: tuple[int, int]
     moved: bool
     blocked_by_door: tuple[int, int] | None = None
+    blocked_by_npc: tuple[int, int] | None = None
 
 
 def try_move(
@@ -59,6 +77,7 @@ def try_move(
     dx: int,
     dy: int,
     open_doors: frozenset[tuple[int, int]] = frozenset(),
+    occupied: frozenset[tuple[int, int]] = frozenset(),
 ) -> MoveResult:
     """Resolve a single step from ``position`` by ``(dx, dy)``.
 
@@ -66,14 +85,21 @@ def try_move(
     and never raises for an ordinary illegal move — walking into a wall or a closed
     door is normal input, not an error.
 
+    ``occupied`` holds every cell another actor is standing on (CONTRACT-v5 §7.9). It
+    defaults to the empty set, so a caller with no monsters — every v1–v4 call site —
+    behaves exactly as before. This module never asks *what* occupies a cell.
+
     Returns:
-        ``MoveResult(target, True)`` if ``world.is_passable(level, open_doors, *target)``,
-        otherwise ``MoveResult(position, False, blocked_by_door=...)`` with the input
-        position returned unchanged (the same tuple object, not an equal copy).
-        ``blocked_by_door`` is ``(tx, ty)`` when the target is a closed door, and
-        ``None`` for every other rejection (wall, border, off-map). A zero delta
-        (``dx == dy == 0``) is not an error; it simply does not move, and is never
-        reported as door-blocked even when standing on a door.
+        ``MoveResult(target, True)`` if ``world.is_passable(level, open_doors, *target)``
+        and the target is unoccupied, otherwise ``MoveResult(position, False, ...)`` with
+        the input position returned unchanged (the same tuple object, not an equal copy)
+        and at most one detail field set. ``blocked_by_npc`` is ``(tx, ty)`` when the
+        target is in ``occupied`` — **checked first**, so it wins over a closed door on
+        the same cell. ``blocked_by_door`` is ``(tx, ty)`` when the target is an
+        unoccupied closed door. Both are ``None`` for every other rejection (wall,
+        border, off-map). A zero delta (``dx == dy == 0``) is not an error; it simply
+        does not move, and is never reported as door- or actor-blocked even when standing
+        on a door or sharing a cell with something in ``occupied``.
 
     Raises:
         ValueError: if ``dx`` or ``dy`` is outside ``{-1, 0, 1}``. Movement is
@@ -92,6 +118,11 @@ def try_move(
 
     target = (position[0] + dx, position[1] + dy)
     tx, ty = target
+    # Occupancy first: a cell holding an actor is refused whether it is floor or door,
+    # and the caller turns that refusal into an attack (CONTRACT-v5 §7.9).
+    if target in occupied:
+        return MoveResult(position, False, blocked_by_npc=target)
+
     if is_passable(level, open_doors, tx, ty):
         return MoveResult(target, True)
 

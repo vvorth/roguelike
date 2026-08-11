@@ -343,15 +343,17 @@ def test_is_blocked_and_try_move_diverge_at_a_closed_door():
 
 
 def test_move_result_is_a_frozen_dataclass_with_binding_field_order():
-    # CONTRACT-v2 §6 amendment: blocked_by_door is a THIRD field with a default, so
-    # v1's two-field positional construction still works unchanged (asserted below).
+    # CONTRACT-v2 §6 amendment: blocked_by_door is a THIRD field with a default, and
+    # CONTRACT-v5 §7.9 appends blocked_by_npc as a FOURTH, also defaulted — so v1's
+    # two-field positional construction still works unchanged (asserted below).
     assert dataclasses.is_dataclass(MoveResult)
     fields = [f.name for f in dataclasses.fields(MoveResult)]
-    assert fields == ["position", "moved", "blocked_by_door"]
+    assert fields == ["position", "moved", "blocked_by_door", "blocked_by_npc"]
     result = MoveResult((4, 2), True)
     assert result.position == (4, 2)
     assert result.moved is True
     assert result.blocked_by_door is None
+    assert result.blocked_by_npc is None
 
 
 def test_move_result_is_immutable():
@@ -596,3 +598,172 @@ def test_open_doors_argument_is_not_mutated():
     doors = frozenset({DOOR_POS})
     try_move(level, DOOR_APPROACH, 0, 1, open_doors=doors)
     assert doors == frozenset({DOOR_POS})
+
+
+# --------------------------------------------------------------------------
+# CONTRACT-v5 §7.9: occupancy, and bump-to-attack's half of it
+#
+# `occupied` is a set of coordinates and nothing else — this module has never
+# heard of a monster, a hit point or a fight. It reports *which* cell it refused
+# and the caller decides that refusing to walk into something means swinging at
+# it, exactly as it already decides that bumping a door means opening it.
+# --------------------------------------------------------------------------
+
+# (2, 3) is floor with floor on all eight sides, so every delta from it is a
+# legal step until something is standing in the way.
+CENTRE = (2, 3)
+
+
+def test_occupied_defaults_to_empty_so_every_v1_to_v4_call_is_unchanged():
+    level = open_level()
+    for dx, dy in ALL_DELTAS:
+        assert try_move(level, CENTRE, dx, dy) == try_move(
+            level, CENTRE, dx, dy, frozenset(), frozenset()
+        )
+
+
+@pytest.mark.parametrize("dx, dy", ALL_DELTAS)
+def test_a_step_into_an_occupied_cell_is_refused_and_names_it(dx, dy):
+    level = open_level()
+    target = (CENTRE[0] + dx, CENTRE[1] + dy)
+    result = try_move(level, CENTRE, dx, dy, occupied=frozenset({target}))
+    assert result.moved is False
+    assert result.position == CENTRE
+    assert result.blocked_by_npc == target
+    assert result.blocked_by_door is None
+
+
+def test_the_refused_position_is_the_same_object_not_an_equal_copy():
+    # The whole point of returning the input position is that a rejected move
+    # changes nothing at all — including identity.
+    level = open_level()
+    position = (2, 3)
+    result = try_move(level, position, 1, 0, occupied=frozenset({(3, 3)}))
+    assert result.position is position
+
+
+def test_an_occupied_cell_elsewhere_does_not_block_the_step():
+    level = open_level()
+    result = try_move(level, CENTRE, 1, 0, occupied=frozenset({(1, 1), (4, 4)}))
+    assert result.moved is True
+    assert result.position == (3, 3)
+    assert result.blocked_by_npc is None
+
+
+def test_an_npc_on_a_closed_door_wins_over_the_door():
+    # CONTRACT-v5 §7.9: you attack the thing, not the door. Unreachable in play —
+    # monsters stand on passable cells — but defined rather than accidental.
+    level = open_level()
+    result = try_move(
+        level,
+        DOOR_APPROACH,
+        0,
+        1,
+        open_doors=frozenset(),
+        occupied=frozenset({DOOR_POS}),
+    )
+    assert result.moved is False
+    assert result.blocked_by_npc == DOOR_POS
+    assert result.blocked_by_door is None
+
+
+def test_an_npc_on_an_open_door_still_blocks():
+    level = open_level()
+    result = try_move(
+        level,
+        DOOR_APPROACH,
+        0,
+        1,
+        open_doors=frozenset({DOOR_POS}),
+        occupied=frozenset({DOOR_POS}),
+    )
+    assert result.moved is False
+    assert result.blocked_by_npc == DOOR_POS
+
+
+def test_occupancy_is_asked_before_passability():
+    # A wall cell listed as occupied reports the actor, not the wall. Nothing can
+    # produce that state; the precedence is pinned so it cannot drift into being
+    # order-dependent on which check happens to run first.
+    level = open_level()
+    wall = (2, 0)
+    result = try_move(level, (2, 1), 0, -1, occupied=frozenset({wall}))
+    assert result.moved is False
+    assert result.blocked_by_npc == wall
+
+
+def test_a_zero_delta_is_never_reported_as_actor_blocked():
+    level = open_level()
+    result = try_move(level, CENTRE, 0, 0, occupied=frozenset({CENTRE}))
+    assert result.moved is False
+    assert result.blocked_by_npc is None
+    assert result.blocked_by_door is None
+
+
+@pytest.mark.parametrize("bad", [2, -2, 10, -10])
+def test_bad_delta_raises_before_the_occupancy_check(bad):
+    level = open_level()
+    with pytest.raises(ValueError):
+        try_move(level, CENTRE, bad, 0, frozenset(), frozenset({(3, 3)}))
+
+
+def test_occupied_is_accepted_positionally_as_the_sixth_argument():
+    level = open_level()
+    result = try_move(level, CENTRE, 1, 0, frozenset(), frozenset({(3, 3)}))
+    assert result.blocked_by_npc == (3, 3)
+
+
+def test_neither_set_is_mutated():
+    level = open_level()
+    doors = frozenset({DOOR_POS})
+    actors = frozenset({(3, 3)})
+    try_move(level, CENTRE, 1, 0, doors, actors)
+    try_move(level, DOOR_APPROACH, 0, 1, doors, actors)
+    assert doors == frozenset({DOOR_POS})
+    assert actors == frozenset({(3, 3)})
+
+
+def test_a_wall_is_still_a_plain_rejection_when_a_set_is_supplied():
+    level = open_level()
+    result = try_move(level, (1, 1), -1, 0, frozenset(), frozenset({(5, 5)}))
+    assert result.moved is False
+    assert result.blocked_by_door is None
+    assert result.blocked_by_npc is None
+
+
+def test_a_closed_door_is_still_a_door_rejection_when_a_set_is_supplied():
+    level = open_level()
+    result = try_move(level, DOOR_APPROACH, 0, 1, frozenset(), frozenset({(1, 1)}))
+    assert result.moved is False
+    assert result.blocked_by_door == DOOR_POS
+    assert result.blocked_by_npc is None
+
+
+def test_move_result_four_field_construction_and_equality():
+    result = MoveResult((1, 2), False, None, (3, 4))
+    assert result.blocked_by_npc == (3, 4)
+    assert MoveResult((1, 2), False, None, (3, 4)) == MoveResult(
+        (1, 2), False, None, (3, 4)
+    )
+    assert MoveResult((1, 2), False, None, (3, 4)) != MoveResult((1, 2), False, None)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.blocked_by_npc = None
+
+
+def test_module_still_imports_only_level_and_world():
+    # CONTRACT-v5 §10 v5 leaves movement.py's import list alone: occupancy arrives
+    # as coordinates, so nothing about monsters is imported to understand them.
+    source = pathlib.Path(
+        __import__("roguelike.movement", fromlist=["movement"]).__file__
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert {name for name in imported if name.startswith("roguelike")} == {
+        "roguelike.level",
+        "roguelike.world",
+    }

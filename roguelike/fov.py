@@ -39,6 +39,18 @@ cell edges, cell centres, side midpoints — is a multiple of 0.5, so doubling m
 all integers). There is no floating point anywhere in the traversal, so there is no
 epsilon, no tie-breaking fudge, and the answer is exact.
 
+One cell, or all of them
+------------------------
+:func:`compute_visible` answers "what can I see?" for a whole radius disc — the question
+the renderer asks once per turn. :func:`has_line_of_sight` answers "can I see *that*?"
+for a single target cell, under the identical geometry, and is the question every NPC
+asks every turn. It exists because asking the first question to answer the second costs
+14.888 ms a time against 0.167 ms: the disc computation does work proportional to the
+whole radius, while an awareness check cares about exactly one cell, so it snapshots
+opacity over only the two cells' bounding box grown by one. Same rule, same answers,
+44x cheaper — and note that the rule is deliberately **not symmetric**, since the eye is
+a cell centre while the target is tested at boundary samples.
+
 Opacity has exactly one source: :func:`roguelike.world.is_transparent`. This module does
 not look at tiles and does not know the closed-door rule.
 
@@ -54,7 +66,7 @@ from __future__ import annotations
 from roguelike.level import Level
 from roguelike.world import is_transparent
 
-__all__ = ["DEFAULT_RADIUS", "compute_visible"]
+__all__ = ["DEFAULT_RADIUS", "compute_visible", "has_line_of_sight"]
 
 
 DEFAULT_RADIUS: int = 20
@@ -170,6 +182,117 @@ def compute_visible(
                     break
 
     return frozenset(visible)
+
+
+def has_line_of_sight(
+    level: Level,
+    open_doors: frozenset[tuple[int, int]],
+    observer: tuple[int, int],
+    target: tuple[int, int],
+) -> bool:
+    """Return ``True`` iff ``observer`` can see ``target`` right now (CONTRACT-v5 §14).
+
+    Exactly the visibility rule :func:`compute_visible` applies, asked about a single
+    cell: the eye sits at the **observer's** cell centre ``(ox + 0.5, oy + 0.5)``, the
+    eight sample points of the module docstring sit on the **target** cell, and the
+    answer is ``True`` iff at least one segment between them crosses no opaque cell. The
+    observer's cell and the target cell are exempt from the opacity test, and the
+    diagonal-corner rule blocks only where both flanking cells are opaque — the identical
+    rules :func:`_segment_is_clear` already implements, on the identical doubled-integer
+    geometry.
+
+    The one thing that differs is how much of the map is looked at. ``compute_visible``
+    decides a whole radius disc and snapshots opacity for all of it; this decides one
+    cell and snapshots opacity for the **bounding box of the two cells, grown by one cell
+    and clipped to the level** — never the whole disc. That is the entire optimisation,
+    and it is worth 44x: measured 0.167 ms per check against 14.888 ms for a
+    ``compute_visible`` call (RESEARCH-v5 §8), which is what makes a per-NPC per-turn
+    awareness check affordable. The one-cell margin is the guarantee that the shrunken
+    view can never change an answer: a segment to a sample point stays inside the two
+    cells' bounding box, and the diagonal-corner rule reads only cells flanking a
+    lattice point the segment crosses, so the grown box contains every lookup with a
+    cell to spare. Cells outside the snapshot read as opaque, exactly as
+    ``compute_visible``'s own snapshot has them.
+
+    **There is no radius parameter.** Sight here is unlimited; range limiting is the
+    caller's business, and a caller that wants one applies it before calling.
+
+    **The argument order is binding, and it is `(observer, target)`.** Permissive line of
+    sight is *not* symmetric — measured, 2 of 720 cell pairs (0.28%) disagree about who
+    can see whom, because the eye is a cell *centre* while the target is tested at eight
+    *boundary* samples. NPC awareness always asks ``(npc_position, player_position)``.
+    Swapping the arguments is a behaviour change, not a refactor, and it is wrong just
+    rarely enough that nobody will be able to reproduce it.
+
+    Pure: neither ``level`` nor ``open_doors`` is modified, nothing is cached between
+    calls, and the same arguments always produce the same answer.
+
+    Args:
+        level: The map. Read-only; consulted only through
+            :func:`roguelike.world.is_transparent`.
+        open_doors: The doors currently open. A closed door is opaque, an open one is
+            not.
+        observer: ``(x, y)`` of the looking cell — where the eye is.
+        target: ``(x, y)`` of the cell being looked at.
+
+    Returns:
+        ``True`` iff some segment from the eye to a sample point of ``target`` is clear.
+        ``observer == target`` is always ``True``, on floor, wall and closed door alike.
+        An out-of-bounds ``observer`` or ``target`` is ``False``; it never raises.
+    """
+    ox, oy = observer
+    tx, ty = target
+
+    # Off-map is not an error here: an NPC may ask about anything, and "no" is the only
+    # sensible answer for a cell that does not exist (CONTRACT-v5 §11).
+    if not level.in_bounds(ox, oy) or not level.in_bounds(tx, ty):
+        return False
+
+    # You can always see the cell you are standing in, whatever it is made of — the same
+    # rule that puts `origin` unconditionally in `compute_visible`'s result.
+    if ox == tx and oy == ty:
+        return True
+
+    opaque = _box_opacity(level, open_doors, ox, oy, tx, ty)
+
+    ax = 2 * ox + 1
+    ay = 2 * oy + 1
+    bx = 2 * tx
+    by = 2 * ty
+    for sample_dx, sample_dy in _SAMPLE_OFFSETS:
+        if _segment_is_clear(
+            ax, ay, bx + sample_dx, by + sample_dy, ox, oy, tx, ty, opaque
+        ):
+            return True
+    return False
+
+
+def _box_opacity(
+    level: Level,
+    open_doors: frozenset[tuple[int, int]],
+    ox: int,
+    oy: int,
+    tx: int,
+    ty: int,
+) -> dict[tuple[int, int], bool]:
+    """Snapshot opacity over the two cells' bounding box, grown by one and clipped.
+
+    The same local view of :func:`roguelike.world.is_transparent` that
+    :func:`compute_visible` builds, over the smallest region that can decide one pair of
+    cells: every cell a segment between them can cross, plus a one-cell ring so that the
+    diagonal-corner rule's flanking lookups cannot fall off the edge of the view and read
+    as opaque. It lives and dies inside the call, so there is nothing to go stale.
+    """
+    x_lo = max(0, min(ox, tx) - 1)
+    x_hi = min(level.width - 1, max(ox, tx) + 1)
+    y_lo = max(0, min(oy, ty) - 1)
+    y_hi = min(level.height - 1, max(oy, ty) + 1)
+
+    opaque: dict[tuple[int, int], bool] = {}
+    for y in range(y_lo, y_hi + 1):
+        for x in range(x_lo, x_hi + 1):
+            opaque[(x, y)] = not is_transparent(level, open_doors, x, y)
+    return opaque
 
 
 def _segment_is_clear(

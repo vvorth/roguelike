@@ -28,6 +28,17 @@ __all__ = [
 # being pure data — see the module docstring).
 _ANSI_WHITE = 7  # curses.COLOR_WHITE
 _ANSI_YELLOW = 3  # curses.COLOR_YELLOW
+_ANSI_RED = 1  # curses.COLOR_RED
+
+# Per-species 256-colour indices (CONTRACT-v5 §24.1 / §4 v5, binding). Keyed by the
+# same lower-case species name string carried by `npc.SpeciesData.name` — this module
+# never imports `roguelike.npc`, so a plain string is the species' whole identity here.
+_NPC_COLORS_256: dict[str, int] = {
+    "rat": 250,
+    "jackal": 173,
+    "giant bat": 140,
+    "cave snake": 70,
+}
 
 
 class Visibility(Enum):
@@ -44,6 +55,7 @@ class Role(Enum):
     TERRAIN = auto()  # wall and floor
     DOOR = auto()
     PLAYER = auto()
+    NPC = auto()  # a monster — only ever drawn at Visibility.VISIBLE (CONTRACT-v5 §4/§15 v5)
 
 
 @dataclass(frozen=True)
@@ -73,16 +85,27 @@ def role_for(tile: Tile, is_player: bool = False) -> Role:
     return Role.TERRAIN
 
 
-def attr_for(role: Role, visibility: Visibility, colors: int = 256) -> Attr:
+def attr_for(
+    role: Role, visibility: Visibility, colors: int = 256, species: str | None = None
+) -> Attr:
     """Return the display :class:`Attr` for ``role`` at ``visibility``.
 
     ``colors`` is the terminal's colour capability (``curses.COLORS``), supplied by
     the caller — this module never detects it itself, since detection needs curses.
 
+    ``species`` selects the colour among the four monsters when ``role`` is
+    ``Role.NPC`` (CONTRACT-v5 §24.1) — the lower-case species name, e.g. ``"rat"`` or
+    ``"cave snake"``, exactly as carried by ``npc.SpeciesData.name``. It is ignored
+    for every other role. An unrecognised or missing species falls back to the
+    terminal default (``-1``) rather than raising — the same "degrade, never crash"
+    discipline as the capability ladder below.
+
     Raises:
         ValueError: for ``Visibility.UNSEEN`` (unseen cells are never drawn, so
-            asking for their attribute is a caller bug), and for
-            ``(Role.PLAYER, Visibility.EXPLORED)`` (the player is always visible).
+            asking for their attribute is a caller bug), for
+            ``(Role.PLAYER, Visibility.EXPLORED)`` (the player is always visible),
+            and for ``(Role.NPC, Visibility.EXPLORED)`` (an NPC is only ever drawn
+            when visible — monsters move, so a remembered one is a lie).
     """
     if visibility is Visibility.UNSEEN:
         raise ValueError(
@@ -94,6 +117,12 @@ def attr_for(role: Role, visibility: Visibility, colors: int = 256) -> Attr:
             "attr_for(Role.PLAYER, Visibility.EXPLORED): the player is always "
             "visible, so this combination is a caller bug"
         )
+    if role is Role.NPC and visibility is Visibility.EXPLORED:
+        raise ValueError(
+            "attr_for(Role.NPC, Visibility.EXPLORED): an NPC is only ever drawn "
+            "when visible — monsters move, so a remembered one is a lie, and "
+            "asking for this combination is a caller bug"
+        )
 
     if role is Role.PLAYER:
         # visibility is guaranteed VISIBLE at this point.
@@ -102,6 +131,14 @@ def attr_for(role: Role, visibility: Visibility, colors: int = 256) -> Attr:
         if colors >= 8:
             return Attr(_ANSI_WHITE, bold=True)
         return Attr(-1, bold=True)
+
+    if role is Role.NPC:
+        # visibility is guaranteed VISIBLE at this point.
+        if colors >= 256:
+            return Attr(_NPC_COLORS_256.get(species or "", -1))
+        if colors >= 8:
+            return Attr(_ANSI_RED)
+        return Attr(-1)
 
     # role is TERRAIN or DOOR.
     if colors >= 256:
