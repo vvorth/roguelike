@@ -98,6 +98,13 @@ class SpeciesData:
 
     ``name`` is lower-case on purpose: messages read ``The {name} hits you.``
 
+    ``hostile`` decides whether walking into this creature attacks it. Everything in
+    today's bestiary is hostile, so the flag has no live counter-example yet — it exists
+    because "bumping must not attack a peaceful creature" is a rule that has to be
+    enforced *somewhere*, and enforcing it at the one place that reads it is cheaper and
+    safer than adding it later to every call site. An explicit attack still hits a
+    non-hostile: that is how you pick a fight on purpose.
+
     There is deliberately **no** ``max_hp``, ``speed``, ``evasion`` or ``block`` field —
     those are :func:`roguelike.stats.derive` of :attr:`stats` (CONTRACT-v5 §24.1).
     """
@@ -109,6 +116,7 @@ class SpeciesData:
     attack_max: int
     xp_value: int
     poison_chance: int = 0
+    hostile: bool = True
 
 
 class AiState(Enum):
@@ -127,7 +135,8 @@ class NPC:
     ``ai_state`` and ``memory`` are maintained by ``game.py``: :func:`plan_action` reads
     them and never decides them.
 
-    There is no ``path`` field and no ``hostile`` flag (everything is hostile).
+    There is no ``path`` field. Hostility is a property of the *species*, not of the
+    individual, so it lives on :class:`SpeciesData`.
     """
 
     actor_id: int

@@ -1080,6 +1080,18 @@ def _fire(state: GameState) -> GameState:
     return replace(after, projectile=tuple(line_cells(state.player, cell)))
 
 
+def _is_hostile_at(state: GameState, cell: Coord) -> bool:
+    """Is the monster standing on ``cell`` hostile? ``False`` if nothing is there.
+
+    Hostility is a property of the species (:attr:`roguelike.npc.SpeciesData.hostile`),
+    so it is looked up rather than stored per monster.
+    """
+    for npc in state.npcs:
+        if npc.position == cell:
+            return SPECIES_DATA[npc.species].hostile
+    return False
+
+
 def _attack_towards(state: GameState, dx: int, dy: int) -> GameState:
     """``F`` then a direction: attack the adjacent cell that way, without moving.
 
@@ -1092,6 +1104,10 @@ def _attack_towards(state: GameState, dx: int, dy: int) -> GameState:
     Swinging at an empty square **costs a turn** and says so. That is deliberate: a free
     swing would be a free probe, telling the player whether a cell is occupied at no cost,
     which is exactly the information a monster's turn is supposed to buy.
+
+    **Hostility is not consulted here.** Bumping deliberately refuses to attack a peaceful
+    creature, so this is the only way to hit one — picking a fight has to be possible, it
+    just has to be deliberate.
     """
     target = (state.player[0] + dx, state.player[1] + dy)
     if any(npc.position == target for npc in state.npcs):
@@ -1588,12 +1604,19 @@ def step(state: GameState, command: Command) -> GameState:
             _occupied(state),
         )
         if result.blocked_by_npc is not None:
-            return _tick_world(
-                state,
-                _player_attack(
-                    state, result.blocked_by_npc, state.player_actor.melee, True
-                ),
-            )
+            # Bumping attacks a hostile and only a hostile. Walking into a peaceful
+            # creature is a blocked move, exactly like walking into a wall: nothing
+            # happens, no turn is spent, and the message on screen survives. Killing
+            # something harmless must be a decision, not a mistyped direction — so the
+            # explicit attack (`a` + direction) still hits it, and that is the only way.
+            if _is_hostile_at(state, result.blocked_by_npc):
+                return _tick_world(
+                    state,
+                    _player_attack(
+                        state, result.blocked_by_npc, state.player_actor.melee, True
+                    ),
+                )
+            return state
         if result.moved:
             return _tick_world(
                 state,

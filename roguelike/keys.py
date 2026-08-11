@@ -41,7 +41,7 @@ class CommandKind(Enum):
     FIRE = auto()  # "f"  -- NEW in v5
     TARGET_NEXT = auto()  # Tab (curses.ascii.TAB) -- NEW in v5
     HELP = auto()  # "?"
-    ATTACK = auto()  # "F" -- prefix; the next key is the direction
+    ATTACK = auto()  # "a" -- prefix; the next key is the direction
 
 
 @dataclass(frozen=True)
@@ -97,12 +97,13 @@ _QUIT_KEYS: tuple[int | str, ...] = ("q", "Q")
 # Stairs are used by an explicit command, as in ADOM (CONTRACT-v3 §5) — not by
 # stepping on the tile. AUTO_EXPLORE ("E") and WALK_PREFIX ("w") are new in
 # v4. FIRE ("f") and TARGET_NEXT (Tab) are new in v5, for ranged combat and
-# cycling targets (CONTRACT-v5 §5). HELP ("?") and ATTACK ("F") followed. All
+# cycling targets (CONTRACT-v5 §5). HELP ("?") and ATTACK ("a") followed. All
 # eight carry dx == dy == 0.
 #
 # ATTACK is a *prefix*, like WALK_PREFIX: the key that follows it names the
-# direction. Note "f" fires the bow and "F" attacks in melee -- adjacent on the
-# keyboard and easy to transpose, so both are asserted explicitly in the tests.
+# direction. It is "a", deliberately NOT "F": "f" already opens ranged targeting,
+# and two adjacent keys doing different combat things is a transposition waiting
+# to happen. "F" is unbound.
 #
 # Tab is referenced as `curses.ascii.TAB`, never the literal 9, matching the
 # rule already followed for KEY_SR and friends.
@@ -114,7 +115,7 @@ _NO_ARG_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
     (CommandKind.FIRE, "f"),
     (CommandKind.TARGET_NEXT, curses.ascii.TAB),
     (CommandKind.HELP, "?"),
-    (CommandKind.ATTACK, "F"),
+    (CommandKind.ATTACK, "a"),
 )
 
 
@@ -138,8 +139,8 @@ HELP_ENTRIES: tuple[tuple[str, str], ...] = (
     (">", "descend, or travel to a known down staircase"),
     ("<", "ascend, or travel to a known up staircase"),
     ("move into a monster", "attack it"),
-    ("F + direction", "attack that way without moving"),
-    ("f", "fire the bow; f again to shoot"),
+    ("a + direction", "attack that way without moving"),
+    ("f", "aim the bow; Tab cycles targets, f shoots"),
     ("Tab", "next target while aiming"),
     ("?", "this help"),
     ("q", "quit"),

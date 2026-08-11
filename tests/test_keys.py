@@ -302,7 +302,7 @@ def test_every_bound_key_in_the_table_is_expected() -> None:
     # v5 additions: fire, target-next (Tab).
     expected |= {ord("f"), curses.ascii.TAB}
     # The help screen, and the explicit-attack prefix.
-    expected |= {ord("?"), ord("F")}
+    expected |= {ord("?"), ord("a")}
     assert set(keys_module._KEY_BINDINGS) == expected
 
 
@@ -497,24 +497,29 @@ def test_fire_and_target_next_are_distinct_commands() -> None:
     assert translate_key("f") != translate_key(curses.ascii.TAB)
 
 
-def test_lowercase_f_fires_and_uppercase_f_attacks() -> None:
-    # THE NAMED TRAP, and now sharper than when F was merely unbound: the two keys
-    # are adjacent on the keyboard and do different things -- f shoots the bow at a
-    # chosen target, F swings in a direction. Transposing them is the single most
-    # likely bug in this table, so both directions are asserted explicitly.
+def test_lowercase_f_is_fire_and_uppercase_f_is_unbound() -> None:
+    # THE NAMED TRAP: binding F when the intent was f. Melee lives on "a"
+    # precisely so that two adjacent keys never both mean "attack" -- an
+    # earlier revision put it on F and that shift-typo risk is why it moved.
     assert translate_key("f").kind is CommandKind.FIRE
-    assert translate_key("F").kind is CommandKind.ATTACK
-    assert translate_key("F") != translate_key("f")
+    assert translate_key("F") == UNKNOWN_COMMAND
+    assert translate_key("F").kind is CommandKind.UNKNOWN
     assert translate_key(ord("f")).kind is CommandKind.FIRE
-    assert translate_key(ord("F")).kind is CommandKind.ATTACK
-    # Both are argument-less intents; the direction arrives as the NEXT key.
-    assert (translate_key("F").dx, translate_key("F").dy) == (0, 0)
+    assert translate_key(ord("F")) == UNKNOWN_COMMAND
 
 
-def test_t_a_i_g_remain_unknown() -> None:
-    # CONTRACT-v5 §5: "Verified unbound before assignment" — f, F, t, a, i, g
-    # all currently map to UNKNOWN; only f gains a binding in v5.
-    for char in "taig":
+def test_a_is_the_melee_attack_prefix() -> None:
+    assert translate_key("a").kind is CommandKind.ATTACK
+    assert translate_key(ord("a")).kind is CommandKind.ATTACK
+    # An argument-less intent; the direction arrives as the NEXT key.
+    assert (translate_key("a").dx, translate_key("a").dy) == (0, 0)
+    assert translate_key("A") == UNKNOWN_COMMAND
+
+
+def test_t_i_g_remain_unknown() -> None:
+    # CONTRACT-v5 §5: "Verified unbound before assignment". Of that original set,
+    # "f" took ranged fire and "a" took melee; "F", "t", "i" and "g" stay unbound.
+    for char in "tigF":
         assert translate_key(char) == UNKNOWN_COMMAND
         assert translate_key(char).kind is CommandKind.UNKNOWN
 
@@ -553,10 +558,11 @@ def test_fire_and_target_next_do_not_collide_with_anything_else() -> None:
         "\n",
         "e",  # lowercase auto-explore is not bound — only "E" is
         "W",  # uppercase walk-prefix is not bound — only "w" is
-        # v5: the still-unbound letters (CONTRACT-v5 §5). "F" is no longer among
-        # them -- it is the explicit-attack prefix.
+        # v5: the still-unbound letters (CONTRACT-v5 §5). "F" is among them again:
+        # melee is on "a", so "f"/"F" cannot be transposed into each other.
+        "F",
+        "A",
         "t",
-        "a",
         "i",
         "g",
         -1,  # getch() with no input in non-blocking mode

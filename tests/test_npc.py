@@ -282,6 +282,9 @@ def test_species_data_does_not_store_derived_values():
         "attack_max",
         "xp_value",
         "poison_chance",
+        # Whether bumping into this creature attacks it. Not a derived value --
+        # it is a fact about the species, like its glyph.
+        "hostile",
     }
     assert fields.isdisjoint({"max_hp", "hp", "speed", "evasion", "block"})
 

@@ -5616,3 +5616,77 @@ def test_no_seed_offers_a_shot_on_the_very_first_turn() -> None:
     for seed in (1, 7, 42, 1234):
         state = new_game(seed)
         assert step(state, Command(CommandKind.FIRE)).targeting is None
+
+
+# --- Hostility: bumping never attacks a peaceful creature --------------------
+#
+# Everything in today's bestiary is hostile, so these tests build their own
+# non-hostile species. That is the honest state of the feature: the rule is
+# enforced and tested, and no shipped content exercises it yet.
+
+
+def _peaceful_rat_beside_the_player(state: GameState):
+    """A rat that has been made non-hostile, standing immediately east."""
+    data = dataclasses.replace(SPECIES_DATA[Species.RAT], hostile=False)
+    npc = NPC(
+        actor_id=99,
+        species=Species.RAT,
+        actor=Actor(data.stats, derive(data.stats).max_hp),
+        position=(state.player[0] + 1, state.player[1]),
+    )
+    return dataclasses.replace(state, npcs=(npc,)), data
+
+
+def test_bumping_a_hostile_attacks_it() -> None:
+    state, _ = _with_adjacent_rat(new_game(1234))
+    after = step(state, Command(CommandKind.MOVE, 1, 0))
+    assert after.turns == state.turns + 1
+    assert after.player == state.player
+    assert {e.kind for e in after.events} & {
+        EventKind.PLAYER_HIT_NPC,
+        EventKind.PLAYER_MISSED_NPC,
+        EventKind.NPC_KILLED,
+    }
+
+
+def test_bumping_a_non_hostile_does_nothing_at_all(monkeypatch) -> None:
+    # Killing something harmless must be a decision, never a mistyped direction.
+    state, data = _peaceful_rat_beside_the_player(new_game(1234))
+    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
+    before_hp = state.npcs[0].actor.hp
+    after = step(state, Command(CommandKind.MOVE, 1, 0))
+    assert after.turns == state.turns, "a refused bump costs no turn"
+    assert after.player == state.player, "and does not move the player"
+    assert after.npcs[0].actor.hp == before_hp, "and does no damage"
+    assert after.events == state.events, "and leaves the message alone"
+
+
+def test_bumping_a_non_hostile_does_not_tick_the_world(monkeypatch) -> None:
+    # It is a blocked move, so v1's headline rule applies in full.
+    state, data = _peaceful_rat_beside_the_player(new_game(1234))
+    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
+    after = step(state, Command(CommandKind.MOVE, 1, 0))
+    assert [(n.position, n.energy) for n in after.npcs] == [
+        (n.position, n.energy) for n in state.npcs
+    ]
+    assert after.player_actor.actor.hp == state.player_actor.actor.hp
+
+
+def test_an_explicit_attack_still_hits_a_non_hostile(monkeypatch) -> None:
+    # Bumping refuses, so this is the only way to pick a fight -- which is the
+    # whole reason the explicit attack has to ignore hostility.
+    state, data = _peaceful_rat_beside_the_player(new_game(1234))
+    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
+    after = step(step(state, ATTACK), Command(CommandKind.MOVE, 1, 0))
+    assert after.turns == state.turns + 1
+    assert {e.kind for e in after.events} & {
+        EventKind.PLAYER_HIT_NPC,
+        EventKind.PLAYER_MISSED_NPC,
+        EventKind.NPC_KILLED,
+    }
+
+
+def test_every_shipped_species_is_hostile() -> None:
+    # The non-hostile path is a tested seam with no live content, exactly as
+    # `interruption` shipped in v4. Recorded so the gap is a choice, not a surprise.
+    assert all(data.hostile for data in SPECIES_DATA.values())
