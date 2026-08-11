@@ -81,6 +81,8 @@ from roguelike.game import (
     run,
     step,
     xp_to_next,
+    xp_for_kill,
+    NPC_XP_DIVISOR,
 )
 from roguelike.items import DAGGER, SHORTBOW
 from roguelike.keys import QUIT_COMMAND, Command, CommandKind, translate_key
@@ -2530,6 +2532,8 @@ def test_public_surface_is_exactly_the_contract_surface() -> None:
         "advance_npcs",
         "level_up",
         "xp_to_next",
+        "xp_for_kill",
+        "NPC_XP_DIVISOR",
         "interruption",
         "help_lines",
         "help_page_count",
@@ -5649,27 +5653,19 @@ def test_bumping_a_hostile_attacks_it() -> None:
     }
 
 
-def test_bumping_a_non_hostile_does_nothing_at_all(monkeypatch) -> None:
+def test_bumping_a_non_hostile_never_attacks_it(monkeypatch) -> None:
     # Killing something harmless must be a decision, never a mistyped direction.
+    # The bump swaps places instead; only `a` + direction can hurt it.
     state, data = _peaceful_rat_beside_the_player(new_game(1234))
     monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
     before_hp = state.npcs[0].actor.hp
     after = step(state, Command(CommandKind.MOVE, 1, 0))
-    assert after.turns == state.turns, "a refused bump costs no turn"
-    assert after.player == state.player, "and does not move the player"
-    assert after.npcs[0].actor.hp == before_hp, "and does no damage"
-    assert after.events == state.events, "and leaves the message alone"
-
-
-def test_bumping_a_non_hostile_does_not_tick_the_world(monkeypatch) -> None:
-    # It is a blocked move, so v1's headline rule applies in full.
-    state, data = _peaceful_rat_beside_the_player(new_game(1234))
-    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
-    after = step(state, Command(CommandKind.MOVE, 1, 0))
-    assert [(n.position, n.energy) for n in after.npcs] == [
-        (n.position, n.energy) for n in state.npcs
-    ]
-    assert after.player_actor.actor.hp == state.player_actor.actor.hp
+    assert after.npcs[0].actor.hp == before_hp, "a bump must do no damage"
+    assert not {e.kind for e in after.events} & {
+        EventKind.PLAYER_HIT_NPC,
+        EventKind.PLAYER_MISSED_NPC,
+        EventKind.NPC_KILLED,
+    }
 
 
 def test_an_explicit_attack_still_hits_a_non_hostile(monkeypatch) -> None:
@@ -5690,3 +5686,119 @@ def test_every_shipped_species_is_hostile() -> None:
     # The non-hostile path is a tested seam with no live content, exactly as
     # `interruption` shipped in v4. Recorded so the gap is a choice, not a surprise.
     assert all(data.hostile for data in SPECIES_DATA.values())
+
+
+# --- Swapping places with a peaceful creature --------------------------------
+#
+# Without this a harmless animal in a one-cell corridor is an impassable wall
+# that can only be removed by killing it, and any route planned through its
+# square fails for a reason the player can neither see nor fix.
+
+
+def test_walking_into_a_non_hostile_swaps_places(monkeypatch) -> None:
+    state, data = _peaceful_rat_beside_the_player(new_game(1234))
+    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
+    rat_was = state.npcs[0].position
+    player_was = state.player
+
+    after = step(state, Command(CommandKind.MOVE, 1, 0))
+
+    # The player takes the creature's square. The creature is moved to the square the
+    # player left -- though the world ticks immediately afterwards, so a wandering
+    # animal may already have stepped off it again; what matters is that it is no
+    # longer in the player's way and that nobody is standing on anybody.
+    assert after.player == rat_was
+    assert after.npcs[0].position != rat_was
+    assert after.turns == state.turns + 1, "a swap is a move, and costs a move's turn"
+    assert EventKind.SWAPPED_PLACES in {e.kind for e in after.events}
+    assert player_was is not None
+
+
+def test_a_swap_harms_nobody(monkeypatch) -> None:
+    state, data = _peaceful_rat_beside_the_player(new_game(1234))
+    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
+    after = step(state, Command(CommandKind.MOVE, 1, 0))
+    assert after.npcs[0].actor.hp == state.npcs[0].actor.hp
+    assert after.player_actor.actor.hp == state.player_actor.actor.hp
+
+
+def test_a_swap_leaves_no_two_actors_on_one_cell(monkeypatch) -> None:
+    state, data = _peaceful_rat_beside_the_player(new_game(1234))
+    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
+    after = step(state, Command(CommandKind.MOVE, 1, 0))
+    occupied = [after.player] + [npc.position for npc in after.npcs]
+    assert len(occupied) == len(set(occupied))
+
+
+def test_a_swap_recomputes_field_of_view_from_the_new_cell(monkeypatch) -> None:
+    state, data = _peaceful_rat_beside_the_player(new_game(1234))
+    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
+    after = step(state, Command(CommandKind.MOVE, 1, 0))
+    assert after.player in after.visible
+
+
+def test_a_hostile_is_attacked_and_never_swapped_with() -> None:
+    state, _ = _with_adjacent_rat(new_game(1234))
+    after = step(state, Command(CommandKind.MOVE, 1, 0))
+    assert after.player == state.player, "the player must not move onto a hostile"
+    assert EventKind.SWAPPED_PLACES not in {e.kind for e in after.events}
+
+
+def test_a_peaceful_creature_never_attacks(monkeypatch) -> None:
+    # Hostility governs the mind as well as the bump rule: a creature the player
+    # is allowed to walk through must not be biting them from behind.
+    state, data = _peaceful_rat_beside_the_player(new_game(1234))
+    monkeypatch.setitem(SPECIES_DATA, Species.RAT, data)
+    hp = state.player_actor.actor.hp
+    for _ in range(12):
+        state = step(state, Command(CommandKind.MOVE, 1, 0))
+        state = step(state, Command(CommandKind.MOVE, -1, 0))
+    assert state.player_actor.actor.hp == hp
+
+
+# --- Experience: who gets it, and how much -----------------------------------
+
+
+def test_the_player_takes_the_full_value_of_a_kill() -> None:
+    assert xp_for_kill(10, True) == 10
+    assert xp_for_kill(5, True) == 5
+
+
+def test_a_monster_takes_half_of_a_kill_floored() -> None:
+    # Halved so that monster-versus-monster fighting, when it arrives, cannot
+    # quietly breed a champion that out-levels the player by farming neighbours.
+    assert NPC_XP_DIVISOR == 2
+    assert xp_for_kill(10, False) == 5
+    assert xp_for_kill(5, False) == 2
+    assert xp_for_kill(1, False) == 0
+    for value in (0, 1, 5, 8, 10, 12, 99):
+        assert xp_for_kill(value, False) <= xp_for_kill(value, True)
+
+
+def test_xp_for_kill_is_never_negative() -> None:
+    for value in (-10, -1, 0):
+        assert xp_for_kill(value, True) >= 0
+        assert xp_for_kill(value, False) >= 0
+
+
+def test_a_monster_hitting_the_player_awards_experience_to_nobody() -> None:
+    # A monster has no experience and no level to raise -- the rule is enforced by
+    # the absence of the field, which is the strongest form it can take. What is
+    # checked here is the other half: the player gains nothing from being hit.
+    state, _ = _with_adjacent_rat(new_game(1234))
+    xp_before = state.player_actor.xp
+    level_before = state.player_actor.level
+    # Let the rat attack for several ticks without the player striking back.
+    for _ in range(6):
+        state = step(state, Command(CommandKind.MOVE, -1, 0))
+        if not state.running:
+            break
+    assert state.player_actor.xp == xp_before
+    assert state.player_actor.level == level_before
+
+
+def test_a_monster_carries_no_experience_or_level_field() -> None:
+    # Monster-versus-monster fighting does not exist yet. Recorded so the gap is a
+    # choice: when it arrives, `xp_for_kill(..., False)` is already the rate.
+    fields = {f.name for f in dataclasses.fields(NPC)}
+    assert fields.isdisjoint({"xp", "level"})

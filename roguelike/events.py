@@ -61,6 +61,7 @@ class EventKind(Enum):
     SPOTTED_HOSTILE = auto()
     ATTACK_WHICH_WAY = auto()
     ATTACKED_NOTHING = auto()
+    SWAPPED_PLACES = auto()
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,7 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.SPOTTED_HOSTILE: "A {name} comes into view!",
     EventKind.ATTACK_WHICH_WAY: "Attack in which direction?",
     EventKind.ATTACKED_NOTHING: "You swing at thin air.",
+    EventKind.SWAPPED_PLACES: "You swap places with the {name}.",
 }
 
 

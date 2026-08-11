@@ -171,6 +171,8 @@ __all__ = [
     "advance_npcs",
     "level_up",
     "xp_to_next",
+    "xp_for_kill",
+    "NPC_XP_DIVISOR",
     "interruption",
     "help_lines",
     "help_page_count",
@@ -995,7 +997,10 @@ def _player_attack(
         if result.killed:
             npcs = tuple(npc for npc in state.npcs if npc is not target)
             emitted.append((Event(EventKind.NPC_KILLED, name=name), cell))
-            player = replace(player, xp=player.xp + SPECIES_DATA[target.species].xp_value)
+            player = replace(
+                player,
+                xp=player.xp + xp_for_kill(SPECIES_DATA[target.species].xp_value, True),
+            )
         else:
             npcs = tuple(
                 replace(npc, actor=replace(npc.actor, hp=result.defender_hp))
@@ -1080,6 +1085,32 @@ def _fire(state: GameState) -> GameState:
     return replace(after, projectile=tuple(line_cells(state.player, cell)))
 
 
+#: Experience a **monster** keeps from a kill, as a fraction of the victim's value:
+#: one half, floored. Monster-versus-monster fighting does not exist yet, so today this
+#: only ever divides in tests — but the rate is fixed here so that when such fights
+#: arrive they cannot quietly breed a champion that out-levels the player by farming its
+#: neighbours. The player always takes the full value.
+NPC_XP_DIVISOR: int = 2
+
+
+def xp_for_kill(xp_value: int, killer_is_player: bool) -> int:
+    """Experience awarded for a kill, by who landed it (integer, never negative).
+
+    The player takes the victim's full ``xp_value``. A monster takes **half, floored** —
+    ``NPC_XP_DIVISOR`` — which keeps a long-lived monster from levelling as fast as the
+    player would by killing the same things.
+
+    **Fighting the player awards a monster nothing at all**, and not by arithmetic: a
+    monster has no experience and no level to raise, so there is no field for this
+    function to feed. The rule is enforced by the absence, which is the strongest form
+    it can take; :func:`_npc_attacks_player` credits nobody, and a test asserts that the
+    player's own experience is likewise untouched when a monster hits them.
+    """
+    if killer_is_player:
+        return max(0, xp_value)
+    return max(0, xp_value) // NPC_XP_DIVISOR
+
+
 def _is_hostile_at(state: GameState, cell: Coord) -> bool:
     """Is the monster standing on ``cell`` hostile? ``False`` if nothing is there.
 
@@ -1090,6 +1121,38 @@ def _is_hostile_at(state: GameState, cell: Coord) -> bool:
         if npc.position == cell:
             return SPECIES_DATA[npc.species].hostile
     return False
+
+
+def _swap_with(state: GameState, cell: Coord) -> GameState:
+    """Exchange places with the peaceful creature standing on ``cell``.
+
+    Only ever reached for a **non-hostile** monster (hostiles are attacked instead), so
+    this is not a way to shove an enemy aside. It exists so a harmless animal is not an
+    impassable obstacle: in a one-cell corridor there is otherwise no way past it, and a
+    route planned through its square fails for a reason the player cannot see or fix.
+
+    Costs one turn — it is a move, and the world ticks accordingly. Field of view is
+    recomputed from the player's new cell by :func:`_take_turn`, exactly as for any step.
+
+    The monster is moved to the square the player just left, so no two actors ever share
+    a cell and the occupancy invariant holds throughout.
+    """
+    swapped = tuple(
+        replace(npc, position=state.player) if npc.position == cell else npc
+        for npc in state.npcs
+    )
+    name = next(
+        (SPECIES_DATA[npc.species].name for npc in state.npcs if npc.position == cell),
+        None,
+    )
+    moved = replace(state, npcs=swapped)
+    return _take_turn(
+        moved,
+        cell,
+        state.open_doors,
+        (Event(EventKind.SWAPPED_PLACES, name=name),)
+        + _stair_events(state.level, cell),
+    )
 
 
 def _attack_towards(state: GameState, dx: int, dy: int) -> GameState:
@@ -1331,7 +1394,8 @@ def advance_npcs(state: GameState) -> GameState:
             # the same path a killing blow does.
             emitted.append((Event(EventKind.NPC_KILLED, name=_species_name(npc)), npc.position))
             player = replace(
-                player, xp=player.xp + SPECIES_DATA[npc.species].xp_value
+                player,
+                xp=player.xp + xp_for_kill(SPECIES_DATA[npc.species].xp_value, True),
             )
             continue
         npcs.append(replace(npc, actor=npc_actor))
@@ -1604,11 +1668,9 @@ def step(state: GameState, command: Command) -> GameState:
             _occupied(state),
         )
         if result.blocked_by_npc is not None:
-            # Bumping attacks a hostile and only a hostile. Walking into a peaceful
-            # creature is a blocked move, exactly like walking into a wall: nothing
-            # happens, no turn is spent, and the message on screen survives. Killing
-            # something harmless must be a decision, not a mistyped direction — so the
-            # explicit attack (`a` + direction) still hits it, and that is the only way.
+            # Bumping attacks a hostile and only a hostile. Killing something harmless
+            # must be a decision, not a mistyped direction — the explicit attack
+            # (`a` + direction) still hits a peaceful creature, and is the only way.
             if _is_hostile_at(state, result.blocked_by_npc):
                 return _tick_world(
                     state,
@@ -1616,7 +1678,11 @@ def step(state: GameState, command: Command) -> GameState:
                         state, result.blocked_by_npc, state.player_actor.melee, True
                     ),
                 )
-            return state
+            # Walking into a peaceful creature **swaps places with it**. Without this a
+            # harmless animal standing in a corridor is an impassable wall that cannot
+            # be removed except by murdering it, and any route planned through its cell
+            # silently fails. Swapping costs the ordinary turn a move costs.
+            return _tick_world(state, _swap_with(state, result.blocked_by_npc))
         if result.moved:
             return _tick_world(
                 state,

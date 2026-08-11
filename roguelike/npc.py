@@ -273,6 +273,10 @@ def plan_action(
 ) -> NpcAction:
     """Decide what ``npc`` intends to do this action (CONTRACT-v5 §24.2).
 
+    **A non-hostile species always wanders**, whatever its ``ai_state`` says, and can
+    therefore never return ``ATTACK``. Hostility governs the mind as well as the bump
+    rule: a creature the player is allowed to walk through must not be biting them.
+
     **HUNTING** — Chebyshev distance 1 from the player gives ``ATTACK`` with
     ``target=player``, from all eight adjacent cells including the diagonals; ``game.py``
     turns that into a melee resolution. Otherwise :func:`roguelike.pathfind.find_path`
@@ -318,6 +322,12 @@ def plan_action(
     Returns:
         A fresh :class:`NpcAction`. Never ``None``, and never raises.
     """
+    # A peaceful creature never hunts and never attacks, whatever state it is carrying.
+    # Hostility governs the mind as well as the bump: a species the player may walk
+    # through must not be biting them from behind.
+    if not SPECIES_DATA[npc.species].hostile:
+        return _wander(rng, npc, level, open_doors, occupied)
+
     if npc.ai_state is AiState.HUNTING:
         return _hunt(npc, level, open_doors, occupied, player)
 

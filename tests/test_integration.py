@@ -35,6 +35,8 @@ import pytest
 from roguelike import activity, dungeon, events, pathfind, world
 from roguelike.events import EventKind
 from roguelike.fov import compute_visible
+import dataclasses
+
 from roguelike.game import (
     GameState,
     advance,
@@ -64,6 +66,22 @@ WALK_KEYS = "jjllkkhhyubn55nnbbjjllll"
 # --------------------------------------------------------------------------
 # Helpers — written here, independent of any module under test
 # --------------------------------------------------------------------------
+
+
+def quiet_game(seed: int, *size: int):
+    """A new game with the level emptied of monsters.
+
+    Most of this suite checks properties that predate monsters entirely — turn
+    accounting, stair alignment, whether a planned route is walkable, whether
+    auto-explore reaches everything. Monsters interfere with all of them for good
+    reasons (a bump is a turn, a hostile blocks a corridor, sighting one stops an
+    activity), and those behaviours have their own tests in ``tests/test_game.py``.
+
+    Emptying the level isolates the v1–v4 invariant under test instead of deleting
+    it. Where the interaction with monsters is the point, the test says so and does
+    not use this helper.
+    """
+    return dataclasses.replace(new_game(seed, *size), npcs=())
 
 
 def walkable_cells(level: Level) -> set[tuple[int, int]]:
@@ -124,9 +142,17 @@ def route_to(state: GameState, target: tuple[int, int]) -> GameState | None:
 
 
 def descend_once(state: GameState) -> GameState:
-    at_stair = route_to(state, state.level.stairs_down[0])
+    """Walk to the down-staircase and take it, on a level cleared of monsters.
+
+    Descending generates the next level, which spawns its own monsters, so the
+    clearing has to happen again on arrival — otherwise the walk on the level
+    below runs into them. These tests are about stair alignment and terrain, not
+    about fighting; the monster interactions have their own tests elsewhere.
+    """
+    quiet = dataclasses.replace(state, npcs=())
+    at_stair = route_to(quiet, quiet.level.stairs_down[0])
     assert at_stair is not None, "the down-staircase was unreachable"
-    return step(at_stair, DESCEND)
+    return dataclasses.replace(step(at_stair, DESCEND), npcs=())
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +298,7 @@ def test_a_scripted_walk_never_enters_a_wall_or_leaves_the_map(seed: int) -> Non
 
 @pytest.mark.parametrize("seed", SEEDS)
 def test_turns_count_only_actions_that_cost_one(seed: int) -> None:
-    state = new_game(seed, *SMALL)
+    state = quiet_game(seed, *SMALL)
     accepted = opened = 0
     for key in WALK_KEYS * 3:
         before = state
@@ -327,7 +353,7 @@ def test_visible_agrees_with_a_direct_fov_call() -> None:
 
 @pytest.mark.parametrize("seed", (1234, 7, 42))
 def test_descending_keeps_the_player_put_and_lines_the_stairs_up(seed: int) -> None:
-    state = new_game(seed, *SMALL)
+    state = quiet_game(seed, *SMALL)
     at_stair = route_to(state, state.level.stairs_down[0])
     assert at_stair is not None
     assert [e.kind for e in at_stair.events] == [EventKind.STAIRS_HERE_DOWN], (
@@ -347,7 +373,7 @@ def test_descending_keeps_the_player_put_and_lines_the_stairs_up(seed: int) -> N
 
 @pytest.mark.parametrize("seed", (1234, 7))
 def test_a_three_level_descent_stays_walkable_all_the_way_down(seed: int) -> None:
-    state = new_game(seed, *SMALL)
+    state = quiet_game(seed, *SMALL)
     seen_depths = [state.depth]
     for _ in range(2):
         state = descend_once(state)
@@ -359,7 +385,7 @@ def test_a_three_level_descent_stays_walkable_all_the_way_down(seed: int) -> Non
 
 def test_fog_and_doors_survive_a_round_trip() -> None:
     """The single most important v3 behaviour: climbing back must not reset the map."""
-    state = new_game(1234, *SMALL)
+    state = quiet_game(1234, *SMALL)
     below = descend_once(state)
     upper_level = below.saved[1].level
     upper_explored = below.saved[1].explored
@@ -461,7 +487,10 @@ def test_the_status_row_carries_the_level_and_seed() -> None:
             state.open_doors, chrome_for(state),
         )
     )
-    assert lines[0].strip() == "", "the stats row is reserved and blank"
+    # The stats row is no longer reserved-and-blank: it carries the character's
+    # vitals now. What this test is named for -- the status row carrying level and
+    # seed -- is unchanged, and is the assertion worth keeping.
+    assert lines[0].startswith("HP ")
     assert lines[-1].rstrip().endswith("Level 1  Seed 1234")
 
 
@@ -682,7 +711,7 @@ def test_a_planned_route_is_actually_walkable_by_the_real_engine(seed: int) -> N
     one opens it — so a door costs a turn without moving, and the same step is
     then retried. That is exactly what the activity layer does.
     """
-    state = new_game(seed, *SMALL)
+    state = quiet_game(seed, *SMALL)
     level = state.level
     walked = state
 
@@ -723,7 +752,7 @@ def run_activity(state: GameState, cap: int = 4000) -> tuple[GameState, int]:
 
 @pytest.mark.parametrize("seed", (1234, 7, 42))
 def test_auto_explore_reveals_the_level_and_then_stops(seed: int) -> None:
-    state = new_game(seed, *SMALL)
+    state = quiet_game(seed, *SMALL)
     started = step(state, translate_key("E"))
     assert started.activity is not None
     assert started.turns == state.turns, "starting an activity costs no turn"
@@ -780,7 +809,7 @@ def test_the_frontier_never_depends_on_unexplored_ground(seed: int) -> None:
 
 
 def test_pressing_descend_off_the_stairs_travels_to_a_known_staircase() -> None:
-    explored = step(new_game(1234, *SMALL), translate_key("E"))
+    explored = step(quiet_game(1234, *SMALL), translate_key("E"))
     explored, _ = run_activity(explored)
     assert explored.player != explored.level.stairs_down[0]
 
@@ -856,7 +885,7 @@ def test_any_command_clears_a_running_activity() -> None:
 
 
 def test_an_activity_does_not_survive_a_level_change() -> None:
-    explored, _ = run_activity(step(new_game(1234, *SMALL), translate_key("E")))
+    explored, _ = run_activity(step(quiet_game(1234, *SMALL), translate_key("E")))
     at_stair = route_to(explored, explored.level.stairs_down[0])
     assert at_stair is not None
     travelling = step(at_stair, translate_key("E"))

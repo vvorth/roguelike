@@ -55,13 +55,14 @@ EXPECTED_MESSAGES = {
     EventKind.SPOTTED_HOSTILE: "A {name} comes into view!",
     EventKind.ATTACK_WHICH_WAY: "Attack in which direction?",
     EventKind.ATTACKED_NOTHING: "You swing at thin air.",
+    EventKind.SWAPPED_PLACES: "You swap places with the {name}.",
 }
 
 
 # --- EventKind shape ----------------------------------------------------------
 
 
-def test_event_kind_has_exactly_thirty_members() -> None:
+def test_event_kind_has_exactly_thirty_one_members() -> None:
     # The eight from v3, the eight from v4 (CONTRACT-v4 §16), plus the twelve
     # new v5 combat/death/levelling/poison/targeting kinds (CONTRACT-v5 §16),
     # in declaration order.
@@ -96,15 +97,16 @@ def test_event_kind_has_exactly_thirty_members() -> None:
         "SPOTTED_HOSTILE",
         "ATTACK_WHICH_WAY",
         "ATTACKED_NOTHING",
+        "SWAPPED_PLACES",
     ]
 
 
-def test_event_kind_has_exactly_thirty_members_by_len() -> None:
-    assert len(list(EventKind)) == 30
+def test_event_kind_has_exactly_thirty_one_members_by_len() -> None:
+    assert len(list(EventKind)) == 31
 
 
 def test_event_kind_uses_auto_values() -> None:
-    assert [member.value for member in EventKind] == list(range(1, 31))
+    assert [member.value for member in EventKind] == list(range(1, 32))
 
 
 # --- MESSAGES: complete and exact --------------------------------------------
@@ -120,8 +122,8 @@ def test_messages_has_no_extra_entries() -> None:
     assert set(MESSAGES) == set(EventKind)
 
 
-def test_messages_has_exactly_thirty_entries() -> None:
-    assert len(MESSAGES) == 30
+def test_messages_has_exactly_thirty_one_entries() -> None:
+    assert len(MESSAGES) == 31
 
 
 @pytest.mark.parametrize("kind", list(EventKind))
