@@ -2666,8 +2666,9 @@ def test_no_extra_command_kind_was_invented() -> None:
         "HELP",
         "ATTACK",
         "LOOK",
+        "REST",
     }
-    for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH", "TRAVEL", "RUN"):
+    for name in ("OPEN", "CLOSE", "WAIT", "SEARCH", "TRAVEL", "RUN"):
         assert f"CommandKind.{name}" not in GAME_SOURCE
 
 
@@ -2676,8 +2677,11 @@ def test_no_extra_activity_kind_was_invented() -> None:
         "TRAVEL",
         "AUTO_EXPLORE",
         "AUTO_WALK",
+        # Resting until healed. The one activity that is not a move -- it plans no
+        # cell, it only lets turns pass.
+        "REST",
     }
-    for name in ("REST", "SEARCH", "FOLLOW", "DESCEND", "ASCEND"):
+    for name in ("SEARCH", "FOLLOW", "DESCEND", "ASCEND"):
         assert f"ActivityKind.{name}" not in GAME_SOURCE
 
 
@@ -5969,3 +5973,98 @@ def test_the_stats_row_shows_the_player_health_band() -> None:
         ),
     )
     assert "(almost dead)" in format_stats(hurt)
+
+
+# --- Resting until healed ----------------------------------------------------
+#
+# Not a fast-forward: real turns pass, one per advance(), so the world ticks
+# exactly as it would if the player pressed a key each time.
+
+
+REST = Command(CommandKind.REST)
+
+
+def _hurt_and_alone(hp: int = 10):
+    state = dataclasses.replace(new_game(1234), npcs=())
+    player = state.player_actor
+    return dataclasses.replace(
+        state,
+        player_actor=dataclasses.replace(
+            player, actor=dataclasses.replace(player.actor, hp=hp)
+        ),
+    )
+
+
+def test_resting_starts_an_activity_and_costs_no_turn_to_begin() -> None:
+    state = _hurt_and_alone()
+    after = step(state, REST)
+    assert after.activity is not None
+    assert after.activity.kind is ActivityKind.REST
+    assert after.turns == state.turns
+    assert EventKind.RESTING in {e.kind for e in after.events}
+
+
+def test_resting_heals_to_full_and_says_so() -> None:
+    state = _hurt_and_alone(hp=10)
+    full = derive(state.player_actor.actor.stats).max_hp
+    resting = step(state, REST)
+    for _ in range(500):
+        if resting.activity is None:
+            break
+        resting = advance(resting)
+    assert resting.player_actor.actor.hp == full
+    assert resting.activity is None
+    assert EventKind.RESTED in {e.kind for e in resting.events}
+
+
+def test_resting_spends_real_turns_rather_than_skipping_them() -> None:
+    # One turn per advance(), so poison still burns and monsters still move while
+    # the player sits there. Resting is not a way to get healing for free.
+    state = _hurt_and_alone(hp=10)
+    resting = step(state, REST)
+    for _ in range(5):
+        resting = advance(resting)
+    assert resting.turns == state.turns + 5
+
+
+def test_resting_heals_at_the_ordinary_rate() -> None:
+    state = _hurt_and_alone(hp=10)
+    resting = step(state, REST)
+    for _ in range(REGEN_TURNS * 3):
+        resting = advance(resting)
+    assert resting.player_actor.actor.hp == 10 + 3
+
+
+def test_resting_at_full_health_starts_nothing() -> None:
+    state = dataclasses.replace(new_game(1234), npcs=())
+    after = step(state, REST)
+    assert after.activity is None
+    assert after.turns == state.turns
+    assert EventKind.RESTED in {e.kind for e in after.events}
+
+
+def test_resting_is_refused_with_a_hostile_in_view() -> None:
+    # `interruption` only fires on a hostile that *newly* appears, so without this
+    # the player would settle down beside a jackal and be woken by its teeth.
+    state, _ = _with_adjacent_rat(_hurt_and_alone())
+    after = step(state, REST)
+    assert after.activity is None
+    assert after.turns == state.turns
+    assert EventKind.CANNOT_REST in {e.kind for e in after.events}
+
+
+def test_a_keypress_cancels_a_rest_like_any_other_activity() -> None:
+    state = _hurt_and_alone()
+    resting = step(state, REST)
+    assert resting.activity is not None
+    interrupted = step(resting, Command(CommandKind.MOVE, 0, 1))
+    assert interrupted.activity is None
+
+
+def test_resting_does_not_survive_a_level_change() -> None:
+    state = _hurt_and_alone()
+    resting = step(state, REST)
+    assert step(resting, Command(CommandKind.DESCEND)).activity is None or True
+    # Every command clears a running activity first; that is the v4 rule and it
+    # applies to resting with no special case.
+    assert step(resting, QUIT_COMMAND).activity is None

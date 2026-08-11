@@ -1114,6 +1114,14 @@ def xp_for_kill(xp_value: int, killer_is_player: bool) -> int:
     return max(0, xp_value) // NPC_XP_DIVISOR
 
 
+def _hostile_in_view(state: GameState) -> bool:
+    """Is any hostile monster currently visible? Used to refuse a rest."""
+    return any(
+        npc.position in state.visible and SPECIES_DATA[npc.species].hostile
+        for npc in state.npcs
+    )
+
+
 def _is_hostile_at(state: GameState, cell: Coord) -> bool:
     """Is the monster standing on ``cell`` hostile? ``False`` if nothing is there.
 
@@ -1746,6 +1754,22 @@ def step(state: GameState, command: Command) -> GameState:
     if command.kind is CommandKind.HELP:
         return replace(state, help_page=0)
 
+    if command.kind is CommandKind.REST:
+        # Refused outright with something already in view. `interruption` only fires on
+        # a hostile that *newly* appears, so without this the player would settle down
+        # beside a jackal and be woken by its teeth.
+        if _hostile_in_view(state):
+            return replace(state, events=(Event(EventKind.CANNOT_REST),))
+        if state.player_actor.actor.hp >= derive(
+            state.player_actor.actor.stats
+        ).max_hp:
+            return replace(state, events=(Event(EventKind.RESTED),))
+        return replace(
+            state,
+            activity=Activity(ActivityKind.REST),
+            events=(Event(EventKind.RESTING),),
+        )
+
     if command.kind is CommandKind.LOOK:
         return _look_at(state, state.player)
 
@@ -1935,6 +1959,12 @@ def advance(state: GameState) -> GameState:
     if activity is None or not state.running:
         return state
 
+    # Resting is the one activity that is not a move: there is no cell to plan, only a
+    # turn to let pass. It is handled before `_planned_step`, which exists to answer
+    # "which way?" and has nothing to say here.
+    if activity.kind is ActivityKind.REST:
+        return _rest_a_turn(state)
+
     target, stopped = _planned_step(state, activity)
     if target is None:
         return _finished(state, stopped)
@@ -1984,6 +2014,26 @@ def advance(state: GameState) -> GameState:
             events=_capped(after.events + (interrupted,)),
         )
     return after
+
+
+def _rest_a_turn(state: GameState) -> GameState:
+    """Let one turn pass while the player sits still, or stop because there is no need.
+
+    Resting is deliberately **not** a fast-forward: it takes real turns, one per call,
+    so the world ticks exactly as it would if the player pressed a key each time —
+    monsters move, poison burns, wounds close at the ordinary
+    :data:`roguelike.status.REGEN_TURNS` rate. Nothing is skipped and nothing is free.
+
+    It ends of its own accord at full health. Everything else that ends it — a hostile
+    coming into view, taking damage, being poisoned — is :func:`interruption`'s job, the
+    same seam that stops travel and auto-explore, so resting needed no stopping rules of
+    its own.
+    """
+    player = state.player_actor
+    if player.actor.hp >= derive(player.actor.stats).max_hp:
+        return _finished(state, EventKind.RESTED)
+    # A turn spent doing nothing at all: no move, no attack, just the clock.
+    return _tick_world(state, _take_turn(state, state.player, state.open_doors, ()))
 
 
 def interruption(before: GameState, after: GameState) -> Event | None:

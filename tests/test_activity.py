@@ -84,14 +84,14 @@ def planning_passable_for(level: Level, open_doors: frozenset = NO_DOORS) -> Pas
 # ==========================================================================
 
 
-def test_activity_kind_has_exactly_the_three_contract_members():
-    assert {k.name for k in ActivityKind} == {"TRAVEL", "AUTO_EXPLORE", "AUTO_WALK"}
+def test_activity_kind_has_exactly_the_four_contract_members():
+    assert {k.name for k in ActivityKind} == {"TRAVEL", "AUTO_EXPLORE", "AUTO_WALK", "REST"}
 
 
 def test_activity_kind_members_are_distinct_auto_values():
     values = [k.value for k in ActivityKind]
-    assert len(set(values)) == 3
-    assert sorted(values) == [1, 2, 3]  # auto() from 1, in declaration order
+    assert len(set(values)) == 4
+    assert sorted(values) == [1, 2, 3, 4]  # auto() from 1, in declaration order
 
 
 def test_activity_defaults_leave_every_optional_field_empty():

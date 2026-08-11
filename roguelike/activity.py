@@ -56,6 +56,7 @@ class ActivityKind(Enum):
     TRAVEL = auto()
     AUTO_EXPLORE = auto()
     AUTO_WALK = auto()
+    REST = auto()
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class Activity:
       ``came_from`` (the cell stepped from last turn, ``None`` on the first step).
     * ``AUTO_EXPLORE`` uses none of them: its goals are recomputed from ``explored``
       every turn.
+    * ``REST`` uses none of them either: it stands still until healed or interrupted.
 
     There is deliberately **no** ``path`` field. Routes are re-planned every turn — at a
     measured 0.235 ms per full-level search that is 0.2% of one turn's budget

@@ -180,7 +180,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_min=1,
         attack_max=3,
         xp_value=5,
-        flee_chance=15,
+        flee_chance=2,
     ),
     Species.JACKAL: SpeciesData(
         name="jackal",
@@ -189,7 +189,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_min=2,
         attack_max=4,
         xp_value=10,
-        flee_chance=35,
+        flee_chance=5,
     ),
     Species.GIANT_BAT: SpeciesData(
         name="giant bat",
@@ -198,7 +198,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_min=1,
         attack_max=2,
         xp_value=8,
-        flee_chance=30,
+        flee_chance=3,
     ),
     Species.CAVE_SNAKE: SpeciesData(
         name="cave snake",
@@ -208,7 +208,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_max=4,
         xp_value=12,
         poison_chance=30,
-        flee_chance=5,
+        flee_chance=1,
     ),
 }
 """The bestiary, one entry per :class:`Species` (CONTRACT-v5 §24.1).
@@ -450,8 +450,14 @@ def wants_to_flee(rng: "Random", npc: NPC, player: Actor) -> bool:
       :class:`~roguelike.stats.Condition` scale, so the comparison is one ``<``. A
       creature losing to someone equally close to death does not disengage.
     * **The roll succeeds**, at :attr:`SpeciesData.flee_chance` percent. Wit is what the
-      number encodes: a jackal disengages far more readily than a cave snake, which
-      barely does at all.
+      number encodes: a jackal disengages more readily than a cave snake, which barely
+      does at all.
+
+    **The percentages are small because the roll repeats.** It is made on *every* action
+    the creature spends badly hurt, so a per-action 35% is not a 35% chance of running —
+    measured over real fights it was 75%, which made fleeing the normal way a fight
+    ended. At the shipped rates a monster bolts from roughly 4-9% of fights: a thing
+    that happens, not a thing that is expected.
 
     **An enraged creature never flees**, whatever its condition — that is what
     :attr:`roguelike.status.StatusKind.ENRAGED` is for, and it is checked first so no

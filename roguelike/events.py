@@ -63,6 +63,9 @@ class EventKind(Enum):
     ATTACKED_NOTHING = auto()
     SWAPPED_PLACES = auto()
     LOOKING = auto()
+    RESTING = auto()
+    RESTED = auto()
+    CANNOT_REST = auto()
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,9 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.ATTACKED_NOTHING: "You swing at thin air.",
     EventKind.SWAPPED_PLACES: "You swap places with the {name}.",
     EventKind.LOOKING: "{name}  [direction] move  [x] done",
+    EventKind.RESTING: "You settle down to rest.",
+    EventKind.RESTED: "You feel rested.",
+    EventKind.CANNOT_REST: "Not with enemies in view.",
 }
 
 
