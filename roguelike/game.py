@@ -137,6 +137,7 @@ from roguelike.keys import HELP_ENTRIES, Command, CommandKind, translate_key
 from roguelike.level import Level
 from roguelike.movement import try_move
 from roguelike.npc import (
+    wants_to_flee,
     NPC,
     FORGET_TICKS,
     PERCEPTION_RADIUS,
@@ -178,6 +179,7 @@ __all__ = [
     "help_page_count",
     "help_page_lines",
     "format_help_status",
+    "describe_cell",
     "format_stats",
     "format_status_right",
     "run",
@@ -399,6 +401,7 @@ class GameState:
     targeting: Targeting | None = None
     help_page: int | None = None
     awaiting_attack: bool = False
+    look_cursor: Coord | None = None
     projectile: tuple[Coord, ...] = ()
 
 
@@ -1123,6 +1126,57 @@ def _is_hostile_at(state: GameState, cell: Coord) -> bool:
     return False
 
 
+def describe_cell(state: GameState, cell: Coord) -> str:
+    """What the look cursor reports about ``cell``. Never raises, never a turn.
+
+    The rules follow what the character can honestly know, which is the whole point of
+    the command — it must not become a map-and-monster oracle:
+
+    * **Never seen** — says so, and reveals nothing else.
+    * **Seen before but not now** — describes the *terrain* only, marked as remembered.
+      A monster is never reported from memory, for the same reason the renderer refuses
+      to draw one: it has moved.
+    * **In view** — the player, then a monster (with its health band), then terrain.
+      Whatever is standing there wins over the floor it stands on.
+
+    All wording comes from :mod:`roguelike.events`; this function composes none.
+    """
+    if cell not in state.explored:
+        return events.UNSEEN_DESCRIPTION
+
+    if cell not in state.visible:
+        tile = state.level.tile_at(*cell)
+        return events.REMEMBERED_PREFIX + events.describe_terrain(
+            tile.name, cell in state.open_doors
+        )
+
+    if cell == state.player:
+        return events.describe_player(state.player_actor.actor.condition.name)
+
+    for npc in state.npcs:
+        if npc.position == cell:
+            return events.describe_monster(
+                SPECIES_DATA[npc.species].name, npc.actor.condition.name
+            )
+
+    tile = state.level.tile_at(*cell)
+    return events.describe_terrain(tile.name, cell in state.open_doors)
+
+
+def _look_at(state: GameState, cell: Coord) -> GameState:
+    """Move the look cursor to ``cell`` and report what is there. **Never a turn.**
+
+    Looking is free and unlimited by design: it is the player reading the screen, and
+    charging a turn for that would make the information a resource rather than a
+    courtesy. The world does not tick, so nothing moves while you study it.
+    """
+    return replace(
+        state,
+        look_cursor=cell,
+        events=(Event(EventKind.LOOKING, name=describe_cell(state, cell)),),
+    )
+
+
 def _swap_with(state: GameState, cell: Coord) -> GameState:
     """Exchange places with the peaceful creature standing on ``cell``.
 
@@ -1226,7 +1280,12 @@ def _regenerate(player: Player) -> Player:
 
 
 def _perceive(
-    npc: NPC, level: Level, open_doors: frozenset[Coord], player: Coord
+    npc: NPC,
+    level: Level,
+    open_doors: frozenset[Coord],
+    player: Coord,
+    player_actor: Actor | None = None,
+    rng: "random.Random | None" = None,
 ) -> NPC:
     """Update one monster's mind before it acts (CONTRACT-v5 §24.2).
 
@@ -1240,7 +1299,10 @@ def _perceive(
     * wandering and it sees you — it starts hunting, with a fresh memory;
     * hunting and it sees you — the trail is fresh again, memory back to zero;
     * hunting and it does not — memory grows, and past
-      :data:`roguelike.npc.FORGET_TICKS` it gives up and goes back to wandering.
+      :data:`roguelike.npc.FORGET_TICKS` it gives up and goes back to wandering;
+    * badly hurt, watching a healthier player, and unlucky on
+      :func:`roguelike.npc.wants_to_flee` — it breaks off and runs. That is a one-way
+      door: monsters do not heal, so nothing sends a fleeing creature back to hunting.
 
     **Memory counts actions, not ticks**, which is the choice this project makes where
     ``npc.py`` is indifferent: a bat at speed 180 acts twice on some ticks and forgets
@@ -1249,6 +1311,22 @@ def _perceive(
     seen = _chebyshev(npc.position, player) <= PERCEPTION_RADIUS and fov.has_line_of_sight(
         level, open_doors, npc.position, player
     )
+
+    # A monster that is losing badly, and can see it is losing, may break off. Checked
+    # before anything else so a creature already running does not reconsider and a
+    # creature about to die does not spend its last action closing in. Fleeing is a
+    # one-way door: nothing here sends it back to hunting, because monsters do not heal.
+    if (
+        npc.ai_state is not AiState.FLEEING
+        and seen
+        and player_actor is not None
+        and rng is not None
+        and wants_to_flee(rng, npc, player_actor)
+    ):
+        return replace(npc, ai_state=AiState.FLEEING, memory=0)
+    if npc.ai_state is AiState.FLEEING:
+        return npc
+
     if npc.ai_state is AiState.WANDERING:
         if seen:
             return replace(npc, ai_state=AiState.HUNTING, memory=0)
@@ -1416,7 +1494,14 @@ def advance_npcs(state: GameState) -> GameState:
         energy = npc.energy + derive(npc.actor.stats).speed
         while energy >= ENERGY_THRESHOLD:
             energy -= ENERGY_THRESHOLD
-            npc = _perceive(npc, state.level, open_doors, state.player)
+            npc = _perceive(
+                npc,
+                state.level,
+                open_doors,
+                state.player,
+                player.actor,
+                wander_rng,
+            )
             action = plan_action(
                 wander_rng, npc, state.level, open_doors, occupied, state.player
             )
@@ -1593,6 +1678,19 @@ def step(state: GameState, command: Command) -> GameState:
     if state.help_page is not None:
         return _turn_help_page(state)
 
+    if state.look_cursor is not None:
+        if command.kind is CommandKind.MOVE:
+            x = state.look_cursor[0] + command.dx
+            y = state.look_cursor[1] + command.dy
+            if state.level.in_bounds(x, y):
+                return _look_at(state, (x, y))
+            # At the edge the cursor simply stays put and re-reports; nothing is
+            # gained by beeping at the player and nothing costs a turn either way.
+            return _look_at(state, state.look_cursor)
+        # Any other key closes the cursor. No turn, no action, and the message is
+        # cleared so the description does not linger over the restored map.
+        return replace(state, look_cursor=None, events=())
+
     if state.activity is not None:
         state = replace(state, activity=None)
 
@@ -1647,6 +1745,9 @@ def step(state: GameState, command: Command) -> GameState:
 
     if command.kind is CommandKind.HELP:
         return replace(state, help_page=0)
+
+    if command.kind is CommandKind.LOOK:
+        return _look_at(state, state.player)
 
     if command.kind is CommandKind.ATTACK:
         return replace(
@@ -2017,6 +2118,10 @@ def format_stats(state: GameState) -> str:
     there were none. There are now, so it is filled in: current and maximum hit points,
     character level, experience towards the next one, and the three primary stats.
 
+    The health band in brackets is the same five-word vocabulary a monster is described
+    with under the look cursor, so "am I worse off than that thing?" is a comparison of
+    two phrases from one scale rather than a guess.
+
     ``max_hp`` comes from :func:`roguelike.stats.derive`, like every other derived value in
     this project — there is no second HP formula here or anywhere. Two spaces between
     fields and one inside the stat block, as everywhere else. A plain ``str``; fitting it
@@ -2027,6 +2132,7 @@ def format_stats(state: GameState) -> str:
     derived = derive(stats)
     return (
         f"HP {player.actor.hp}/{derived.max_hp}"
+        f" ({events.CONDITION_WORDS[player.actor.condition.name]})"
         f"  Lv {player.level}"
         f"  XP {player.xp}/{xp_to_next(player.level)}"
         f"  Str {stats.str_} Agi {stats.agi} Vit {stats.vit}"
@@ -2075,9 +2181,24 @@ _BLOCKING: int = -1
 #: (CONTRACT-v4 §0.10).
 _PROJECTILE_FRAME_MS: int = 25
 
+#: How long the arrow rests on the square it struck before the frame is redrawn without
+#: it. A quarter of a second: long enough to see where the shot landed, short enough that
+#: nobody mistakes it for something lying on the floor. Without this the marker stayed on
+#: screen until the next keypress, which read as a persistent object that is not there.
+_IMPACT_HOLD_MS: int = 250
+
 
 def _target_cell(state: GameState) -> Coord | None:
-    """The cell the ranged cursor is on, or ``None``. The renderer reverses it."""
+    """The cell carrying the highlight, or ``None``. The renderer reverses it.
+
+    Two cursors share one highlight: the ranged-target cursor and the look cursor. They
+    are mutually exclusive by construction — look mode swallows every key, so no shot can
+    be lined up while it is open — so one field on the frame serves both and the renderer
+    needs to know about neither. Look wins if both are somehow set, since it is the one
+    the player is actively steering.
+    """
+    if state.look_cursor is not None:
+        return state.look_cursor
     if state.targeting is None:
         return None
     return state.targeting.targets[state.targeting.index]
@@ -2228,10 +2349,20 @@ def run(stdscr, state: GameState) -> GameState:
         # player's own square, where blanking the `@` for a frame would look like a bug.
         if state.projectile:
             stdscr.timeout(_PROJECTILE_FRAME_MS)
+            interrupted = False
             for cell in state.projectile[1:]:
                 render.draw(stdscr, _projectile_frame(state, cell))
                 if stdscr.getch() != _NO_KEY:
+                    interrupted = True
                     break
+            # Hold the impact briefly, then redraw the frame built above — the one
+            # without the arrow in it. The marker must not outlive the moment: nothing
+            # is lying on that square, and leaving it there until the next keypress
+            # says otherwise. A player who is already pressing keys skips the hold.
+            if not interrupted:
+                stdscr.timeout(_IMPACT_HOLD_MS)
+                stdscr.getch()
+            render.draw(stdscr, cells)
 
         if state.activity is not None:
             stdscr.timeout(_ACTIVITY_TICK_MS)

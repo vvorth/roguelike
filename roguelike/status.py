@@ -23,11 +23,16 @@ __all__ = [
 
 
 class StatusKind(Enum):
-    """The complete status-effect vocabulary (CONTRACT-v5 §22). Do not add members."""
+    """The status-effect vocabulary (CONTRACT-v5 §22)."""
 
     POISONED = auto()
+    ENRAGED = auto()
 
 
+#: An enraged creature never flees, however badly hurt it is (see
+#: :func:`roguelike.npc.plan_action`). Nothing applies it yet — it is the seam the
+#: "except when in some enraged state" rule needs, shipped called-and-tested with no
+#: live source, exactly as ``interruption`` shipped in v4.
 @dataclass(frozen=True)
 class StatusEffect:
     """One active status effect on an actor.
@@ -41,8 +46,17 @@ class StatusEffect:
     magnitude: int
 
 
-REGEN_TURNS: int = 10
+REGEN_TURNS: int = 3
 """The player regains 1 HP every ``REGEN_TURNS`` world-ticks (CONTRACT-v5 §22.4).
+
+**Was 10, corrected to 3.** RESEARCH-v5 §7 chose 10 from a simulation that turned out to
+have a bug in it: the sweep passed the HP multiplier for the player but let monsters keep
+the function's default, so it modelled monsters at ``5 + VIT*2`` while the shipped
+``stats.derive`` gives everything ``5 + VIT*4``. Re-run against the real values, the
+published "61.5% of floors cleared" was actually **2.2%** — the near-unplayable regime the
+whole research re-check existed to eliminate. At 3 it is **61.9%**, which is what the
+research intended all along. Monsters fleeing (added alongside) accounts for a few points
+of that on its own.
 
 Applying regeneration to the player is the caller's responsibility (``game.py``, out of scope
 for this module) — this module only carries the constant.

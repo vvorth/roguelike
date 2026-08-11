@@ -62,6 +62,7 @@ class EventKind(Enum):
     ATTACK_WHICH_WAY = auto()
     ATTACKED_NOTHING = auto()
     SWAPPED_PLACES = auto()
+    LOOKING = auto()
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,7 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.ATTACK_WHICH_WAY: "Attack in which direction?",
     EventKind.ATTACKED_NOTHING: "You swing at thin air.",
     EventKind.SWAPPED_PLACES: "You swap places with the {name}.",
+    EventKind.LOOKING: "{name}  [direction] move  [x] done",
 }
 
 
@@ -152,3 +154,57 @@ def message_for(events: Sequence[Event]) -> str:
             template.format(depth=event.depth, name=event.name, level=event.level)
         )
     return " ".join(words)
+
+
+# --- Look-mode vocabulary (the one place these words are written) ------------
+#
+# `describe_*` below build the sentence the look cursor shows. They live here
+# with the rest of the wording rather than in `game.py`, which composes no
+# English of its own.
+
+CONDITION_WORDS: dict[str, str] = {
+    "UNHURT": "unhurt",
+    "SCRATCHED": "lightly hurt",
+    "WOUNDED": "wounded",
+    "BADLY_WOUNDED": "badly wounded",
+    "NEAR_DEATH": "almost dead",
+}
+"""How a health band reads to a watching eye. Keyed by
+:class:`roguelike.stats.Condition` member *name*, so this module keeps importing
+nothing from the package."""
+
+TERRAIN_WORDS: dict[str, str] = {
+    "WALL": "a wall",
+    "FLOOR": "the floor",
+    "DOOR": "a door",
+    "STAIRS_UP": "a staircase leading up",
+    "STAIRS_DOWN": "a staircase leading down",
+}
+"""How a tile reads. Keyed by :class:`roguelike.tiles.Tile` member *name*, for the
+same reason."""
+
+
+def describe_monster(name: str, condition_name: str) -> str:
+    """``"a jackal, badly wounded"`` — what the cursor says over a creature."""
+    return f"a {name}, {CONDITION_WORDS[condition_name]}"
+
+
+def describe_player(condition_name: str) -> str:
+    """``"yourself, wounded"`` — the cursor over your own square."""
+    return f"yourself, {CONDITION_WORDS[condition_name]}"
+
+
+def describe_terrain(tile_name: str, door_is_open: bool = False) -> str:
+    """``"a door (open)"`` — what the cursor says over bare terrain."""
+    word = TERRAIN_WORDS[tile_name]
+    if tile_name == "DOOR":
+        return f"{word} ({'open' if door_is_open else 'closed'})"
+    return word
+
+
+UNSEEN_DESCRIPTION: str = "somewhere you have not seen"
+"""What the cursor says over a cell that has never been in view."""
+
+REMEMBERED_PREFIX: str = "remembered: "
+"""Marks a description of terrain recalled rather than currently seen, so the
+player is never told a monster is somewhere it merely used to be."""

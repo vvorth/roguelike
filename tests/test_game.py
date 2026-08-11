@@ -67,6 +67,7 @@ from roguelike.game import (
     Targeting,
     advance,
     advance_npcs,
+    describe_cell,
     format_help_status,
     format_stats,
     format_status_right,
@@ -436,6 +437,7 @@ STATE_FIELDS = (
     "targeting",
     "help_page",
     "awaiting_attack",
+    "look_cursor",
     "projectile",
 )
 
@@ -600,8 +602,9 @@ def test_gamestate_field_order_and_defaults() -> None:
     assert fields[17].default is None        # targeting
     assert fields[18].default is None        # help_page
     assert fields[19].default is False       # awaiting_attack
-    assert fields[20].default == ()          # projectile
-    assert len(fields) == 21
+    assert fields[20].default is None        # look_cursor
+    assert fields[21].default == ()          # projectile
+    assert len(fields) == 22
 
 
 def test_gamestate_constructs_positionally_with_defaults() -> None:
@@ -1722,7 +1725,7 @@ def test_format_stats_is_the_v5_layout() -> None:
     # CONTRACT-v5 §7.13, character for character, at the baseline the game starts from.
     assert (
         format_stats(start(room_level()))
-        == "HP 45/45  Lv 1  XP 0/25  Str 10 Agi 10 Vit 10"
+        == "HP 45/45 (unhurt)  Lv 1  XP 0/25  Str 10 Agi 10 Vit 10"
     )
     assert format_stats(new_game(1234, *SMALL)) == format_stats(start(room_level()))
 
@@ -1735,7 +1738,7 @@ def test_format_stats_shows_real_values_not_a_template() -> None:
             actor=Actor(stats=Stats(str_=12, agi=9, vit=13), hp=37), xp=17, level=3
         ),
     )
-    assert format_stats(state) == "HP 37/57  Lv 3  XP 17/225  Str 12 Agi 9 Vit 13"
+    assert format_stats(state) == "HP 37/57 (wounded)  Lv 3  XP 17/225  Str 12 Agi 9 Vit 13"
 
 
 def test_format_stats_uses_two_spaces_between_fields_and_one_inside_the_stat_block() -> None:
@@ -1752,7 +1755,9 @@ def test_format_stats_max_hp_comes_from_stats_derive_not_a_second_formula() -> N
             start(room_level()),
             player_actor=Player(actor=Actor(stats=Stats(10, 10, vit), hp=1)),
         )
-        assert f"/{derive(Stats(10, 10, vit)).max_hp}  Lv" in format_stats(state)
+        # The health band now sits between max HP and the level, so anchor on the
+        # bracket rather than the two spaces.
+        assert f"/{derive(Stats(10, 10, vit)).max_hp} (" in format_stats(state)
 
 
 def test_format_stats_tracks_damage_taken() -> None:
@@ -2329,8 +2334,8 @@ def test_the_loop_paces_with_timeout_and_nothing_else() -> None:
         and isinstance(child.func, ast.Attribute)
         and child.func.attr == "timeout"
     ]
-    assert len(timeouts) == 3, (
-        "one deadline for an activity, one for ordinary play, one per projectile frame"
+    assert len(timeouts) == 4, (
+        "an activity, ordinary play, a projectile frame, and the impact hold"
     )
     # And `timeout` is called nowhere else in the module — pacing is the loop's alone.
     assert (
@@ -2343,7 +2348,7 @@ def test_the_loop_paces_with_timeout_and_nothing_else() -> None:
                 and child.func.attr == "timeout"
             ]
         )
-        == 3
+        == 4
     )
 
 
@@ -2373,6 +2378,7 @@ def test_step_does_not_touch_the_renderer_or_curses() -> None:
         "_planned_step",
         "_finished",
         "new_game",
+        "describe_cell",
         "format_stats",
         "format_status_right",
     ):
@@ -2539,6 +2545,7 @@ def test_public_surface_is_exactly_the_contract_surface() -> None:
         "help_page_count",
         "help_page_lines",
         "format_help_status",
+        "describe_cell",
         "format_stats",
         "format_status_right",
         "run",
@@ -2658,6 +2665,7 @@ def test_no_extra_command_kind_was_invented() -> None:
         # The help screen, and an explicit directional attack. Still no WAIT.
         "HELP",
         "ATTACK",
+        "LOOK",
     }
     for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH", "TRAVEL", "RUN"):
         assert f"CommandKind.{name}" not in GAME_SOURCE
@@ -2781,7 +2789,7 @@ def test_run_lays_the_chrome_out_through_the_renderer() -> None:
     # padded to the full width by the renderer, exactly as the empty string was.
     stats_row = screen.row(0, 0, width)
     assert stats_row == format_stats(state).ljust(width)[:width]
-    assert stats_row.startswith("HP 45/45  Lv 1  XP 0/25")
+    assert stats_row.startswith("HP 45/45 (unhurt)  Lv 1  XP 0/25")
     status = screen.row(0, height + 1, width)
     assert status.endswith("Level 1  Seed 1234")
     assert status.strip() == "Level 1  Seed 1234", "no message yet"
@@ -4248,14 +4256,15 @@ def test_a_wounded_player_regenerates_on_a_level_with_nothing_alive_on_it() -> N
 
     Gating the whole tick on ``state.npcs`` froze healing the moment a floor was cleared —
     and most of a level's turns are walked after its monsters are dead. Regeneration is
-    what takes floor clears from 0.0% to 61.5% (RESEARCH-v5 §7), so freezing it there
-    silently restores the unplayable balance.
+    what takes floor clears from near zero to ~62%, so freezing it there silently
+    restores the unplayable balance.
     """
     empty = with_player(start(fight_level()), hp=10)
     assert empty.npcs == ()
-    for _ in range(40):
+    ticks = 40
+    for _ in range(ticks):
         empty = tick(empty)
-    assert empty.player_actor.actor.hp == 14
+    assert empty.player_actor.actor.hp == 10 + ticks // REGEN_TURNS
 
 
 def test_regeneration_does_not_depend_on_a_monster_being_alive() -> None:
@@ -4263,10 +4272,12 @@ def test_regeneration_does_not_depend_on_a_monster_being_alive() -> None:
     # level: the status phase is not gated on `state.npcs`.
     empty = with_player(start(fight_level()), hp=10)
     occupied = with_player(caged(), hp=10)
-    for _ in range(40):
+    ticks = 40
+    for _ in range(ticks):
         empty = tick(empty)
         occupied = tick(occupied)
-    assert empty.player_actor.actor.hp == occupied.player_actor.actor.hp == 14
+    assert empty.player_actor.actor.hp == 10 + ticks // REGEN_TURNS
+    assert empty.player_actor.actor.hp == occupied.player_actor.actor.hp
 
 
 def test_poison_burns_and_expires_on_a_level_with_nothing_alive_on_it() -> None:
@@ -4274,15 +4285,18 @@ def test_poison_burns_and_expires_on_a_level_with_nothing_alive_on_it() -> None:
         start(fight_level()), hp=40, effects=(StatusEffect(StatusKind.POISONED, 5, 2),)
     )
     assert state.npcs == ()
-    for expected_hp, expected_left in ((38, 4), (36, 3), (34, 2), (32, 1), (30, 0)):
+    # Regeneration runs on the same ticks, so the poison is tracked by its duration
+    # and by the net loss, not by an absolute HP per turn.
+    for expected_left in (4, 3, 2, 1, 0):
         state = tick(state)
-        assert state.player_actor.actor.hp == expected_hp
         assert EventKind.POISON_DAMAGE in {e.kind for e in state.events}
         effects = state.player_actor.actor.status_effects
         assert (effects[0].remaining_turns if effects else 0) == expected_left
     assert state.player_actor.actor.status_effects == (), "five turns, five burns"
+    burned = 40 - state.player_actor.actor.hp
+    assert 5 * 2 - (5 // REGEN_TURNS) - 1 <= burned <= 5 * 2
     after = tick(state)
-    assert after.player_actor.actor.hp == 30, "and then it is over"
+    assert after.player_actor.actor.hp >= state.player_actor.actor.hp, "and then it is over"
 
 
 def test_poison_can_kill_on_an_empty_level_through_the_same_death_path() -> None:
@@ -4435,6 +4449,10 @@ def test_a_new_game_is_populated_from_the_levels_own_seed(monsters) -> None:
 
 
 def test_poison_burns_once_per_tick_and_expires() -> None:
+    # Regeneration also runs on these ticks, so the poison is measured as a *drop
+    # per tick* rather than an absolute total: at REGEN_TURNS = 3 the player claws
+    # back a point on the third one, and hard-coding 38/36/34 would silently start
+    # testing the regen rate instead of the poison.
     state = caged()
     state = with_player(
         state, hp=40, effects=(StatusEffect(StatusKind.POISONED, 3, 2),)
@@ -4445,10 +4463,12 @@ def test_poison_burns_once_per_tick_and_expires() -> None:
     second = tick(first)
     assert second.player_actor.actor.hp == 36
     third = tick(second)
-    assert third.player_actor.actor.hp == 34
     assert third.player_actor.actor.status_effects == (), "three turns, three burns"
+    burned = 40 - third.player_actor.actor.hp
+    assert 4 <= burned <= 6, "three burns of 2, less whatever regeneration returned"
+    # With the poison gone the player only heals from here.
     fourth = tick(third)
-    assert fourth.player_actor.actor.hp == 34
+    assert fourth.player_actor.actor.hp >= third.player_actor.actor.hp
 
 
 def test_poison_ticks_for_an_actor_whose_energy_did_not_cross_the_threshold() -> None:
@@ -5802,3 +5822,150 @@ def test_a_monster_carries_no_experience_or_level_field() -> None:
     # choice: when it arrives, `xp_for_kill(..., False)` is already the rate.
     fields = {f.name for f in dataclasses.fields(NPC)}
     assert fields.isdisjoint({"xp", "level"})
+
+
+# --- The look cursor ---------------------------------------------------------
+#
+# Free, unlimited, and never a turn: it is the player reading the screen, and
+# charging for that would make information a resource rather than a courtesy.
+
+
+LOOK = Command(CommandKind.LOOK)
+
+
+def test_look_opens_a_cursor_on_the_player_and_costs_no_turn() -> None:
+    state = new_game(1234)
+    after = step(state, LOOK)
+    assert after.look_cursor == state.player
+    assert after.turns == state.turns
+
+
+def test_direction_keys_move_the_cursor_not_the_player() -> None:
+    state = step(new_game(1234), LOOK)
+    moved = step(state, Command(CommandKind.MOVE, 1, 0))
+    assert moved.look_cursor == (state.look_cursor[0] + 1, state.look_cursor[1])
+    assert moved.player == state.player
+
+
+def test_looking_never_costs_a_turn_or_ticks_the_world() -> None:
+    state = new_game(1234)
+    before = [(n.position, n.energy, n.actor.hp) for n in state.npcs]
+    looking = step(state, LOOK)
+    for i in range(200):
+        looking = step(looking, Command(CommandKind.MOVE, 1 if i % 2 else -1, 1))
+    assert looking.turns == state.turns
+    assert looking.player == state.player
+    assert [(n.position, n.energy, n.actor.hp) for n in looking.npcs] == before
+
+
+def test_the_cursor_cannot_leave_the_map() -> None:
+    state = step(new_game(1234), LOOK)
+    for _ in range(200):
+        state = step(state, Command(CommandKind.MOVE, -1, -1))
+    assert state.level.in_bounds(*state.look_cursor)
+    for _ in range(400):
+        state = step(state, Command(CommandKind.MOVE, 1, 1))
+    assert state.level.in_bounds(*state.look_cursor)
+
+
+def test_any_other_key_closes_the_cursor_without_a_turn() -> None:
+    state = new_game(1234)
+    closed = step(step(state, LOOK), LOOK)
+    assert closed.look_cursor is None
+    assert closed.turns == state.turns
+
+
+def test_quitting_inside_look_mode_does_not_quit_the_game() -> None:
+    state = new_game(1234)
+    after = step(step(state, LOOK), QUIT_COMMAND)
+    assert after.running is True
+    assert after.look_cursor is None
+
+
+def test_look_can_be_reopened_as_often_as_the_player_likes() -> None:
+    state = new_game(1234)
+    for _ in range(50):
+        state = step(state, LOOK)
+        state = step(state, Command(CommandKind.MOVE, 1, 0))
+        state = step(state, LOOK)          # closes
+    assert state.turns == 0
+
+
+def test_the_cursor_describes_yourself_with_a_health_band() -> None:
+    state = new_game(1234)
+    assert describe_cell(state, state.player).startswith("yourself, ")
+    hurt = dataclasses.replace(
+        state,
+        player_actor=dataclasses.replace(
+            state.player_actor,
+            actor=dataclasses.replace(state.player_actor.actor, hp=5),
+        ),
+    )
+    assert "almost dead" in describe_cell(hurt, hurt.player)
+
+
+def test_the_cursor_describes_a_monster_with_its_health_band() -> None:
+    state, _ = _with_adjacent_rat(new_game(1234))
+    where = state.npcs[0].position
+    assert describe_cell(state, where) == "a rat, unhurt"
+    wounded = dataclasses.replace(
+        state,
+        npcs=(
+            dataclasses.replace(
+                state.npcs[0],
+                actor=dataclasses.replace(state.npcs[0].actor, hp=2),
+            ),
+        ),
+    )
+    assert describe_cell(wounded, where) == "a rat, almost dead"
+
+
+def test_the_cursor_never_reports_a_monster_from_memory() -> None:
+    # The same rule the renderer follows: terrain is remembered, monsters are not,
+    # because a monster seen an hour ago has moved.
+    state, _ = _with_adjacent_rat(new_game(1234))
+    where = state.npcs[0].position
+    forgotten = dataclasses.replace(state, visible=frozenset({state.player}))
+    described = describe_cell(forgotten, where)
+    assert "rat" not in described
+    assert described.startswith("remembered: ")
+
+
+def test_the_cursor_reveals_nothing_about_unseen_ground() -> None:
+    state = new_game(1234)
+    unseen = next(
+        (x, y)
+        for y in range(state.level.height)
+        for x in range(state.level.width)
+        if (x, y) not in state.explored
+    )
+    assert describe_cell(state, unseen) == "somewhere you have not seen"
+
+
+def test_the_cursor_names_terrain_and_door_state() -> None:
+    state = new_game(1234)
+    door = next(
+        (cell for cell in state.visible if state.level.tile_at(*cell).name == "DOOR"),
+        None,
+    )
+    if door is not None:
+        assert describe_cell(state, door) == "a door (closed)"
+        opened = dataclasses.replace(state, open_doors=frozenset({door}))
+        assert describe_cell(opened, door) == "a door (open)"
+    wall = next(
+        cell for cell in state.visible if not state.level.is_walkable(*cell)
+    )
+    assert describe_cell(state, wall) == "a wall"
+
+
+def test_the_stats_row_shows_the_player_health_band() -> None:
+    state = new_game(1234)
+    assert "(unhurt)" in format_stats(state)
+    hurt = dataclasses.replace(
+        state,
+        player_actor=dataclasses.replace(
+            state.player_actor,
+            actor=dataclasses.replace(state.player_actor.actor, hp=5),
+        ),
+    )
+    assert "(almost dead)" in format_stats(hurt)

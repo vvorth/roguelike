@@ -29,7 +29,7 @@ __all__ = [
 
 
 class CommandKind(Enum):
-    """The eleven things a key press can mean."""
+    """The twelve things a key press can mean."""
 
     MOVE = auto()
     QUIT = auto()
@@ -42,6 +42,7 @@ class CommandKind(Enum):
     TARGET_NEXT = auto()  # Tab (curses.ascii.TAB) -- NEW in v5
     HELP = auto()  # "?"
     ATTACK = auto()  # "a" -- prefix; the next key is the direction
+    LOOK = auto()  # "x" -- examine mode; a cursor, not a turn
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,7 @@ _NO_ARG_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
     (CommandKind.TARGET_NEXT, curses.ascii.TAB),
     (CommandKind.HELP, "?"),
     (CommandKind.ATTACK, "a"),
+    (CommandKind.LOOK, "x"),
 )
 
 
@@ -142,6 +144,7 @@ HELP_ENTRIES: tuple[tuple[str, str], ...] = (
     ("a + direction", "attack that way without moving"),
     ("f", "aim the bow; Tab cycles targets, f shoots"),
     ("Tab", "next target while aiming"),
+    ("x", "look around; direction keys move the cursor"),
     ("?", "this help"),
     ("q", "quit"),
 )

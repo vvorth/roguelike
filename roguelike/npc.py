@@ -58,8 +58,9 @@ from typing import TYPE_CHECKING
 
 from roguelike.fov import has_line_of_sight
 from roguelike.level import Level
-from roguelike.pathfind import Coord, find_path
-from roguelike.stats import Actor, Stats, derive
+from roguelike.pathfind import DIRECTIONS, Coord, find_path
+from roguelike.stats import Actor, Condition, Stats, derive
+from roguelike.status import StatusKind
 from roguelike.world import is_passable, is_planning_passable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
@@ -78,6 +79,7 @@ __all__ = [
     "MONSTERS_PER_LEVEL",
     "SPAWN_SAFE_RADIUS",
     "SPAWN_MIN_SEPARATION",
+    "wants_to_flee",
     "plan_action",
     "spawn_npcs",
 ]
@@ -117,13 +119,15 @@ class SpeciesData:
     xp_value: int
     poison_chance: int = 0
     hostile: bool = True
+    flee_chance: int = 0
 
 
 class AiState(Enum):
-    """The two states a monster's mind can be in (CONTRACT-v5 §24.2)."""
+    """The states a monster's mind can be in (CONTRACT-v5 §24.2, plus fleeing)."""
 
     WANDERING = auto()
     HUNTING = auto()
+    FLEEING = auto()
 
 
 @dataclass(frozen=True)
@@ -176,6 +180,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_min=1,
         attack_max=3,
         xp_value=5,
+        flee_chance=15,
     ),
     Species.JACKAL: SpeciesData(
         name="jackal",
@@ -184,6 +189,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_min=2,
         attack_max=4,
         xp_value=10,
+        flee_chance=35,
     ),
     Species.GIANT_BAT: SpeciesData(
         name="giant bat",
@@ -192,6 +198,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_min=1,
         attack_max=2,
         xp_value=8,
+        flee_chance=30,
     ),
     Species.CAVE_SNAKE: SpeciesData(
         name="cave snake",
@@ -201,6 +208,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_max=4,
         xp_value=12,
         poison_chance=30,
+        flee_chance=5,
     ),
 }
 """The bestiary, one entry per :class:`Species` (CONTRACT-v5 §24.1).
@@ -328,6 +336,9 @@ def plan_action(
     if not SPECIES_DATA[npc.species].hostile:
         return _wander(rng, npc, level, open_doors, occupied)
 
+    if npc.ai_state is AiState.FLEEING:
+        return _flee(npc, level, open_doors, occupied, player)
+
     if npc.ai_state is AiState.HUNTING:
         return _hunt(npc, level, open_doors, occupied, player)
 
@@ -424,6 +435,75 @@ def spawn_npcs(
         ]
 
     return tuple(npcs)
+
+
+def wants_to_flee(rng: "Random", npc: NPC, player: Actor) -> bool:
+    """Would this monster rather run than keep fighting?
+
+    Three things must all hold, and the caller switches the monster to
+    :attr:`AiState.FLEEING` when they do:
+
+    * **It is badly hurt** — :attr:`~roguelike.stats.Condition.BADLY_WOUNDED` or worse.
+      A scratch is not a reason to run.
+    * **The player is in better shape than it is.** This is the "can it see that I am
+      healthy and it is not" rule: both sides are read on the same five-band
+      :class:`~roguelike.stats.Condition` scale, so the comparison is one ``<``. A
+      creature losing to someone equally close to death does not disengage.
+    * **The roll succeeds**, at :attr:`SpeciesData.flee_chance` percent. Wit is what the
+      number encodes: a jackal disengages far more readily than a cave snake, which
+      barely does at all.
+
+    **An enraged creature never flees**, whatever its condition — that is what
+    :attr:`roguelike.status.StatusKind.ENRAGED` is for, and it is checked first so no
+    roll is even made.
+
+    Pure: draws at most once from ``rng`` and mutates nothing.
+    """
+    if any(effect.kind is StatusKind.ENRAGED for effect in npc.actor.status_effects):
+        return False
+    chance = SPECIES_DATA[npc.species].flee_chance
+    if chance <= 0:
+        return False
+    if npc.actor.condition < Condition.BADLY_WOUNDED:
+        return False
+    if player.condition >= npc.actor.condition:
+        return False
+    return rng.randint(1, 100) <= chance
+
+
+def _flee(
+    npc: NPC,
+    level: Level,
+    open_doors: frozenset[Coord],
+    occupied: frozenset[Coord],
+    player: Coord,
+) -> NpcAction:
+    """Put distance between this monster and the player.
+
+    Steps to whichever legal neighbour is furthest from the player, preferring a strict
+    improvement. **Cornered — no neighbour is further away than where it stands — it
+    turns and fights** if the player is adjacent, and waits otherwise. An animal with
+    its back to the wall does not stand there being hit, and without this a fleeing
+    monster in a dead end would be a permanently harmless punching bag.
+
+    Ties break on the coordinate, so the choice is deterministic and draws no randomness.
+    """
+    here = _chebyshev(npc.position, player)
+    x, y = npc.position
+    options = [
+        (x + dx, y + dy)
+        for dx, dy in DIRECTIONS
+        if _is_legal_move(level, open_doors, occupied, (x + dx, y + dy))
+    ]
+    better = [cell for cell in options if _chebyshev(cell, player) > here]
+    if better:
+        return NpcAction(
+            NpcActionKind.MOVE,
+            max(sorted(better), key=lambda cell: _chebyshev(cell, player)),
+        )
+    if here == 1:
+        return NpcAction(NpcActionKind.ATTACK, player)
+    return NpcAction(NpcActionKind.WAIT)
 
 
 def _hunt(

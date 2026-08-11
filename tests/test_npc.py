@@ -22,6 +22,8 @@ from __future__ import annotations
 import ast
 import copy
 import dataclasses
+from roguelike.npc import wants_to_flee
+from roguelike.status import StatusEffect, StatusKind
 import inspect
 import itertools
 import os
@@ -282,9 +284,11 @@ def test_species_data_does_not_store_derived_values():
         "attack_max",
         "xp_value",
         "poison_chance",
-        # Whether bumping into this creature attacks it. Not a derived value --
-        # it is a fact about the species, like its glyph.
+        # Whether bumping into this creature attacks it, and how readily it breaks
+        # off a losing fight. Not derived values -- facts about the species, like
+        # its glyph.
         "hostile",
+        "flee_chance",
     }
     assert fields.isdisjoint({"max_hp", "hp", "speed", "evasion", "block"})
 
@@ -326,8 +330,8 @@ def test_tuning_constants_are_integers():
         assert isinstance(value, int) and not isinstance(value, bool)
 
 
-def test_the_two_ai_states_and_three_action_kinds():
-    assert [s.name for s in AiState] == ["WANDERING", "HUNTING"]
+def test_the_three_ai_states_and_three_action_kinds():
+    assert [s.name for s in AiState] == ["WANDERING", "HUNTING", "FLEEING"]
     assert [k.name for k in NpcActionKind] == ["WAIT", "MOVE", "ATTACK"]
 
 
@@ -1411,6 +1415,7 @@ def test_npc_exports_exactly_the_contract_surface():
         "MONSTERS_PER_LEVEL",
         "SPAWN_SAFE_RADIUS",
         "SPAWN_MIN_SEPARATION",
+        "wants_to_flee",
         "plan_action",
         "spawn_npcs",
     }
@@ -1419,3 +1424,106 @@ def test_npc_exports_exactly_the_contract_surface():
 def test_spawn_npcs_signature_matches_the_contract():
     parameters = list(inspect.signature(spawn_npcs).parameters)
     assert parameters == ["rng", "level", "first_actor_id"]
+
+
+# --- Fleeing: breaking off a fight you are losing ----------------------------
+
+
+def _hurt(species: Species, hp: int, state: AiState = AiState.HUNTING) -> NPC:
+    data = SPECIES_DATA[species]
+    return NPC(1, species, Actor(data.stats, hp), (5, 5), ai_state=state)
+
+
+def _healthy_player() -> Actor:
+    return Actor(Stats(10, 10, 10), derive(Stats(10, 10, 10)).max_hp)
+
+
+def _flee_rate(npc: NPC, player: Actor, rolls: int = 400) -> float:
+    return sum(wants_to_flee(random.Random(s), npc, player) for s in range(rolls)) / rolls
+
+
+def test_an_unhurt_monster_never_flees():
+    full = derive(SPECIES_DATA[Species.JACKAL].stats).max_hp
+    assert _flee_rate(_hurt(Species.JACKAL, full), _healthy_player()) == 0.0
+
+
+def test_a_lightly_hurt_monster_never_flees():
+    # A scratch is not a reason to run: the threshold is BADLY_WOUNDED.
+    full = derive(SPECIES_DATA[Species.JACKAL].stats).max_hp
+    assert _flee_rate(_hurt(Species.JACKAL, full - 1), _healthy_player()) == 0.0
+
+
+def test_a_badly_hurt_monster_flees_at_roughly_its_species_rate():
+    for species in Species:
+        data = SPECIES_DATA[species]
+        full = derive(data.stats).max_hp
+        rate = _flee_rate(_hurt(species, max(1, full // 5)), _healthy_player())
+        assert abs(rate * 100 - data.flee_chance) <= 6, (species, rate)
+
+
+def test_a_monster_does_not_flee_from_an_equally_hurt_player():
+    # "It can see I am healthy and it is not" -- both halves matter.
+    full = derive(SPECIES_DATA[Species.JACKAL].stats).max_hp
+    dying_player = Actor(Stats(10, 10, 10), 1)
+    assert _flee_rate(_hurt(Species.JACKAL, max(1, full // 5)), dying_player) == 0.0
+
+
+def test_an_enraged_monster_never_flees():
+    full = derive(SPECIES_DATA[Species.JACKAL].stats).max_hp
+    data = SPECIES_DATA[Species.JACKAL]
+    angry = NPC(
+        1,
+        Species.JACKAL,
+        Actor(data.stats, max(1, full // 5), (StatusEffect(StatusKind.ENRAGED, 10, 0),)),
+        (5, 5),
+        ai_state=AiState.HUNTING,
+    )
+    assert _flee_rate(angry, _healthy_player()) == 0.0
+
+
+def test_wit_shows_in_the_flee_rates():
+    # The jackal is the sharpest animal in the bestiary and disengages most readily;
+    # the cave snake barely does at all.
+    rates = {s: SPECIES_DATA[s].flee_chance for s in Species}
+    assert rates[Species.JACKAL] > rates[Species.RAT] > rates[Species.CAVE_SNAKE]
+    assert all(0 <= r <= 100 for r in rates.values())
+
+
+def test_a_fleeing_monster_moves_further_away():
+    level = _corridor(12)
+    npc = _hurt(Species.JACKAL, 3, AiState.FLEEING)
+    npc = dataclasses.replace(npc, position=(6, 1))
+    player = (4, 1)
+    action = plan_action(random.Random(0), npc, level, frozenset(), frozenset({player}), player)
+    assert action.kind is NpcActionKind.MOVE
+    before = max(abs(npc.position[0] - player[0]), abs(npc.position[1] - player[1]))
+    after = max(abs(action.target[0] - player[0]), abs(action.target[1] - player[1]))
+    assert after > before
+
+
+def test_a_cornered_fleeing_monster_turns_and_fights():
+    # Without this a fleeing monster in a dead end is a permanently harmless
+    # punching bag, and an animal with its back to the wall does not behave that way.
+    level = _corridor(2)
+    npc = dataclasses.replace(_hurt(Species.JACKAL, 3, AiState.FLEEING), position=(1, 1))
+    action = plan_action(
+        random.Random(0), npc, level, frozenset(), frozenset({(2, 1)}), (2, 1)
+    )
+    assert action.kind is NpcActionKind.ATTACK
+
+
+def test_fleeing_draws_no_randomness():
+    level = _corridor(12)
+    npc = dataclasses.replace(_hurt(Species.JACKAL, 3, AiState.FLEEING), position=(6, 1))
+    targets = {
+        plan_action(random.Random(s), npc, level, frozenset(), frozenset({(4, 1)}), (4, 1)).target
+        for s in range(50)
+    }
+    assert len(targets) == 1
+
+
+def _corridor(length: int):
+    """A 1-tall open corridor `length` cells long, walled all round."""
+    rows = ["#" * (length + 2), "#" + "." * length + "#", "#" * (length + 2)]
+    grid = [[{"#": Tile.WALL, ".": Tile.FLOOR}[c] for c in r] for r in rows]
+    return Level(len(rows[0]), len(rows), freeze_grid(grid), (), (1, 1), 0)

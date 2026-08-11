@@ -11,10 +11,13 @@ against a single type (CONTRACT-v5 §20).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 
 from roguelike.status import StatusEffect
 
 __all__ = [
+    "Condition",
+    "condition",
     "BASELINE",
     "Stats",
     "Derived",
@@ -44,6 +47,58 @@ class Derived:
     block: int
 
 
+class Condition(IntEnum):
+    """How hurt an actor looks, to itself or to anyone watching.
+
+    Five bands rather than a number, because this is what one creature can *see* of
+    another: an approximation, not a hit-point readout. The player's own bar is the
+    same vocabulary, so "am I worse off than that thing?" is one comparison of two
+    values from the same scale.
+
+    An :class:`~enum.IntEnum`, ordered best to worst, so the members compare directly:
+    ``Condition.WOUNDED < Condition.NEAR_DEATH`` reads as "less hurt than". That
+    comparison is the whole point — it is how a monster decides whether the player is
+    in better shape than it is, and it is why this is not a plain ``Enum``
+    (:class:`roguelike.tiles.Tile` is an ``IntEnum`` for the same kind of reason).
+    """
+
+    UNHURT = 0
+    SCRATCHED = 1
+    WOUNDED = 2
+    BADLY_WOUNDED = 3
+    NEAR_DEATH = 4
+
+
+def condition(hp: int, max_hp: int) -> Condition:
+    """Which band ``hp`` out of ``max_hp`` falls into.
+
+    Thresholds are quarters, compared by integer cross-multiplication so no float and
+    no rounding rule enters (CONTRACT-v5 §0.13):
+
+    ==================  ==========================
+    at full health      ``UNHURT``
+    above three quarters ``SCRATCHED``
+    above one half      ``WOUNDED``
+    above one quarter   ``BADLY_WOUNDED``
+    anything less       ``NEAR_DEATH``
+    ==================  ==========================
+
+    A dead or negative ``hp`` reads ``NEAR_DEATH``; a non-positive ``max_hp`` reads
+    ``NEAR_DEATH`` too rather than dividing by zero. Never raises.
+    """
+    if max_hp <= 0 or hp <= 0:
+        return Condition.NEAR_DEATH
+    if hp >= max_hp:
+        return Condition.UNHURT
+    if hp * 4 > max_hp * 3:
+        return Condition.SCRATCHED
+    if hp * 2 > max_hp:
+        return Condition.WOUNDED
+    if hp * 4 > max_hp:
+        return Condition.BADLY_WOUNDED
+    return Condition.NEAR_DEATH
+
+
 @dataclass(frozen=True)
 class Actor:
     """The shared core of the player and every NPC."""
@@ -51,6 +106,11 @@ class Actor:
     stats: Stats
     hp: int
     status_effects: tuple[StatusEffect, ...] = ()
+
+    @property
+    def condition(self) -> Condition:
+        """How hurt this actor looks. Derived, never stored — one source of truth."""
+        return condition(self.hp, derive(self.stats).max_hp)
 
 
 def _clamp(value: int, low: int, high: int) -> int:

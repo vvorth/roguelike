@@ -12,7 +12,15 @@ import pathlib
 
 import pytest
 
-from roguelike.stats import BASELINE, Actor, Derived, Stats, derive
+from roguelike.stats import (
+    BASELINE,
+    Actor,
+    Condition,
+    Derived,
+    Stats,
+    condition,
+    derive,
+)
 from roguelike.status import StatusEffect, StatusKind
 
 # ---------------------------------------------------------------------------
@@ -201,3 +209,54 @@ def test_stats_contains_no_float_literals():
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, float):
             pytest.fail(f"float literal found in stats.py: {node.value!r}")
+
+
+# --- Condition: the five bands one creature can read off another -------------
+
+
+def test_the_five_bands_at_a_45_hp_actor():
+    assert condition(45, 45) is Condition.UNHURT
+    assert condition(44, 45) is Condition.SCRATCHED
+    assert condition(34, 45) is Condition.SCRATCHED
+    assert condition(23, 45) is Condition.WOUNDED
+    assert condition(12, 45) is Condition.BADLY_WOUNDED
+    assert condition(11, 45) is Condition.NEAR_DEATH
+    assert condition(1, 45) is Condition.NEAR_DEATH
+
+
+def test_full_health_is_unhurt_at_every_size():
+    for max_hp in (1, 9, 17, 25, 45, 100):
+        assert condition(max_hp, max_hp) is Condition.UNHURT
+
+
+def test_dead_or_impossible_values_read_near_death_and_never_raise():
+    assert condition(0, 45) is Condition.NEAR_DEATH
+    assert condition(-20, 45) is Condition.NEAR_DEATH
+    assert condition(5, 0) is Condition.NEAR_DEATH
+    assert condition(0, 0) is Condition.NEAR_DEATH
+
+
+def test_conditions_are_ordered_worst_last():
+    # The ordering is the point: it is how a monster asks "is the player in better
+    # shape than I am?" -- one comparison on one scale.
+    assert (
+        Condition.UNHURT
+        < Condition.SCRATCHED
+        < Condition.WOUNDED
+        < Condition.BADLY_WOUNDED
+        < Condition.NEAR_DEATH
+    )
+
+
+def test_condition_never_improves_as_hp_falls():
+    previous = Condition.UNHURT
+    for hp in range(45, 0, -1):
+        band = condition(hp, 45)
+        assert band >= previous
+        previous = band
+
+
+def test_actor_exposes_its_own_condition_derived_not_stored():
+    actor = Actor(Stats(10, 10, 10), hp=20)
+    assert actor.condition is condition(20, derive(actor.stats).max_hp)
+    assert "condition" not in {f.name for f in dataclasses.fields(Actor)}

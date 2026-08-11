@@ -25,8 +25,10 @@ def effect(remaining: int, magnitude: int = 2, kind: StatusKind = POISON) -> Sta
 # ---------------------------------------------------------------------------
 
 
-def test_regen_turns_is_10():
-    assert REGEN_TURNS == 10
+def test_regen_turns_is_3():
+    # Corrected from 10: the research that chose 10 simulated monsters at half
+    # their real HP, and at 10 the game clears 2.2% of floors instead of ~62%.
+    assert REGEN_TURNS == 3
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +151,10 @@ def test_tick_effects_does_not_mutate_input_tuple():
 # ---------------------------------------------------------------------------
 
 
-def test_status_kind_has_exactly_poisoned():
-    assert {member.name for member in StatusKind} == {"POISONED"}
+def test_status_kind_is_poisoned_and_enraged():
+    # ENRAGED blocks a monster from fleeing (roguelike.npc.wants_to_flee).
+    # Nothing applies it yet -- a tested seam with no live source.
+    assert {member.name for member in StatusKind} == {"POISONED", "ENRAGED"}
 
 
 # ---------------------------------------------------------------------------
