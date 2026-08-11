@@ -95,8 +95,8 @@ this / drop this". The project has one paginated full-screen view already —
 `Chrome`, which is exactly what an inventory screen is. **Reusing it is the recommendation**;
 the alternative is a second full-screen layout that has to learn the same clipping rules.
 
-Proposed keys, all currently unbound (verified): `i` inventory · `w` is taken (walk), so
-**`e` equip** · `d` drop · `q` is taken (quit), so **`Q`… no** — see the open question in §7.
+Keys — **`i` for the inventory screen is confirmed by the user**; `e` (equip) and `d` (drop)
+are proposed and verified unbound. `w` and `q` are already taken by walk and quit.
 
 ---
 
@@ -125,20 +125,24 @@ Proposed tiers (three, not five — the band does not support five):
 | standard | **dagger 2–5** (unchanged) | 2–5 | **shortbow 1–4** (unchanged) | 1–4 |
 | fine | sword | 4–8 | longbow | 3–6 |
 
-### Damage types — the honest recommendation is *not yet*
+### Damage types — **decided: full resistances** (§7.1)
 
-A damage type only means something if something *resists* it. Nothing in the bestiary resists
-anything, so types would ship as a field that is read, compared, and always finds a match —
-scaffolding with no live content, which this project has accepted twice (`interruption`,
-`ENRAGED`) but should not accept a third time in the same increment.
+`DamageType` (SLASH / PIERCE / BLUNT) on `Weapon`, and a per-species resistance table that
+actually changes damage. The user chose this over flavour-only, accepting §0's saturation
+cost on the current bestiary in exchange for a mechanic that keeps scaling.
 
-**Recommendation: define `DamageType` (SLASH / PIERCE / BLUNT) on `Weapon` as flavour only,
-with no mechanical effect in v6**, and add resistances when a species that resists something
-exists. Or omit it entirely. **This is a decision for the user, not for the contract** — see
-§7.
+**What still needs sweeping before the contract freezes it:** a resistance expressed as a
+percentage runs into §0's arithmetic from the other side — 50% off a 1–4 roll is 0–2, and the
+`max(1, …)` floor eats most of it. Two shapes to measure:
 
-*Why not just add resistances too:* every resistance multiplies into the §0 problem. A 50%
-resist against 1–4 damage is the flat-block saturation all over again, in percentage clothing.
+* **percentage** — simple, but saturates against small numbers exactly as flat block does;
+* **a damage multiplier applied before the floor**, with resistances kept coarse (immune /
+  resistant / normal / vulnerable) rather than arbitrary percentages.
+
+The second is the recommendation to *test first*, not to adopt untested. Either way the
+bestiary needs at least one species that resists something, or the mechanic ships dead —
+proposed: the cave snake resists PIERCE (arrows slide off scales), the giant bat is
+vulnerable to BLUNT.
 
 ---
 
@@ -275,28 +279,108 @@ tune one row without re-deriving a curve.
 
 ---
 
-## 7. Decisions the user should make before a contract is written
+## 7. Decisions — all four settled by the user
 
-1. **Damage types** — flavour only, full resistances, or omit? §2 recommends *flavour only or
-   omit*; resistances re-create the §0 saturation problem in percentage form.
-2. **Food and hunger** — drop food, or commit to a hunger clock as its own increment? §4
-   recommends *drop it for now*; a ration with nothing to cure is an item that exists to be
-   ignored, and hunger interacts badly with `R` resting free for 100+ turns.
-3. **Inventory keys.** `i`, `e`, `d` are free; `w` and `q` are taken. Worth confirming the
-   scheme before it is frozen, since keys are the hardest thing to change later.
-4. **Whether a shield's block should also apply to ranged attacks.** Proposed yes; no monster
-   has a ranged attack yet, so it is untestable today either way.
+1. **Damage types: full resistances, not flavour.** The user's reasoning, recorded because it
+   overrides §0's caution deliberately rather than by oversight: *resistance will not saturate
+   against stronger foes, and being untouchable to a jackal with a good shield makes sense.*
+   That is a design position, not a miss — it accepts that a good shield trivialises **the
+   current bestiary** in exchange for a mechanic that keeps working when tougher things arrive.
+   **The consequence to state plainly in CONTRACT-v6: today's four species are the whole game,
+   so a fine shield will make the shipped content easy until deeper foes exist.** §0's measured
+   table is the evidence for how quickly that happens; it is now an accepted cost, not a
+   warning.
+2. **No food.** Dropped. Hunger stays un-designed and is not a v6 concern.
+3. **Inventory on `i`.** Confirmed free (verified: `i`, `e`, `d`, `g`, `t` all map to
+   `UNKNOWN`).
+4. **Shields work against arrows, but a shot must always be able to land**, with the chance
+   depending on both sides' stats. Researched below in §7.1.
 
-## 8. Numbers that are proposals, not measurements
+### §7.1 Shields against ranged attacks — the researched formula
 
-Stated plainly so nothing here is mistaken for evidence:
+**Requirement:** a shield helps against arrows; the archer's and the defender's stats both
+matter; **there is always a chance to be hit anyway.**
 
-- shield block chances (15/25/35)
+Only three primary stats exist (STR / AGI / VIT) and four derived ones. AGI is the only one
+that means anything for "did the arrow get past the shield" — STR is arm strength and VIT is
+constitution, and `evasion` is already spent on the to-hit roll, so reusing it would make AGI
+count twice in the same exchange.
+
+**Proposed formula:**
+
+```
+ranged_block% = clamp(shield.block_chance + (defender.AGI - attacker.AGI) * 2, 5, 75)
+```
+
+Rolled only if the attack already hit, exactly like the melee block roll, so the shield is a
+second line of defence rather than a second dodge.
+
+**Why the coefficient is 2** — swept across the three candidates:
+
+| coeff | buckler, AGI gap −8 → +8 | behaviour |
+|---|---|---|
+| 1 | 7% → 23% | the gap barely matters; stats are decoration |
+| **2** | **5% → 31%** | **a 4-point AGI edge is worth ~8 points of block — noticeable, not decisive** |
+| 3 | 5% → 39% | the gap swamps the shield; a buckler on a fast character beats a tower shield on a slow one |
+
+**Why the cap is 75 and the floor is 5** — the cap is precisely the "always a chance to be
+hit" requirement:
+
+| cap | an arrow still lands… | |
+|---|---|---|
+| 60% | 40% of the time | safe but the shield feels weak |
+| **75%** | **25% of the time** | **chosen** |
+| 85% | 15% of the time | thin |
+| 90% | 10% of the time | fails the requirement in practice |
+
+The floor of 5 does the same job from the other side: a slow character with a small shield
+against a fast archer still blocks occasionally, so the item is never literally worthless.
+
+**Behaviour across the AGI values that actually exist** (archers are hypothetical — nothing
+shoots yet):
+
+| defender | shield | vs AGI 18 | vs AGI 13 | vs AGI 8 |
+|---|---|---|---|---|
+| baseline, AGI 10 | buckler | 5% | 9% | 19% |
+| baseline, AGI 10 | tower | 19% | 29% | 39% |
+| levelled, AGI 14 | kite | 17% | 27% | 37% |
+| agile, AGI 18 | tower | 35% | 45% | 55% |
+
+Over twenty shots, a tower shield takes an agile character from 20 hits to about 10, and a
+baseline one from 20 to 14. The shield always matters and never decides the exchange alone.
+
+> **Honest scope note: this is untestable live in v6.** No monster has a ranged attack, and no
+> monster carries a shield, so neither direction of this rule can fire in a real game. It
+> ships as a tested pure function with no live caller — the same position `interruption` held
+> in v4 and `ENRAGED` holds now. The alternative is to leave shields melee-only and add this
+> when an archer exists; the user asked for it, so it is specified, and this note is here so
+> the gap is a recorded choice.
+
+## 8. What is measured, what is proposed, and what is still unswept
+
+**Measured against the shipped modules** — safe to build on:
+
+- §0's flat-block saturation table and the jackal win-rate table
+- §2's dagger-hits-to-kill window
+- §4's potion-versus-resting equivalence
+- §7.1's shield-versus-ranged coefficient, cap and floor sweeps
+
+**Proposals, not measurements** — nothing here is evidence:
+
+- shield base block chances (15/25/35)
 - weapon tier damage ranges, other than the two shipped weapons
 - chest frequency (12%) and the depth/grade table
 - potion and bandage magnitudes
 - the 20-item carry cap
 
-All of them should be swept against the shipped modules — the way §0 and §4 were — **before**
-CONTRACT-v6 freezes them. §0 is the cautionary example: it took one sweep to discover that the
-obvious shield design breaks the game, and that sweep is cheap compared with shipping it.
+**Still unswept and load-bearing — do this before CONTRACT-v6 freezes anything:**
+
+1. **The resistance shape.** §2 sets out two candidates (percentage versus coarse multiplier).
+   The percentage form runs straight into §0's arithmetic and may well be unusable; this needs
+   the same sweep §0 got. It is the single largest open risk in the increment, because the
+   user has chosen resistances and the obvious implementation is the one most likely to break.
+2. **Shield base chances against the *whole* fight**, not just per-arrow. §7.1 measured the
+   per-shot maths; the end-to-end effect on floor-clear rate is unmeasured.
+
+§0 is the cautionary example for all of this: one sweep showed the obvious shield design wins
+100% of jackal fights, and that sweep cost minutes against shipping a broken mechanic.
