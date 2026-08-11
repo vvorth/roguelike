@@ -301,8 +301,8 @@ def test_every_bound_key_in_the_table_is_expected() -> None:
     expected |= {ord("E"), ord("w")}
     # v5 additions: fire, target-next (Tab).
     expected |= {ord("f"), curses.ascii.TAB}
-    # The help screen.
-    expected |= {ord("?")}
+    # The help screen, and the explicit-attack prefix.
+    expected |= {ord("?"), ord("F")}
     assert set(keys_module._KEY_BINDINGS) == expected
 
 
@@ -497,15 +497,18 @@ def test_fire_and_target_next_are_distinct_commands() -> None:
     assert translate_key("f") != translate_key(curses.ascii.TAB)
 
 
-def test_lowercase_f_is_fire_uppercase_f_is_still_unknown() -> None:
-    # THE NAMED TRAP: binding F when the intent was f. Assert both directions
-    # explicitly.
+def test_lowercase_f_fires_and_uppercase_f_attacks() -> None:
+    # THE NAMED TRAP, and now sharper than when F was merely unbound: the two keys
+    # are adjacent on the keyboard and do different things -- f shoots the bow at a
+    # chosen target, F swings in a direction. Transposing them is the single most
+    # likely bug in this table, so both directions are asserted explicitly.
     assert translate_key("f").kind is CommandKind.FIRE
-    assert translate_key("F") == UNKNOWN_COMMAND
-    assert translate_key("F").kind is CommandKind.UNKNOWN
+    assert translate_key("F").kind is CommandKind.ATTACK
     assert translate_key("F") != translate_key("f")
     assert translate_key(ord("f")).kind is CommandKind.FIRE
-    assert translate_key(ord("F")) == UNKNOWN_COMMAND
+    assert translate_key(ord("F")).kind is CommandKind.ATTACK
+    # Both are argument-less intents; the direction arrives as the NEXT key.
+    assert (translate_key("F").dx, translate_key("F").dy) == (0, 0)
 
 
 def test_t_a_i_g_remain_unknown() -> None:
@@ -550,8 +553,8 @@ def test_fire_and_target_next_do_not_collide_with_anything_else() -> None:
         "\n",
         "e",  # lowercase auto-explore is not bound — only "E" is
         "W",  # uppercase walk-prefix is not bound — only "w" is
-        # v5: F (not f), and the other still-unbound letters (CONTRACT-v5 §5).
-        "F",
+        # v5: the still-unbound letters (CONTRACT-v5 §5). "F" is no longer among
+        # them -- it is the explicit-attack prefix.
         "t",
         "a",
         "i",
@@ -662,18 +665,19 @@ def test_command_kind_members() -> None:
         "FIRE",
         "TARGET_NEXT",
         "HELP",
+        "ATTACK",
     ]
 
 
 def test_command_kind_uses_auto_values() -> None:
-    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
 
-def test_command_kind_has_exactly_ten_members() -> None:
+def test_command_kind_has_exactly_eleven_members() -> None:
     # The five from v3 (MOVE, QUIT, UNKNOWN, DESCEND, ASCEND), the two from v4
     # (AUTO_EXPLORE, WALK_PREFIX), the two from v5 (FIRE, TARGET_NEXT), and HELP.
-    assert len(list(CommandKind)) == 10
-    assert len(CommandKind) == 10
+    assert len(list(CommandKind)) == 11
+    assert len(CommandKind) == 11
 
 
 def test_module_constants_are_the_expected_kinds() -> None:

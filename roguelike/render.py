@@ -70,6 +70,7 @@ __all__ = [
     "NpcGlyph",
     "render_to_cells",
     "render_text_page",
+    "PROJECTILE_CHAR",
     "to_lines",
     "init_colors",
     "draw",
@@ -128,6 +129,11 @@ class Chrome:
     status_right: str = ""
 
 
+#: Drawn for a missile in flight. Conventional, and distinct from every tile glyph and
+#: every species glyph in the bestiary.
+PROJECTILE_CHAR: str = "*"
+
+
 def _chrome_row(text: str, width: int) -> list[Cell]:
     """Pad/truncate ``text`` to exactly ``width`` and wrap it as a terrain/visible row."""
     padded = text[:width].ljust(width)
@@ -162,6 +168,7 @@ def render_to_cells(
     chrome: Chrome,
     npcs: tuple[NpcGlyph, ...] = (),
     target: tuple[int, int] | None = None,
+    projectile: tuple[int, int] | None = None,
 ) -> list[list[Cell]]:
     """Render one frame as a grid of styled :class:`Cell`. Pure.
 
@@ -244,6 +251,16 @@ def render_to_cells(
     if level.in_bounds(player_x, player_y):
         rows[player_y + 1][player_x] = Cell(PLAYER_CHAR, Role.PLAYER, Visibility.VISIBLE)
 
+    # A missile in flight — drawn over everything including the player, because for the
+    # instant it is on screen it is the thing the eye should follow. It is transient: the
+    # caller passes one cell per animation frame and `None` the rest of the time.
+    if projectile is not None:
+        missile_x, missile_y = projectile
+        if level.in_bounds(missile_x, missile_y):
+            rows[missile_y + 1][missile_x] = Cell(
+                PROJECTILE_CHAR, Role.PROJECTILE, Visibility.VISIBLE
+            )
+
     # The ranged-target cursor — applied last of all, on top of terrain, an NPC or the
     # player alike. It only ever flips `reverse`; the glyph underneath is untouched, so
     # a targeted monster still shows its species glyph, not a cursor character.
@@ -319,6 +336,7 @@ _ATTR_COMBOS: tuple[tuple[Role, Visibility], ...] = (
     (Role.DOOR, Visibility.VISIBLE),
     (Role.DOOR, Visibility.EXPLORED),
     (Role.PLAYER, Visibility.VISIBLE),
+    (Role.PROJECTILE, Visibility.VISIBLE),
 )
 
 # The species keys style.attr_for accepts for Role.NPC (CONTRACT-v5 §24.1's four-species
@@ -326,6 +344,7 @@ _ATTR_COMBOS: tuple[tuple[Role, Visibility], ...] = (
 # rather than imported from npc.py, which this module may not import (§10 v5). Every NPC
 # handed to render_to_cells is expected to carry one of these four as its `species`.
 _NPC_SPECIES: tuple[str, ...] = ("rat", "jackal", "giant bat", "cave snake")
+
 
 # Populated once by init_colors(); read (never written) by draw(). Empty until
 # init_colors() has run, which is exactly the "no attribute" fallback draw() needs.

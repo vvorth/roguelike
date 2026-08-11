@@ -433,6 +433,8 @@ STATE_FIELDS = (
     "npcs",
     "targeting",
     "help_page",
+    "awaiting_attack",
+    "projectile",
 )
 
 
@@ -595,7 +597,9 @@ def test_gamestate_field_order_and_defaults() -> None:
     assert fields[16].default == ()          # npcs
     assert fields[17].default is None        # targeting
     assert fields[18].default is None        # help_page
-    assert len(fields) == 19
+    assert fields[19].default is False       # awaiting_attack
+    assert fields[20].default == ()          # projectile
+    assert len(fields) == 21
 
 
 def test_gamestate_constructs_positionally_with_defaults() -> None:
@@ -2323,7 +2327,9 @@ def test_the_loop_paces_with_timeout_and_nothing_else() -> None:
         and isinstance(child.func, ast.Attribute)
         and child.func.attr == "timeout"
     ]
-    assert len(timeouts) == 2, "one deadline for an activity, one for ordinary play"
+    assert len(timeouts) == 3, (
+        "one deadline for an activity, one for ordinary play, one per projectile frame"
+    )
     # And `timeout` is called nowhere else in the module — pacing is the loop's alone.
     assert (
         len(
@@ -2335,7 +2341,7 @@ def test_the_loop_paces_with_timeout_and_nothing_else() -> None:
                 and child.func.attr == "timeout"
             ]
         )
-        == 2
+        == 3
     )
 
 
@@ -2382,7 +2388,10 @@ def test_the_renderer_is_reached_only_from_run() -> None:
         for node in ast.walk(GAME_TREE)
         if isinstance(node, ast.Name) and node.id == "render"
     }
-    assert users <= {"run"}
+    # `run` and the two presentation helpers it alone calls. The invariant that matters
+    # is that no *rule* draws, so those are asserted absent explicitly below.
+    assert users <= {"run", "_projectile_frame", "_npc_glyphs"}
+    assert "step" not in users and "advance" not in users and "advance_npcs" not in users
 
 
 def test_step_does_not_reimplement_collision_keys_or_visibility() -> None:
@@ -2642,10 +2651,11 @@ def test_no_extra_command_kind_was_invented() -> None:
         # walking into a monster *is* the attack (§7.9).
         "FIRE",
         "TARGET_NEXT",
-        # The help screen. Still no ATTACK, and still no WAIT.
+        # The help screen, and an explicit directional attack. Still no WAIT.
         "HELP",
+        "ATTACK",
     }
-    for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH", "TRAVEL", "RUN", "ATTACK"):
+    for name in ("OPEN", "CLOSE", "WAIT", "REST", "SEARCH", "TRAVEL", "RUN"):
         assert f"CommandKind.{name}" not in GAME_SOURCE
 
 
@@ -5437,3 +5447,172 @@ def test_the_footer_names_the_page_and_the_total() -> None:
 def test_a_dead_game_ignores_the_help_key() -> None:
     state = dataclasses.replace(new_game(1234), running=False)
     assert step(state, HELP) is state
+
+
+# --- Explicit attack: F, then a direction ------------------------------------
+#
+# Walking into a monster already attacks it, but that is no use when you want to
+# hit something you might otherwise walk past. `F` swings at an adjacent square
+# without ever becoming a step.
+
+
+ATTACK = Command(CommandKind.ATTACK)
+
+
+def _with_adjacent_rat(state: GameState, dx: int = 1, dy: int = 0):
+    """Put a full-health rat immediately beside the player."""
+    data = SPECIES_DATA[Species.RAT]
+    rat = NPC(
+        actor_id=99,
+        species=Species.RAT,
+        actor=Actor(data.stats, derive(data.stats).max_hp),
+        position=(state.player[0] + dx, state.player[1] + dy),
+    )
+    return dataclasses.replace(state, npcs=(rat,)), rat
+
+
+def test_the_attack_key_asks_for_a_direction_and_costs_no_turn() -> None:
+    state = new_game(1234)
+    after = step(state, ATTACK)
+    assert after.awaiting_attack is True
+    assert after.turns == state.turns
+    assert EventKind.ATTACK_WHICH_WAY in {e.kind for e in after.events}
+
+
+def test_an_explicit_attack_hits_the_monster_without_moving_the_player() -> None:
+    state, rat = _with_adjacent_rat(new_game(1234))
+    after = step(step(state, ATTACK), Command(CommandKind.MOVE, 1, 0))
+    assert after.player == state.player, "an explicit attack must never be a step"
+    assert after.turns == state.turns + 1
+    kinds = {e.kind for e in after.events}
+    assert kinds & {EventKind.PLAYER_HIT_NPC, EventKind.PLAYER_MISSED_NPC, EventKind.NPC_KILLED}
+
+
+def test_an_explicit_attack_works_diagonally() -> None:
+    state, _ = _with_adjacent_rat(new_game(1234), dx=1, dy=1)
+    after = step(step(state, ATTACK), Command(CommandKind.MOVE, 1, 1))
+    assert after.player == state.player
+    kinds = {e.kind for e in after.events}
+    assert kinds & {EventKind.PLAYER_HIT_NPC, EventKind.PLAYER_MISSED_NPC, EventKind.NPC_KILLED}
+
+
+def test_swinging_at_an_empty_square_costs_a_turn() -> None:
+    # A free swing would be a free probe: it would tell the player whether a cell is
+    # occupied at no cost, which is exactly what a monster's turn is meant to buy.
+    state = dataclasses.replace(new_game(1234), npcs=())
+    after = step(step(state, ATTACK), Command(CommandKind.MOVE, 1, 0))
+    assert after.turns == state.turns + 1
+    assert after.player == state.player
+    assert EventKind.ATTACKED_NOTHING in {e.kind for e in after.events}
+
+
+def test_attacking_a_wall_is_still_just_a_swing_and_never_a_move() -> None:
+    state = dataclasses.replace(new_game(1234), npcs=())
+    # Whatever lies that way, the player does not move and a turn passes.
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        after = step(step(state, ATTACK), Command(CommandKind.MOVE, dx, dy))
+        assert after.player == state.player
+        assert after.turns == state.turns + 1
+
+
+def test_a_non_direction_after_the_attack_key_is_swallowed_whole() -> None:
+    # Same rule as the walk prefix: a typo costs nothing and does nothing.
+    state = new_game(1234)
+    after = step(step(state, ATTACK), QUIT_COMMAND)
+    assert after.running is True
+    assert after.awaiting_attack is False
+    assert after.turns == state.turns
+
+
+def test_the_attack_prefix_does_not_survive_the_command_that_clears_it() -> None:
+    state = new_game(1234)
+    assert step(step(state, ATTACK), Command(CommandKind.MOVE, 1, 0)).awaiting_attack is False
+
+
+# --- Projectile flight path --------------------------------------------------
+#
+# `step` records the cells an arrow flew through; `run` draws them. The path is
+# presentation only -- the shot is fully resolved before the first frame.
+
+
+def _aimed_at_a_rat():
+    """A state with a rat in view and in bow range, already targeted.
+
+    Built by hand rather than found by seed search: monsters spawn at least
+    ``SPAWN_SAFE_RADIUS`` (8) cells from the player start while the shortbow reaches
+    only 6, so **no seed has a shootable target on turn 0** — you always have to close
+    the distance first. That is deliberate, and it means these tests must place their
+    own target.
+    """
+    state = new_game(1234)
+    px, py = state.player
+    # Walk outwards along the row until a cell three east is still on the map and open.
+    spot = (px + 3, py)
+    if not state.level.is_walkable(*spot) or spot not in state.visible:
+        candidates = [
+            cell
+            for cell in state.visible
+            if state.level.is_walkable(*cell)
+            and cell != state.player
+            and max(abs(cell[0] - px), abs(cell[1] - py)) <= 6
+        ]
+        assert candidates, "seed 1234 should light at least one nearby floor cell"
+        spot = sorted(candidates)[0]
+    data = SPECIES_DATA[Species.RAT]
+    rat = NPC(
+        actor_id=99,
+        species=Species.RAT,
+        actor=Actor(data.stats, derive(data.stats).max_hp),
+        position=spot,
+    )
+    state = dataclasses.replace(state, npcs=(rat,))
+    aimed = step(state, Command(CommandKind.FIRE))
+    assert aimed.targeting is not None, "the rat should be targetable"
+    return aimed
+
+
+def test_firing_records_a_flight_path_from_the_player_to_the_target() -> None:
+    aimed = _aimed_at_a_rat()
+    target = aimed.targeting.targets[aimed.targeting.index]
+    shot = step(aimed, Command(CommandKind.FIRE))
+    assert shot.projectile[0] == aimed.player
+    assert shot.projectile[-1] == target
+
+
+def test_a_flight_path_is_contiguous() -> None:
+    aimed = _aimed_at_a_rat()
+    shot = step(aimed, Command(CommandKind.FIRE))
+    for before, after in zip(shot.projectile, shot.projectile[1:]):
+        assert max(abs(after[0] - before[0]), abs(after[1] - before[1])) == 1
+
+
+def test_a_flight_path_does_not_survive_into_the_next_turn() -> None:
+    # It is a one-turn artefact; a later frame must never redraw a stale arrow.
+    aimed = _aimed_at_a_rat()
+    shot = step(aimed, Command(CommandKind.FIRE))
+    assert shot.projectile
+    assert step(shot, Command(CommandKind.MOVE, 0, 1)).projectile == ()
+
+
+def test_ordinary_turns_record_no_flight_path() -> None:
+    state = new_game(1234)
+    assert state.projectile == ()
+    assert step(state, Command(CommandKind.MOVE, 0, 1)).projectile == ()
+
+
+def test_a_melee_attack_records_no_flight_path() -> None:
+    state, _ = _with_adjacent_rat(new_game(1234))
+    after = step(step(state, ATTACK), Command(CommandKind.MOVE, 1, 0))
+    assert after.projectile == ()
+
+
+def test_no_seed_offers_a_shot_on_the_very_first_turn() -> None:
+    """Monsters spawn at least 8 cells away; the shortbow reaches 6.
+
+    Recorded as a test because it is a real consequence of two constants chosen
+    independently (``npc.SPAWN_SAFE_RADIUS`` and ``items.SHORTBOW.range``), and if one
+    of them ever moves, this is the cheapest place to find out.
+    """
+    for seed in (1, 7, 42, 1234):
+        state = new_game(seed)
+        assert step(state, Command(CommandKind.FIRE)).targeting is None

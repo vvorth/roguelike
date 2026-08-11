@@ -59,6 +59,8 @@ class EventKind(Enum):
     NO_TARGET = auto()
     TARGETING = auto()
     SPOTTED_HOSTILE = auto()
+    ATTACK_WHICH_WAY = auto()
+    ATTACKED_NOTHING = auto()
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,8 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.NO_TARGET: "There is nothing to shoot at.",
     EventKind.TARGETING: "Target: {name}. [Tab] next, [f] fire, any other key cancels.",
     EventKind.SPOTTED_HOSTILE: "A {name} comes into view!",
+    EventKind.ATTACK_WHICH_WAY: "Attack in which direction?",
+    EventKind.ATTACKED_NOTHING: "You swing at thin air.",
 }
 
 

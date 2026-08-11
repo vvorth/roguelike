@@ -55,6 +55,7 @@ class Role(Enum):
     TERRAIN = auto()  # wall and floor
     DOOR = auto()
     PLAYER = auto()
+    PROJECTILE = auto()  # a missile in flight
     NPC = auto()  # a monster — only ever drawn at Visibility.VISIBLE (CONTRACT-v5 §4/§15 v5)
 
 
@@ -112,6 +113,11 @@ def attr_for(
             "attr_for(..., Visibility.UNSEEN): unseen cells are never drawn, "
             "so their attribute should never be requested"
         )
+    if role is Role.PROJECTILE and visibility is Visibility.EXPLORED:
+        raise ValueError(
+            "attr_for(Role.PROJECTILE, Visibility.EXPLORED): a missile is only ever "
+            "drawn mid-flight, so this combination is a caller bug"
+        )
     if role is Role.PLAYER and visibility is Visibility.EXPLORED:
         raise ValueError(
             "attr_for(Role.PLAYER, Visibility.EXPLORED): the player is always "
@@ -123,6 +129,14 @@ def attr_for(
             "when visible — monsters move, so a remembered one is a lie, and "
             "asking for this combination is a caller bug"
         )
+
+    if role is Role.PROJECTILE:
+        # Always in flight, therefore always visible; bright so the eye follows it.
+        if colors >= 256:
+            return Attr(226, bold=True)
+        if colors >= 8:
+            return Attr(_ANSI_YELLOW, bold=True)
+        return Attr(-1, bold=True)
 
     if role is Role.PLAYER:
         # visibility is guaranteed VISIBLE at this point.

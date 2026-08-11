@@ -27,10 +27,10 @@ def test_visibility_has_exactly_three_members():
     assert names == {"UNSEEN", "EXPLORED", "VISIBLE"}
 
 
-def test_role_has_exactly_four_members():
-    assert len(Role) == 4
+def test_role_has_exactly_five_members():
+    assert len(Role) == 5
     names = {m.name for m in Role}
-    assert names == {"TERRAIN", "DOOR", "PLAYER", "NPC"}
+    assert names == {"TERRAIN", "DOOR", "PLAYER", "PROJECTILE", "NPC"}
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +160,12 @@ def test_npc_visible_monochrome_is_terminal_default(colors, species):
 # Role.PLAYER and Role.NPC are both drawn only ever at Visibility.VISIBLE — asking for
 # their EXPLORED attribute is a caller bug for both (§4/§15 v5 extends the player's rule
 # to NPCs), so both are excluded from the EXPLORED half of the sweeps below.
-_ONLY_VISIBLE_ROLES = (Role.PLAYER, Role.NPC)
+_ONLY_VISIBLE_ROLES = (Role.PLAYER, Role.PROJECTILE, Role.NPC)
 
 
-@pytest.mark.parametrize("role", [Role.TERRAIN, Role.DOOR, Role.PLAYER, Role.NPC])
+@pytest.mark.parametrize(
+    "role", [Role.TERRAIN, Role.DOOR, Role.PLAYER, Role.PROJECTILE, Role.NPC]
+)
 def test_unseen_raises_for_every_role(role):
     with pytest.raises(ValueError):
         attr_for(role, Visibility.UNSEEN)

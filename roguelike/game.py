@@ -146,7 +146,7 @@ from roguelike.npc import (
     plan_action,
     spawn_npcs,
 )
-from roguelike.pathfind import Coord, Passable, find_path, octile
+from roguelike.pathfind import Coord, Passable, find_path, line_cells, octile
 from roguelike.stats import BASELINE, Actor, Stats, derive
 from roguelike.status import (
     REGEN_TURNS,
@@ -396,6 +396,8 @@ class GameState:
     npcs: tuple[NPC, ...] = ()
     targeting: Targeting | None = None
     help_page: int | None = None
+    awaiting_attack: bool = False
+    projectile: tuple[Coord, ...] = ()
 
 
 def new_game(
@@ -1071,7 +1073,35 @@ def _fire(state: GameState) -> GameState:
         if not targets:
             return replace(state, targeting=None, events=(Event(EventKind.NO_TARGET),))
         return _targeting_at(state, Targeting(targets, 0))
-    return _player_attack(state, cell, state.player_actor.ranged, False)
+    # The flight path is recorded on the state, not drawn here: `step` stays pure and
+    # `run` owns every clock in this project (CONTRACT-v4 §0.10). It is presentation
+    # only -- the shot is already fully resolved by the time the arrow is drawn moving.
+    after = _player_attack(state, cell, state.player_actor.ranged, False)
+    return replace(after, projectile=tuple(line_cells(state.player, cell)))
+
+
+def _attack_towards(state: GameState, dx: int, dy: int) -> GameState:
+    """``F`` then a direction: attack the adjacent cell that way, without moving.
+
+    The point of an explicit attack is that it **never** becomes a step. Walking into a
+    monster already attacks it (CONTRACT-v5 §7.9), but that is no use when you want to
+    hit something you might instead walk past, or to swing at a square you believe holds
+    something. So this resolves an attack on the neighbouring cell whatever is there, and
+    the player does not move either way.
+
+    Swinging at an empty square **costs a turn** and says so. That is deliberate: a free
+    swing would be a free probe, telling the player whether a cell is occupied at no cost,
+    which is exactly the information a monster's turn is supposed to buy.
+    """
+    target = (state.player[0] + dx, state.player[1] + dy)
+    if any(npc.position == target for npc in state.npcs):
+        return _player_attack(state, target, state.player_actor.melee, True)
+    return _take_turn(
+        state,
+        state.player,
+        state.open_doors,
+        (Event(EventKind.ATTACKED_NOTHING),),
+    )
 
 
 def _tick_status(actor: Actor) -> tuple[Actor, int]:
@@ -1472,6 +1502,11 @@ def step(state: GameState, command: Command) -> GameState:
     if not state.running:
         return state
 
+    # A flight path belongs to exactly the turn that produced it. Clearing it here means
+    # no later frame can redraw a stale arrow, whatever the next command turns out to be.
+    if state.projectile:
+        state = replace(state, projectile=())
+
     # The help screen swallows every key, so it is answered before anything else — even
     # before an activity is cleared, because reading the help is not a game action and
     # must not disturb a walk in progress.
@@ -1492,6 +1527,13 @@ def step(state: GameState, command: Command) -> GameState:
             )
         # A typo, not an error: the prefix is dropped, the command is swallowed whole,
         # and the message already on screen is left alone.
+        return state
+
+    if state.awaiting_attack:
+        state = replace(state, awaiting_attack=False)
+        if command.kind is CommandKind.MOVE:
+            return _tick_world(state, _attack_towards(state, command.dx, command.dy))
+        # Same rule as the walk prefix: a typo is swallowed whole and costs nothing.
         return state
 
     if state.targeting is not None:
@@ -1525,6 +1567,13 @@ def step(state: GameState, command: Command) -> GameState:
 
     if command.kind is CommandKind.HELP:
         return replace(state, help_page=0)
+
+    if command.kind is CommandKind.ATTACK:
+        return replace(
+            state,
+            awaiting_attack=True,
+            events=(Event(EventKind.ATTACK_WHICH_WAY),),
+        )
 
     if command.kind is CommandKind.FIRE:
         return _start_targeting(state)
@@ -1930,12 +1979,62 @@ _NO_KEY: int = -1
 #: are named apart here so neither can be mistaken for the other.
 _BLOCKING: int = -1
 
+#: Milliseconds the arrow rests on each cell of its flight. Short enough that a
+#: full-room shot is over in a fraction of a second, long enough to read as motion
+#: rather than a flicker. Delivered by the same `stdscr.timeout` that paces activities —
+#: this project has no `sleep` and no clock read anywhere, and must not grow one
+#: (CONTRACT-v4 §0.10).
+_PROJECTILE_FRAME_MS: int = 25
+
 
 def _target_cell(state: GameState) -> Coord | None:
     """The cell the ranged cursor is on, or ``None``. The renderer reverses it."""
     if state.targeting is None:
         return None
     return state.targeting.targets[state.targeting.index]
+
+
+def _npc_glyphs(state: GameState) -> tuple[render.NpcGlyph, ...]:
+    """The monsters as the renderer wants them: position, glyph, species name.
+
+    A monster reaches the renderer as plain data, because ``render.py`` may not import
+    ``npc.py`` (CONTRACT-v5 §10 v5). Glyph and name come from the same ``SPECIES_DATA``
+    entry, so they cannot disagree. The whole list goes over every time: "draw a monster
+    only where it can be seen, never from memory" is enforced inside the pure renderer,
+    not by caller discipline.
+    """
+    return tuple(
+        render.NpcGlyph(
+            position=npc.position,
+            glyph=SPECIES_DATA[npc.species].glyph,
+            species=SPECIES_DATA[npc.species].name,
+        )
+        for npc in state.npcs
+    )
+
+
+def _projectile_frame(state: GameState, cell: Coord) -> list[list[render.Cell]]:
+    """One frame of the arrow's flight, with the missile drawn at ``cell``.
+
+    Frame *construction* only — no clock, no keyboard, no drawing. The loop owns the
+    pacing, so ``stdscr.timeout`` still appears in exactly one function in this module
+    (CONTRACT-v4 §0.10), and this stays a pure function of a state and a coordinate.
+    """
+    return render.render_to_cells(
+        state.level,
+        state.player,
+        state.visible,
+        state.explored,
+        state.open_doors,
+        render.Chrome(
+            stats=format_stats(state),
+            message=events.message_for(state.events),
+            status_right=format_status_right(state),
+        ),
+        _npc_glyphs(state),
+        None,
+        cell,
+    )
 
 
 def _cancelled(state: GameState) -> GameState:
@@ -2015,12 +2114,6 @@ def run(stdscr, state: GameState) -> GameState:
                 message=events.message_for(state.events),
                 status_right=format_status_right(state),
             )
-            # A monster reaches the renderer as plain data — a position, a glyph and a
-            # lower-case species name, both of the latter from the same `SPECIES_DATA`
-            # entry so they cannot disagree — because `render.py` may not import
-            # `npc.py`. The whole list goes over: "draw a monster only where it can be
-            # seen, never from memory" is enforced inside the pure renderer, not by
-            # caller discipline.
             cells = render.render_to_cells(
                 state.level,
                 state.player,
@@ -2028,17 +2121,28 @@ def run(stdscr, state: GameState) -> GameState:
                 state.explored,
                 state.open_doors,
                 chrome,
-                tuple(
-                    render.NpcGlyph(
-                        position=npc.position,
-                        glyph=SPECIES_DATA[npc.species].glyph,
-                        species=SPECIES_DATA[npc.species].name,
-                    )
-                    for npc in state.npcs
-                ),
+                _npc_glyphs(state),
                 _target_cell(state),
             )
         render.draw(stdscr, cells)
+
+        # A shot just resolved: play the arrow's flight before asking for the next key.
+        # Purely a view of a turn that has already happened — the damage was dealt, the
+        # monster possibly killed and the message composed by `step`, so skipping the
+        # animation entirely would change nothing but what the player sees.
+        #
+        # This is the project's only animation and it introduces NO new timing mechanism:
+        # each frame waits on the same `stdscr.timeout` that paces an activity, so there
+        # is still no `sleep`, no clock read and no busy-wait anywhere (CONTRACT-v4 §0.10).
+        # A keypress cuts the flight short — the arrow has already landed, and a player
+        # hammering keys should not be made to wait. The first cell is skipped: it is the
+        # player's own square, where blanking the `@` for a frame would look like a bug.
+        if state.projectile:
+            stdscr.timeout(_PROJECTILE_FRAME_MS)
+            for cell in state.projectile[1:]:
+                render.draw(stdscr, _projectile_frame(state, cell))
+                if stdscr.getch() != _NO_KEY:
+                    break
 
         if state.activity is not None:
             stdscr.timeout(_ACTIVITY_TICK_MS)

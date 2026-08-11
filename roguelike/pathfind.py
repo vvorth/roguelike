@@ -127,6 +127,36 @@ def find_path(passable: Passable, start: Coord, goals: AbstractSet[Coord]) -> li
     return None
 
 
+def line_cells(a: Coord, b: Coord) -> list[Coord]:
+    """Every cell a straight line from ``a`` to ``b`` passes through, ``a`` first.
+
+    An integer Bresenham walk, so the result is exact and identical on every
+    machine -- no floats, matching the rest of this module. ``line_cells(a, a)``
+    is ``[a]``, and the last element is always ``b``.
+
+    This is geometry, not pathfinding: it takes no ``passable`` callable and
+    ignores walls entirely. It exists so a projectile can be drawn flying to a
+    target the caller has already decided it can reach.
+    """
+    (x0, y0), (x1, y1) = a, b
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    step_x = 1 if x1 > x0 else -1
+    step_y = 1 if y1 > y0 else -1
+    error = dx - dy
+    cells = [(x0, y0)]
+    while (x0, y0) != (x1, y1):
+        doubled = 2 * error
+        if doubled > -dy:
+            error -= dy
+            x0 += step_x
+        if doubled < dx:
+            error += dx
+            y0 += step_y
+        cells.append((x0, y0))
+    return cells
+
+
 def is_wide(passable: Passable, x: int, y: int) -> bool:
     """True iff (x, y) belongs to any 2x2 block of passable cells.
 

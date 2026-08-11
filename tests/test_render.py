@@ -1044,6 +1044,7 @@ def test_public_surface():
         "NpcGlyph",
         "render_to_cells",
         "render_text_page",
+        "PROJECTILE_CHAR",
         "to_lines",
         "init_colors",
         "draw",
@@ -1280,6 +1281,7 @@ def test_init_colors_populates_module_level_attr_table_for_every_combo():
         (Role.DOOR, Visibility.VISIBLE),
         (Role.DOOR, Visibility.EXPLORED),
         (Role.PLAYER, Visibility.VISIBLE),
+        (Role.PROJECTILE, Visibility.VISIBLE),
     }
     assert set(render_module._CELL_ATTRS.keys()) == expected_keys
 
