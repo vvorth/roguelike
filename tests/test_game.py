@@ -2934,6 +2934,19 @@ def walk(state: GameState, dx: int, dy: int) -> GameState:
     return step(step(state, WALK_PREFIX), Command(CommandKind.MOVE, dx, dy))
 
 
+def force_walk(state: GameState, dx: int, dy: int) -> GameState:
+    """Start an auto-walk *without* going through the keystrokes.
+
+    An automatic move is refused outright while a hostile is in view, which is the
+    right rule for a player pressing ``w`` and the wrong one for a test whose subject
+    is what ``advance`` does once an activity is running. This builds the activity
+    directly so those tests can still reach the code they are about.
+    """
+    return dataclasses.replace(
+        state, activity=Activity(ActivityKind.AUTO_WALK, direction=(dx, dy))
+    )
+
+
 def finish_activity(state: GameState, limit: int = 4000) -> GameState:
     """Call :func:`advance` until the activity clears, and return the final state.
 
@@ -4907,7 +4920,7 @@ def test_a_hostile_coming_into_view_cancels_the_activity() -> None:
     assert after.activity is None, "the walk stopped"
     spotted = [e for e in after.events if e.kind is EventKind.SPOTTED_HOSTILE]
     assert [e.name for e in spotted] == ["jackal"]
-    assert "A jackal comes into view!" in events.message_for(after.events)
+    assert "There is a jackal in view." in events.message_for(after.events)
 
 
 def test_the_nearest_newcomer_is_the_one_named() -> None:
@@ -4924,11 +4937,24 @@ def test_the_nearest_newcomer_is_the_one_named() -> None:
     assert event.name == "jackal"
 
 
-def test_an_already_visible_monster_merely_moving_does_not_interrupt() -> None:
+def test_any_visible_hostile_interrupts_not_only_a_newly_appeared_one() -> None:
+    """The rule was "newly visible" and is now "visible at all".
+
+    "Newly visible" was too weak: an activity that began before something wandered
+    into sight would keep walking past a monster that had been on screen the whole
+    time. Nothing is lost by stopping on every turn a visible monster shuffles,
+    because the activity is over on the first such turn -- there is no second one.
+    """
     before = with_npcs(start(fight_level()), make_npc((6, 3), Species.RAT))
     after = with_npcs(start(fight_level()), make_npc((5, 3), Species.RAT))
     assert (6, 3) in before.visible and (5, 3) in before.visible
-    assert interruption(before, after) is None
+    event = interruption(before, after)
+    assert event is not None and event.kind is EventKind.SPOTTED_HOSTILE
+
+
+def test_nothing_in_view_does_not_interrupt() -> None:
+    empty = dataclasses.replace(start(fight_level()), npcs=())
+    assert interruption(empty, empty) is None
 
 
 def test_taking_damage_interrupts() -> None:
@@ -4978,7 +5004,7 @@ def test_the_interruption_event_is_appended_not_substituted() -> None:
     state = corridor_state(rows, (2, 1))
     state = with_npcs(state, make_npc((3, 1), Species.JACKAL, energy=99))
     state = with_player(state, hp=40)
-    walking = walk(state, -1, 0)
+    walking = force_walk(state, -1, 0)
 
     for seed in range(200):
         attempt = advance(dataclasses.replace(walking, master_seed=seed))
@@ -5013,7 +5039,7 @@ def test_an_activity_turn_ticks_the_world_exactly_once() -> None:
         ),
         stats=UNKILLABLE,
     )
-    walking = walk(state, 1, 0)
+    walking = force_walk(state, 1, 0)
     after = advance(walking)
     assert after.turns == walking.turns + 1
     assert actions_taken(walking.npcs[0], after.npcs[0], 80) in (0, 1)
@@ -6068,3 +6094,89 @@ def test_resting_does_not_survive_a_level_change() -> None:
     # Every command clears a running activity first; that is the v4 rule and it
     # applies to resting with no special case.
     assert step(resting, QUIT_COMMAND).activity is None
+
+
+# --- Automatic movement only ever happens on an empty screen ------------------
+
+
+def _watched_by_a_jackal():
+    state = new_game(1234)
+    data = SPECIES_DATA[Species.JACKAL]
+    spot = next(
+        cell
+        for cell in sorted(state.visible)
+        if state.level.is_walkable(*cell) and cell != state.player
+    )
+    npc = NPC(9, Species.JACKAL, Actor(data.stats, derive(data.stats).max_hp), spot)
+    return dataclasses.replace(state, npcs=(npc,))
+
+
+def test_auto_explore_is_refused_while_a_hostile_is_in_view() -> None:
+    state = _watched_by_a_jackal()
+    after = step(state, Command(CommandKind.AUTO_EXPLORE))
+    assert after.activity is None
+    assert after.turns == state.turns
+    assert EventKind.HOSTILE_IN_VIEW in {e.kind for e in after.events}
+    assert "jackal" in events.message_for(after.events)
+
+
+def test_travel_to_the_stairs_is_refused_while_a_hostile_is_in_view() -> None:
+    state = _watched_by_a_jackal()
+    after = step(state, Command(CommandKind.DESCEND))
+    assert after.activity is None
+    assert after.turns == state.turns
+    assert EventKind.HOSTILE_IN_VIEW in {e.kind for e in after.events}
+
+
+def test_auto_walk_is_refused_while_a_hostile_is_in_view() -> None:
+    state = _watched_by_a_jackal()
+    after = walk(state, 1, 0)
+    assert after.activity is None
+    assert after.turns == state.turns
+    assert EventKind.HOSTILE_IN_VIEW in {e.kind for e in after.events}
+
+
+def test_the_refusal_names_the_creature_so_the_reason_is_obvious() -> None:
+    state = _watched_by_a_jackal()
+    line = events.message_for(step(state, Command(CommandKind.AUTO_EXPLORE)).events)
+    assert "jackal" in line and "view" in line
+
+
+def test_automatic_movement_starts_normally_on_an_empty_screen() -> None:
+    state = dataclasses.replace(new_game(1234), npcs=())
+    started = step(state, Command(CommandKind.AUTO_EXPLORE))
+    assert started.activity is not None
+    assert started.activity.kind is ActivityKind.AUTO_EXPLORE
+
+
+def test_a_running_activity_stops_the_moment_a_hostile_is_visible() -> None:
+    state = dataclasses.replace(new_game(1234), npcs=())
+    running = advance(step(state, Command(CommandKind.AUTO_EXPLORE)))
+    assert running.activity is not None
+
+    data = SPECIES_DATA[Species.JACKAL]
+    spot = next(
+        cell
+        for cell in sorted(running.visible)
+        if running.level.is_walkable(*cell) and cell != running.player
+    )
+    seen = dataclasses.replace(
+        running,
+        npcs=(NPC(9, Species.JACKAL, Actor(data.stats, derive(data.stats).max_hp), spot),),
+    )
+    after = advance(seen)
+    assert after.activity is None
+    assert "jackal" in events.message_for(after.events)
+
+
+def test_a_peaceful_creature_does_not_block_automatic_movement(monkeypatch) -> None:
+    # The rule is about *hostiles*. Something harmless standing in the room is not a
+    # reason to refuse to explore, or a peaceful level could never be auto-explored.
+    state = _watched_by_a_jackal()
+    monkeypatch.setitem(
+        SPECIES_DATA,
+        Species.JACKAL,
+        dataclasses.replace(SPECIES_DATA[Species.JACKAL], hostile=False),
+    )
+    after = step(state, Command(CommandKind.AUTO_EXPLORE))
+    assert after.activity is not None

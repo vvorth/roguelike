@@ -652,6 +652,25 @@ def _whole_level_passable(state: GameState) -> Passable:
     return passable
 
 
+def _refuse_automatic_move(state: GameState) -> GameState | None:
+    """Refuse to hand the reins over while something hostile is watching.
+
+    Returns a state carrying the refusal, or ``None`` when there is nothing in view and
+    the caller may proceed. Costs no turn either way — declining to start is not an
+    action.
+
+    Every automatic move goes through here: auto-explore, travel and auto-walk alike.
+    Letting the player start one with a jackal already on screen is the same mistake as
+    letting a walk continue into a pack — :func:`interruption` catches the second case,
+    and this catches the first, which it structurally cannot: it only fires on a monster
+    that *newly* appears.
+    """
+    name = _visible_hostile(state)
+    if name is None:
+        return None
+    return replace(state, events=(Event(EventKind.HOSTILE_IN_VIEW, name=name),))
+
+
 def _travel_or_report(
     state: GameState, candidates: tuple[Coord, ...], unknown: EventKind
 ) -> GameState:
@@ -671,6 +690,10 @@ def _travel_or_report(
 
     No turn is consumed either way — starting an activity is not itself an action.
     """
+    refusal = _refuse_automatic_move(state)
+    if refusal is not None:
+        return refusal
+
     goals = frozenset(cell for cell in candidates if cell in state.explored)
     if not goals:
         return replace(state, events=(Event(unknown),))
@@ -1114,12 +1137,27 @@ def xp_for_kill(xp_value: int, killer_is_player: bool) -> int:
     return max(0, xp_value) // NPC_XP_DIVISOR
 
 
+def _visible_hostile(state: GameState) -> str | None:
+    """The nearest visible hostile's species name, or ``None`` if none is in view.
+
+    Nearest by Chebyshev distance, ties broken by coordinate, so the name in the message
+    is deterministic. Used both to refuse an automatic move and to stop one already
+    running — the same question in both cases, asked in one place.
+    """
+    seen = [
+        npc
+        for npc in state.npcs
+        if npc.position in state.visible and SPECIES_DATA[npc.species].hostile
+    ]
+    if not seen:
+        return None
+    nearest = min(seen, key=lambda npc: (_chebyshev(npc.position, state.player), npc.position))
+    return SPECIES_DATA[nearest.species].name
+
+
 def _hostile_in_view(state: GameState) -> bool:
     """Is any hostile monster currently visible? Used to refuse a rest."""
-    return any(
-        npc.position in state.visible and SPECIES_DATA[npc.species].hostile
-        for npc in state.npcs
-    )
+    return _visible_hostile(state) is not None
 
 
 def _is_hostile_at(state: GameState, cell: Coord) -> bool:
@@ -1705,6 +1743,9 @@ def step(state: GameState, command: Command) -> GameState:
     if state.awaiting_walk:
         state = replace(state, awaiting_walk=False)
         if command.kind is CommandKind.MOVE:
+            refusal = _refuse_automatic_move(state)
+            if refusal is not None:
+                return refusal
             return replace(
                 state,
                 activity=Activity(
@@ -1749,6 +1790,9 @@ def step(state: GameState, command: Command) -> GameState:
         )
 
     if command.kind is CommandKind.AUTO_EXPLORE:
+        refusal = _refuse_automatic_move(state)
+        if refusal is not None:
+            return refusal
         return replace(state, activity=Activity(ActivityKind.AUTO_EXPLORE))
 
     if command.kind is CommandKind.HELP:
@@ -2045,19 +2089,27 @@ def interruption(before: GameState, after: GameState) -> Event | None:
     three are computable from the two states this function already receives. In priority
     order:
 
-    1. **A hostile comes into view** — a monster standing somewhere that is in
-       ``after.visible`` and was not in ``before.visible``. Returns ``SPOTTED_HOSTILE``
-       naming the species, choosing the nearest by Chebyshev distance and breaking ties by
-       coordinate so the answer is total and reproducible.
+    1. **A hostile is in view at all** — not merely one that has just appeared. Returns
+       ``SPOTTED_HOSTILE`` naming the species, choosing the nearest by Chebyshev distance
+       and breaking ties by coordinate so the answer is total and reproducible.
+       "Newly visible" was the original rule and it was too weak: an activity that began
+       before something wandered into sight would keep walking past a monster that had
+       been on screen the whole time.
+    …checked *after* the two below, which say things the player cannot see for
+       themselves.
+
     2. **The player took damage** — hit points went down, from any cause. ``INTERRUPTED``.
     3. **The character's state changed** — a status effect of a kind that was not there
        before. ``INTERRUPTED``.
 
     Otherwise ``None``. **Opening a door still does not interrupt** (v4 user decision 3):
-    the door opens, costs its turn, says so, and the walk carries on. Neither does a
-    monster that was already visible merely moving — the condition is about a position
-    coming into view, not about a monster twitching in plain sight, or an auto-explore
-    would stop every turn a rat shuffled.
+    the door opens, costs its turn, says so, and the walk carries on.
+
+    Nothing is lost by stopping every turn a visible monster shuffles: the activity is
+    over on the first such turn, so there is no second one to stop. And an automatic move
+    cannot be *started* with a hostile in view either (:func:`_refuse_automatic_move`),
+    so the two rules together mean automatic movement only ever happens on an empty
+    screen.
 
     This is not a nicety: two jackals beat a baseline player 100% of the time, so an
     auto-explore that walks into a pack and keeps walking is a death with no chance to
@@ -2067,18 +2119,9 @@ def interruption(before: GameState, after: GameState) -> Event | None:
     registry, an observer list or a plugin mechanism. v4 said so with one condition and it
     is still the right shape with three.
     """
-    appeared = [
-        npc
-        for npc in after.npcs
-        if npc.position in after.visible and npc.position not in before.visible
-    ]
-    if appeared:
-        nearest = min(
-            appeared,
-            key=lambda npc: (_chebyshev(after.player, npc.position), npc.position),
-        )
-        return Event(EventKind.SPOTTED_HOSTILE, name=_species_name(nearest))
-
+    # Damage and status changes answer first: they say something the player cannot see
+    # for themselves, and "The jackal hits you. You stop." reads better than being told
+    # about a jackal that has been on screen for ten turns.
     if after.player_actor.actor.hp < before.player_actor.actor.hp:
         return Event(EventKind.INTERRUPTED)
 
@@ -2087,6 +2130,23 @@ def interruption(before: GameState, after: GameState) -> Event | None:
     }
     if gained:
         return Event(EventKind.INTERRUPTED)
+
+    # ANY hostile in view stops an automatic move, not merely one that just appeared.
+    # "Newly visible" was too weak: an activity started before something wandered into
+    # sight, or resumed after a stop, would happily keep walking past a jackal that had
+    # been on screen the whole time. The player asked for the reins back the moment
+    # anything hostile can be seen, and that is the condition that means it.
+    watching = [
+        npc
+        for npc in after.npcs
+        if npc.position in after.visible and SPECIES_DATA[npc.species].hostile
+    ]
+    if watching:
+        nearest = min(
+            watching,
+            key=lambda npc: (_chebyshev(after.player, npc.position), npc.position),
+        )
+        return Event(EventKind.SPOTTED_HOSTILE, name=_species_name(nearest))
 
     return None
 

@@ -66,6 +66,7 @@ class EventKind(Enum):
     RESTING = auto()
     RESTED = auto()
     CANNOT_REST = auto()
+    HOSTILE_IN_VIEW = auto()
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,7 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.POISON_DAMAGE: "The poison burns.",
     EventKind.NO_TARGET: "There is nothing to shoot at.",
     EventKind.TARGETING: "Target: {name}. [Tab] next, [f] fire, any other key cancels.",
-    EventKind.SPOTTED_HOSTILE: "A {name} comes into view!",
+    EventKind.SPOTTED_HOSTILE: "There is a {name} in view.",
     EventKind.ATTACK_WHICH_WAY: "Attack in which direction?",
     EventKind.ATTACKED_NOTHING: "You swing at thin air.",
     EventKind.SWAPPED_PLACES: "You swap places with the {name}.",
@@ -126,6 +127,7 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.RESTING: "You settle down to rest.",
     EventKind.RESTED: "You feel rested.",
     EventKind.CANNOT_REST: "Not with enemies in view.",
+    EventKind.HOSTILE_IN_VIEW: "Not while a {name} is in view.",
 }
 
 

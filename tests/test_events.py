@@ -52,7 +52,7 @@ EXPECTED_MESSAGES = {
     EventKind.POISON_DAMAGE: "The poison burns.",
     EventKind.NO_TARGET: "There is nothing to shoot at.",
     EventKind.TARGETING: "Target: {name}. [Tab] next, [f] fire, any other key cancels.",
-    EventKind.SPOTTED_HOSTILE: "A {name} comes into view!",
+    EventKind.SPOTTED_HOSTILE: "There is a {name} in view.",
     EventKind.ATTACK_WHICH_WAY: "Attack in which direction?",
     EventKind.ATTACKED_NOTHING: "You swing at thin air.",
     EventKind.SWAPPED_PLACES: "You swap places with the {name}.",
@@ -60,13 +60,14 @@ EXPECTED_MESSAGES = {
     EventKind.RESTING: "You settle down to rest.",
     EventKind.RESTED: "You feel rested.",
     EventKind.CANNOT_REST: "Not with enemies in view.",
+    EventKind.HOSTILE_IN_VIEW: "Not while a {name} is in view.",
 }
 
 
 # --- EventKind shape ----------------------------------------------------------
 
 
-def test_event_kind_has_exactly_thirty_five_members() -> None:
+def test_event_kind_has_exactly_thirty_six_members() -> None:
     # The eight from v3, the eight from v4 (CONTRACT-v4 §16), plus the twelve
     # new v5 combat/death/levelling/poison/targeting kinds (CONTRACT-v5 §16),
     # in declaration order.
@@ -106,15 +107,16 @@ def test_event_kind_has_exactly_thirty_five_members() -> None:
         "RESTING",
         "RESTED",
         "CANNOT_REST",
+        "HOSTILE_IN_VIEW",
     ]
 
 
-def test_event_kind_has_exactly_thirty_five_members_by_len() -> None:
-    assert len(list(EventKind)) == 35
+def test_event_kind_has_exactly_thirty_six_members_by_len() -> None:
+    assert len(list(EventKind)) == 36
 
 
 def test_event_kind_uses_auto_values() -> None:
-    assert [member.value for member in EventKind] == list(range(1, 36))
+    assert [member.value for member in EventKind] == list(range(1, 37))
 
 
 # --- MESSAGES: complete and exact --------------------------------------------
@@ -130,8 +132,8 @@ def test_messages_has_no_extra_entries() -> None:
     assert set(MESSAGES) == set(EventKind)
 
 
-def test_messages_has_exactly_thirty_five_entries() -> None:
-    assert len(MESSAGES) == 35
+def test_messages_has_exactly_thirty_six_entries() -> None:
+    assert len(MESSAGES) == 36
 
 
 @pytest.mark.parametrize("kind", list(EventKind))
@@ -332,7 +334,7 @@ def test_targeting_message() -> None:
 def test_spotted_hostile_message() -> None:
     assert (
         message_for((Event(EventKind.SPOTTED_HOSTILE, name="giant bat"),))
-        == "A giant bat comes into view!"
+        == "There is a giant bat in view."
     )
 
 
