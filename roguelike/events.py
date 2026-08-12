@@ -70,6 +70,7 @@ class EventKind(Enum):
     CLOSE_WHICH_WAY = auto()
     DOOR_CLOSED = auto()
     NOTHING_TO_CLOSE = auto()
+    NO_DOOR_ADJACENT = auto()
     DOORWAY_BLOCKED = auto()
     # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
     SHIELD_BLOCKED = auto()
@@ -151,6 +152,7 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.CLOSE_WHICH_WAY: "Close a door in which direction?",
     EventKind.DOOR_CLOSED: "The door closes.",
     EventKind.NOTHING_TO_CLOSE: "There is no open door that way.",
+    EventKind.NO_DOOR_ADJACENT: "There is no open door beside you.",
     EventKind.DOORWAY_BLOCKED: "The {name} is standing in the doorway.",
     # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
     EventKind.SHIELD_BLOCKED: "Your shield turns the blow.",

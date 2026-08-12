@@ -64,6 +64,7 @@ EXPECTED_MESSAGES = {
     EventKind.CLOSE_WHICH_WAY: "Close a door in which direction?",
     EventKind.DOOR_CLOSED: "The door closes.",
     EventKind.NOTHING_TO_CLOSE: "There is no open door that way.",
+    EventKind.NO_DOOR_ADJACENT: "There is no open door beside you.",
     EventKind.DOORWAY_BLOCKED: "The {name} is standing in the doorway.",
     # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
     EventKind.SHIELD_BLOCKED: "Your shield turns the blow.",
@@ -87,7 +88,7 @@ EXPECTED_MESSAGES = {
 # --- EventKind shape ----------------------------------------------------------
 
 
-def test_event_kind_has_exactly_fifty_five_members() -> None:
+def test_event_kind_has_exactly_fifty_six_members() -> None:
     # The eight from v3, the eight from v4 (CONTRACT-v4 §16), the twenty new
     # v5 kinds (combat/death/levelling/poison/targeting plus the melee,
     # look and rest kinds that arrived alongside them), plus the fifteen new
@@ -133,6 +134,7 @@ def test_event_kind_has_exactly_fifty_five_members() -> None:
         "CLOSE_WHICH_WAY",
         "DOOR_CLOSED",
         "NOTHING_TO_CLOSE",
+        "NO_DOOR_ADJACENT",
         "DOORWAY_BLOCKED",
         "SHIELD_BLOCKED",
         "NPC_SHIELD_BLOCKED",
@@ -152,12 +154,12 @@ def test_event_kind_has_exactly_fifty_five_members() -> None:
     ]
 
 
-def test_event_kind_has_exactly_fifty_five_members_by_len() -> None:
-    assert len(list(EventKind)) == 55
+def test_event_kind_has_exactly_fifty_six_members_by_len() -> None:
+    assert len(list(EventKind)) == 56
 
 
 def test_event_kind_uses_auto_values() -> None:
-    assert [member.value for member in EventKind] == list(range(1, 56))
+    assert [member.value for member in EventKind] == list(range(1, 57))
 
 
 # --- MESSAGES: complete and exact --------------------------------------------
@@ -173,8 +175,8 @@ def test_messages_has_no_extra_entries() -> None:
     assert set(MESSAGES) == set(EventKind)
 
 
-def test_messages_has_exactly_fifty_five_entries() -> None:
-    assert len(MESSAGES) == 55
+def test_messages_has_exactly_fifty_six_entries() -> None:
+    assert len(MESSAGES) == 56
 
 
 @pytest.mark.parametrize("kind", list(EventKind))

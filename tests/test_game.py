@@ -69,6 +69,7 @@ from roguelike.game import (
     Targeting,
     advance,
     advance_npcs,
+    _adjacent_open_doors,
     describe_cell,
     format_help_status,
     format_inventory_status,
@@ -7215,17 +7216,68 @@ def _beside_an_open_door():
     raise AssertionError("no reachable door on this level")
 
 
-def test_close_asks_for_a_direction_and_costs_no_turn() -> None:
-    state, _, _ = _beside_an_open_door()
+def test_one_adjacent_door_closes_outright_without_asking() -> None:
+    """Making the player name a direction they have no choice about is a keystroke
+    that carries no information."""
+    state, door, _ = _beside_an_open_door()
+    assert len(_adjacent_open_doors(state)) == 1
     after = step(state, CLOSE)
-    assert after.awaiting_close is True
+    assert after.awaiting_close is False
+    assert door not in after.open_doors
+    assert after.turns == state.turns + 1
+    assert EventKind.DOOR_CLOSED in {e.kind for e in after.events}
+
+
+def test_no_adjacent_door_says_so_without_asking_a_direction() -> None:
+    state = dataclasses.replace(new_game(1234), npcs=(), open_doors=frozenset())
+    after = step(state, CLOSE)
+    assert after.awaiting_close is False
     assert after.turns == state.turns
-    assert EventKind.CLOSE_WHICH_WAY in {e.kind for e in after.events}
+    # A different sentence from the one a wrong direction earns: nothing was aimed
+    # at, so "that way" would answer a question nobody asked.
+    assert EventKind.NO_DOOR_ADJACENT in {e.kind for e in after.events}
+
+
+def test_two_adjacent_doors_ask_which_one() -> None:
+    state = dataclasses.replace(new_game(1234), npcs=())
+    doors = [
+        (x, y)
+        for y in range(state.level.height)
+        for x in range(state.level.width)
+        if state.level.tile_at(x, y).name == "DOOR"
+    ]
+    spot = None
+    for cell in (
+        (x, y)
+        for y in range(state.level.height)
+        for x in range(state.level.width)
+    ):
+        if not state.level.is_walkable(*cell):
+            continue
+        near = [
+            d for d in doors
+            if max(abs(d[0] - cell[0]), abs(d[1] - cell[1])) == 1
+        ]
+        if len(near) >= 2:
+            spot = (cell, near)
+            break
+    if spot is None:
+        pytest.skip("no cell on this level touches two doors")
+    cell, near = spot
+    state = dataclasses.replace(state, player=cell, open_doors=frozenset(near))
+    asked = step(state, CLOSE)
+    assert asked.awaiting_close is True
+    assert asked.turns == state.turns
+    assert EventKind.CLOSE_WHICH_WAY in {e.kind for e in asked.events}
+
+    dx, dy = near[0][0] - cell[0], near[0][1] - cell[1]
+    after = step(asked, Command(CommandKind.MOVE, dx, dy))
+    assert near[0] not in after.open_doors
 
 
 def test_closing_an_open_door_shuts_it_and_costs_a_turn() -> None:
     state, door, (dx, dy) = _beside_an_open_door()
-    after = step(step(state, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    after = step(state, CLOSE)
     assert door not in after.open_doors
     assert after.turns == state.turns + 1
     assert after.player == state.player, "closing a door is not a step"
@@ -7235,7 +7287,7 @@ def test_closing_an_open_door_shuts_it_and_costs_a_turn() -> None:
 def test_closing_recomputes_what_can_be_seen() -> None:
     # Shutting a door changes visibility exactly as opening one does.
     state, door, (dx, dy) = _beside_an_open_door()
-    after = step(step(state, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    after = step(state, CLOSE)
     assert after.visible != state.visible or door not in after.open_doors
 
 
@@ -7260,13 +7312,16 @@ def test_a_door_can_be_closed_diagonally() -> None:
         pytest.skip("this level has no diagonally reachable door")
     door, stand, (dx, dy) = found
     state = dataclasses.replace(state, player=stand, open_doors=frozenset({door}))
-    after = step(step(state, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    after = step(state, CLOSE)          # the only door beside you: no prompt
     assert door not in after.open_doors
 
 
-def test_closing_nothing_reports_and_costs_no_turn() -> None:
-    state = dataclasses.replace(new_game(1234), npcs=())
-    after = step(step(state, CLOSE), Command(CommandKind.MOVE, 1, 0))
+def test_a_wrong_direction_at_the_prompt_reports_and_costs_no_turn() -> None:
+    # Reached only via the two-door prompt; `_close_towards` still guards itself.
+    from roguelike.game import _close_towards
+
+    state, _, _ = _beside_an_open_door()
+    after = _close_towards(state, 0, 0)
     assert after.turns == state.turns
     assert EventKind.NOTHING_TO_CLOSE in {e.kind for e in after.events}
 
@@ -7283,7 +7338,7 @@ def test_a_creature_in_the_doorway_blocks_it_and_is_named() -> None:
             NPC(9, Species.RAT, Actor(data.stats, derive(data.stats).max_hp), door),
         ),
     )
-    after = step(step(state, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    after = step(state, CLOSE)
     assert door in after.open_doors, "the door must stay open"
     assert after.turns == state.turns, "a refused close costs nothing"
     assert EventKind.DOORWAY_BLOCKED in {e.kind for e in after.events}
@@ -7293,14 +7348,15 @@ def test_a_creature_in_the_doorway_blocks_it_and_is_named() -> None:
 def test_a_closed_door_cannot_be_closed_again() -> None:
     state, door, (dx, dy) = _beside_an_open_door()
     shut = dataclasses.replace(state, open_doors=frozenset())
-    after = step(step(shut, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    after = step(shut, CLOSE)
     assert after.turns == shut.turns
-    assert EventKind.NOTHING_TO_CLOSE in {e.kind for e in after.events}
+    assert EventKind.NO_DOOR_ADJACENT in {e.kind for e in after.events}
 
 
-def test_a_non_direction_after_close_is_swallowed_whole() -> None:
+def test_a_non_direction_at_the_close_prompt_is_swallowed_whole() -> None:
     state, _, _ = _beside_an_open_door()
-    after = step(step(state, CLOSE), QUIT_COMMAND)
+    prompted = dataclasses.replace(state, awaiting_close=True)
+    after = step(prompted, QUIT_COMMAND)
     assert after.running is True
     assert after.awaiting_close is False
     assert after.turns == state.turns

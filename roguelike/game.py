@@ -187,7 +187,14 @@ from roguelike.npc import (
     resistance_of,
     spawn_npcs,
 )
-from roguelike.pathfind import Coord, Passable, find_path, line_cells, octile
+from roguelike.pathfind import (
+    DIRECTIONS,
+    Coord,
+    Passable,
+    find_path,
+    line_cells,
+    octile,
+)
 from roguelike.stats import BASELINE, Actor, Stats, derive
 from roguelike.status import (
     REGEN_TURNS,
@@ -1511,27 +1518,34 @@ def _swap_with(state: GameState, cell: Coord) -> GameState:
     )
 
 
-def _close_towards(state: GameState, dx: int, dy: int) -> GameState:
-    """``c`` then a direction: shut the open door on the neighbouring cell.
+def _adjacent_open_doors(state: GameState) -> tuple[Coord, ...]:
+    """Every open door touching the player, in a fixed order.
 
-    **Any of the eight neighbours**, diagonals included — a door is reachable from a corner
-    and refusing that would be an arbitrary rule the player has to learn.
+    All eight neighbours — a door is reachable from a corner, and excluding diagonals
+    would be an arbitrary rule the player learns by failing. Sorted so the answer is
+    deterministic and never depends on iteration order.
+    """
+    x, y = state.player
+    return tuple(
+        sorted(
+            (x + dx, y + dy)
+            for dx, dy in DIRECTIONS
+            if (x + dx, y + dy) in state.open_doors
+        )
+    )
 
-    Three ways it can fail, all costing **no turn**, because none of them is an action:
 
-    * no open door that way — ``NOTHING_TO_CLOSE``;
-    * something is standing in the doorway — ``DOORWAY_BLOCKED``, naming it. A door cannot
-      shut through a creature, and a monster in the frame is exactly when a player most
-      wants to try, so it says which one rather than silently refusing;
-    * the player is standing in it themselves, which the neighbour rule already excludes.
-
-    Closing succeeds only on a door that is currently open, so it is never a way to
-    discover an unexplored cell.
+def _close_at(state: GameState, target: Coord) -> GameState:
+    """Shut the open door on ``target``, or say why not. Never moves the player.
 
     Costs one turn when it works, and recomputes field of view — shutting a door changes
     what can be seen, exactly as opening one does.
+
+    Two ways it declines, neither costing a turn, because neither is an action: there is
+    no open door there, or something is standing in the frame. A door cannot shut through
+    a creature, and a monster in the doorway is exactly when a player most wants to try,
+    so the refusal names it rather than failing silently.
     """
-    target = (state.player[0] + dx, state.player[1] + dy)
     if target not in state.open_doors:
         return replace(state, events=(Event(EventKind.NOTHING_TO_CLOSE),))
     for npc in state.npcs:
@@ -1551,6 +1565,15 @@ def _close_towards(state: GameState, dx: int, dy: int) -> GameState:
         state.open_doors - {target},
         (Event(EventKind.DOOR_CLOSED),),
     )
+
+
+def _close_towards(state: GameState, dx: int, dy: int) -> GameState:
+    """``c`` then a direction: shut the open door on the neighbouring cell.
+
+    Reached only when **more than one** door touches the player — with a single one, ``c``
+    shuts it outright and never asks. See :func:`_close_at` for what happens then.
+    """
+    return _close_at(state, (state.player[0] + dx, state.player[1] + dy))
 
 
 def _attack_towards(state: GameState, dx: int, dy: int) -> GameState:
@@ -2490,6 +2513,16 @@ def step(state: GameState, command: Command) -> GameState:
         return _look_at(state, state.player)
 
     if command.kind is CommandKind.CLOSE:
+        # Only ask when the question is real. With one door beside you there is nothing
+        # to disambiguate, and making the player name a direction they have no choice
+        # about is a keystroke that carries no information.
+        doors = _adjacent_open_doors(state)
+        if not doors:
+            # A different sentence from the one a wrong direction earns: nothing was
+            # aimed at, so "that way" would be answering a question nobody asked.
+            return replace(state, events=(Event(EventKind.NO_DOOR_ADJACENT),))
+        if len(doors) == 1:
+            return _close_at(state, doors[0])
         return replace(
             state,
             awaiting_close=True,

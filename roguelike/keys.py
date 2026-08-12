@@ -157,7 +157,7 @@ HELP_ENTRIES: tuple[tuple[str, str], ...] = (
     ("<", "ascend, or travel to a known up staircase"),
     ("move into a monster", "attack it"),
     ("a + direction", "attack that way without moving"),
-    ("c + direction", "close an open door beside you"),
+    ("c", "close a door beside you (asks only if there are two)"),
     ("f", "aim the bow; Tab cycles targets, f shoots"),
     ("Tab", "next target while aiming"),
     ("x", "look around; direction keys move the cursor"),
