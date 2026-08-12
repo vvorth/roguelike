@@ -305,7 +305,7 @@ def test_every_bound_key_in_the_table_is_expected() -> None:
     # The help screen, and the explicit-attack prefix.
     expected |= {ord("?"), ord("a"), ord("x"), ord("R")}
     # v6 additions: inventory, pick-up.
-    expected |= {ord("i"), ord("g")}
+    expected |= {ord("i"), ord("g"), ord("c")}
     assert set(keys_module._KEY_BINDINGS) == expected
 
 
@@ -835,22 +835,23 @@ def test_command_kind_members() -> None:
         "ATTACK",
         "LOOK",
         "REST",
+        "CLOSE",
         "INVENTORY",
         "PICK_UP",
     ]
 
 
 def test_command_kind_uses_auto_values() -> None:
-    assert [member.value for member in CommandKind] == list(range(1, 16))
+    assert [member.value for member in CommandKind] == list(range(1, 17))
 
 
-def test_command_kind_has_exactly_fifteen_members() -> None:
+def test_command_kind_has_exactly_sixteen_members() -> None:
     # The five from v3 (MOVE, QUIT, UNKNOWN, DESCEND, ASCEND), the two from v4
     # (AUTO_EXPLORE, WALK_PREFIX), the two from v5 (FIRE, TARGET_NEXT), HELP,
     # ATTACK, LOOK and REST (which arrived without a version bump to this
     # docstring's count), and the two from v6 (INVENTORY, PICK_UP).
-    assert len(list(CommandKind)) == 15
-    assert len(CommandKind) == 15
+    assert len(list(CommandKind)) == 16
+    assert len(CommandKind) == 16
 
 
 def test_module_constants_are_the_expected_kinds() -> None:

@@ -61,6 +61,10 @@ EXPECTED_MESSAGES = {
     EventKind.RESTED: "You feel rested.",
     EventKind.CANNOT_REST: "Not with enemies in view.",
     EventKind.HOSTILE_IN_VIEW: "Not while a {name} is in view.",
+    EventKind.CLOSE_WHICH_WAY: "Close a door in which direction?",
+    EventKind.DOOR_CLOSED: "The door closes.",
+    EventKind.NOTHING_TO_CLOSE: "There is no open door that way.",
+    EventKind.DOORWAY_BLOCKED: "The {name} is standing in the doorway.",
     # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
     EventKind.SHIELD_BLOCKED: "Your shield turns the blow.",
     EventKind.NPC_SHIELD_BLOCKED: "The {name} blocks with its shield.",
@@ -83,7 +87,7 @@ EXPECTED_MESSAGES = {
 # --- EventKind shape ----------------------------------------------------------
 
 
-def test_event_kind_has_exactly_fifty_one_members() -> None:
+def test_event_kind_has_exactly_fifty_five_members() -> None:
     # The eight from v3, the eight from v4 (CONTRACT-v4 §16), the twenty new
     # v5 kinds (combat/death/levelling/poison/targeting plus the melee,
     # look and rest kinds that arrived alongside them), plus the fifteen new
@@ -126,6 +130,10 @@ def test_event_kind_has_exactly_fifty_one_members() -> None:
         "RESTED",
         "CANNOT_REST",
         "HOSTILE_IN_VIEW",
+        "CLOSE_WHICH_WAY",
+        "DOOR_CLOSED",
+        "NOTHING_TO_CLOSE",
+        "DOORWAY_BLOCKED",
         "SHIELD_BLOCKED",
         "NPC_SHIELD_BLOCKED",
         "RESISTED",
@@ -144,12 +152,12 @@ def test_event_kind_has_exactly_fifty_one_members() -> None:
     ]
 
 
-def test_event_kind_has_exactly_fifty_one_members_by_len() -> None:
-    assert len(list(EventKind)) == 51
+def test_event_kind_has_exactly_fifty_five_members_by_len() -> None:
+    assert len(list(EventKind)) == 55
 
 
 def test_event_kind_uses_auto_values() -> None:
-    assert [member.value for member in EventKind] == list(range(1, 52))
+    assert [member.value for member in EventKind] == list(range(1, 56))
 
 
 # --- MESSAGES: complete and exact --------------------------------------------
@@ -165,8 +173,8 @@ def test_messages_has_no_extra_entries() -> None:
     assert set(MESSAGES) == set(EventKind)
 
 
-def test_messages_has_exactly_fifty_one_entries() -> None:
-    assert len(MESSAGES) == 51
+def test_messages_has_exactly_fifty_five_entries() -> None:
+    assert len(MESSAGES) == 55
 
 
 @pytest.mark.parametrize("kind", list(EventKind))

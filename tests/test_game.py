@@ -480,6 +480,7 @@ STATE_FIELDS = (
     "targeting",
     "help_page",
     "awaiting_attack",
+    "awaiting_close",
     "look_cursor",
     "projectile",
     # v6 appends exactly three, on the same terms (CONTRACT-v6 §7 v6).
@@ -659,14 +660,15 @@ def test_gamestate_field_order_and_defaults() -> None:
     assert fields[17].default is None        # targeting
     assert fields[18].default is None        # help_page
     assert fields[19].default is False       # awaiting_attack
-    assert fields[20].default is None        # look_cursor
-    assert fields[21].default == ()          # projectile
+    assert fields[20].default is False       # awaiting_close
+    assert fields[21].default is None        # look_cursor
+    assert fields[22].default == ()          # projectile
     # v6 appends exactly three, on the same terms again (CONTRACT-v6 §7 v6), so every
     # v1-v5 construction — positional included — keeps working untouched.
-    assert fields[22].default == ()          # chests
-    assert fields[23].default is False       # inventory_open
-    assert fields[24].default == 0           # inventory_cursor
-    assert len(fields) == 25
+    assert fields[23].default == ()          # chests
+    assert fields[24].default is False       # inventory_open
+    assert fields[25].default == 0           # inventory_cursor
+    assert len(fields) == 26
 
 
 def test_gamestate_constructs_positionally_with_defaults() -> None:
@@ -2748,8 +2750,9 @@ def test_no_extra_command_kind_was_invented() -> None:
         # would spend three keys everywhere to use them in one place.
         "INVENTORY",
         "PICK_UP",
+        "CLOSE",
     }
-    for name in ("OPEN", "CLOSE", "WAIT", "SEARCH", "TRAVEL", "RUN"):
+    for name in ("OPEN", "WAIT", "SEARCH", "TRAVEL", "RUN"):
         assert f"CommandKind.{name}" not in GAME_SOURCE
 
 
@@ -4475,9 +4478,19 @@ def test_a_hunter_that_loses_sight_forgets_after_forget_ticks() -> None:
     assert memories[5] == (AiState.WANDERING, 0), "past FORGET_TICKS it gives up"
 
 
-def test_a_monster_bumps_a_closed_door_open_and_says_so_only_when_it_is_seen() -> None:
+def test_a_door_opening_monster_bumps_a_door_and_says_so_only_when_it_is_seen(
+    monkeypatch,
+) -> None:
     # 9x5 two rooms joined by a door at (4, 2); the player stands in the west room and can
     # see the door, and a hunter in the east room must open it to reach them.
+    #
+    # No ANIMAL can work a latch, so the hunter here is made a door-opener — a humanoid,
+    # when one exists. The animal case is the test immediately below.
+    monkeypatch.setitem(
+        SPECIES_DATA,
+        Species.RAT,
+        dataclasses.replace(SPECIES_DATA[Species.RAT], opens_doors=True),
+    )
     state = start(two_room_level())
     state = with_player(
         with_npcs(state, make_npc((5, 2), stats=Stats(10, 10, 10))), stats=UNKILLABLE
@@ -4493,6 +4506,24 @@ def test_a_monster_bumps_a_closed_door_open_and_says_so_only_when_it_is_seen() -
     quiet = tick(unseen)
     assert DOOR_CELL in quiet.open_doors
     assert quiet.events == (), "an off-screen door does not narrate itself"
+
+
+def test_an_animal_cannot_open_a_door_however_long_it_tries() -> None:
+    """No animal can work a latch, so a shut door genuinely stops it.
+
+    This is what makes closing a door behind you a tactic rather than a gesture,
+    and every species in today's bestiary is an animal.
+    """
+    state = start(two_room_level())
+    state = with_player(
+        with_npcs(state, make_npc((5, 2), stats=Stats(10, 10, 10))), stats=UNKILLABLE
+    )
+    assert not SPECIES_DATA[Species.RAT].opens_doors
+
+    for _ in range(30):
+        state = tick(state)
+        assert DOOR_CELL not in state.open_doors
+    assert EventKind.DOOR_OPENED not in {e.kind for e in state.events}
 
 
 # ---------------------------------------------------------------------------------------
@@ -7150,3 +7181,157 @@ def test_a_monster_never_gets_a_shield_roll_it_did_not_earn() -> None:
         assert EventKind.NPC_SHIELD_BLOCKED not in {
             e.kind for e in step(step(one, FIRE), FIRE).events
         }
+
+
+# --- Closing a door (c + direction) ------------------------------------------
+#
+# The counterpart to bump-to-open. Shutting a door behind you only means
+# something because no animal can open one again.
+
+
+CLOSE = Command(CommandKind.CLOSE)
+
+
+def _beside_an_open_door():
+    """A game with the player next to an open door, and the delta to reach it."""
+    state = dataclasses.replace(new_game(1234), npcs=())
+    for y in range(state.level.height):
+        for x in range(state.level.width):
+            if state.level.tile_at(x, y).name != "DOOR":
+                continue
+            for dx, dy in (
+                (1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (-1, -1), (1, -1), (-1, 1),
+            ):
+                stand = (x + dx, y + dy)
+                if state.level.is_walkable(*stand):
+                    return (
+                        dataclasses.replace(
+                            state, player=stand, open_doors=frozenset({(x, y)})
+                        ),
+                        (x, y),
+                        (-dx, -dy),
+                    )
+    raise AssertionError("no reachable door on this level")
+
+
+def test_close_asks_for_a_direction_and_costs_no_turn() -> None:
+    state, _, _ = _beside_an_open_door()
+    after = step(state, CLOSE)
+    assert after.awaiting_close is True
+    assert after.turns == state.turns
+    assert EventKind.CLOSE_WHICH_WAY in {e.kind for e in after.events}
+
+
+def test_closing_an_open_door_shuts_it_and_costs_a_turn() -> None:
+    state, door, (dx, dy) = _beside_an_open_door()
+    after = step(step(state, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    assert door not in after.open_doors
+    assert after.turns == state.turns + 1
+    assert after.player == state.player, "closing a door is not a step"
+    assert EventKind.DOOR_CLOSED in {e.kind for e in after.events}
+
+
+def test_closing_recomputes_what_can_be_seen() -> None:
+    # Shutting a door changes visibility exactly as opening one does.
+    state, door, (dx, dy) = _beside_an_open_door()
+    after = step(step(state, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    assert after.visible != state.visible or door not in after.open_doors
+
+
+def test_a_door_can_be_closed_diagonally() -> None:
+    """Any of the eight neighbours. Refusing diagonals would be an arbitrary
+    rule the player has to discover by failing."""
+    state = dataclasses.replace(new_game(1234), npcs=())
+    found = None
+    for y in range(state.level.height):
+        for x in range(state.level.width):
+            if state.level.tile_at(x, y).name != "DOOR":
+                continue
+            for dx, dy in ((1, 1), (-1, -1), (1, -1), (-1, 1)):
+                if state.level.is_walkable(x + dx, y + dy):
+                    found = ((x, y), (x + dx, y + dy), (-dx, -dy))
+                    break
+            if found:
+                break
+        if found:
+            break
+    if found is None:
+        pytest.skip("this level has no diagonally reachable door")
+    door, stand, (dx, dy) = found
+    state = dataclasses.replace(state, player=stand, open_doors=frozenset({door}))
+    after = step(step(state, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    assert door not in after.open_doors
+
+
+def test_closing_nothing_reports_and_costs_no_turn() -> None:
+    state = dataclasses.replace(new_game(1234), npcs=())
+    after = step(step(state, CLOSE), Command(CommandKind.MOVE, 1, 0))
+    assert after.turns == state.turns
+    assert EventKind.NOTHING_TO_CLOSE in {e.kind for e in after.events}
+
+
+def test_a_creature_in_the_doorway_blocks_it_and_is_named() -> None:
+    # A door cannot shut through a creature, and standing in one is exactly when
+    # the player most wants to try — so it says which creature rather than
+    # refusing silently.
+    state, door, (dx, dy) = _beside_an_open_door()
+    data = SPECIES_DATA[Species.RAT]
+    state = dataclasses.replace(
+        state,
+        npcs=(
+            NPC(9, Species.RAT, Actor(data.stats, derive(data.stats).max_hp), door),
+        ),
+    )
+    after = step(step(state, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    assert door in after.open_doors, "the door must stay open"
+    assert after.turns == state.turns, "a refused close costs nothing"
+    assert EventKind.DOORWAY_BLOCKED in {e.kind for e in after.events}
+    assert "rat" in events.message_for(after.events)
+
+
+def test_a_closed_door_cannot_be_closed_again() -> None:
+    state, door, (dx, dy) = _beside_an_open_door()
+    shut = dataclasses.replace(state, open_doors=frozenset())
+    after = step(step(shut, CLOSE), Command(CommandKind.MOVE, dx, dy))
+    assert after.turns == shut.turns
+    assert EventKind.NOTHING_TO_CLOSE in {e.kind for e in after.events}
+
+
+def test_a_non_direction_after_close_is_swallowed_whole() -> None:
+    state, _, _ = _beside_an_open_door()
+    after = step(step(state, CLOSE), QUIT_COMMAND)
+    assert after.running is True
+    assert after.awaiting_close is False
+    assert after.turns == state.turns
+
+
+def test_shutting_a_door_stops_an_animal_that_was_chasing_you() -> None:
+    """The point of the whole feature, end to end.
+
+    A door the player shuts is a wall to every species in the bestiary, so it
+    genuinely breaks pursuit rather than delaying it by one turn.
+    """
+    state, door, _ = _beside_an_open_door()
+    data = SPECIES_DATA[Species.RAT]
+    hunter_cell = None
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        cell = (door[0] + dx, door[1] + dy)
+        if state.level.is_walkable(*cell) and cell != state.player:
+            hunter_cell = cell
+            break
+    assert hunter_cell is not None
+    state = dataclasses.replace(
+        state,
+        open_doors=frozenset(),
+        npcs=(
+            NPC(
+                9, Species.RAT,
+                Actor(data.stats, derive(data.stats).max_hp),
+                hunter_cell, ai_state=AiState.HUNTING,
+            ),
+        ),
+    )
+    for _ in range(25):
+        state = advance_npcs(state)
+        assert door not in state.open_doors

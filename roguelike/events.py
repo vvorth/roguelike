@@ -67,6 +67,10 @@ class EventKind(Enum):
     RESTED = auto()
     CANNOT_REST = auto()
     HOSTILE_IN_VIEW = auto()
+    CLOSE_WHICH_WAY = auto()
+    DOOR_CLOSED = auto()
+    NOTHING_TO_CLOSE = auto()
+    DOORWAY_BLOCKED = auto()
     # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
     SHIELD_BLOCKED = auto()
     NPC_SHIELD_BLOCKED = auto()
@@ -144,6 +148,10 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.RESTED: "You feel rested.",
     EventKind.CANNOT_REST: "Not with enemies in view.",
     EventKind.HOSTILE_IN_VIEW: "Not while a {name} is in view.",
+    EventKind.CLOSE_WHICH_WAY: "Close a door in which direction?",
+    EventKind.DOOR_CLOSED: "The door closes.",
+    EventKind.NOTHING_TO_CLOSE: "There is no open door that way.",
+    EventKind.DOORWAY_BLOCKED: "The {name} is standing in the doorway.",
     # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
     EventKind.SHIELD_BLOCKED: "Your shield turns the blow.",
     EventKind.NPC_SHIELD_BLOCKED: "The {name} blocks with its shield.",

@@ -501,6 +501,7 @@ class GameState:
     targeting: Targeting | None = None
     help_page: int | None = None
     awaiting_attack: bool = False
+    awaiting_close: bool = False
     look_cursor: Coord | None = None
     projectile: tuple[Coord, ...] = ()
     chests: tuple[Chest, ...] = ()
@@ -1510,6 +1511,48 @@ def _swap_with(state: GameState, cell: Coord) -> GameState:
     )
 
 
+def _close_towards(state: GameState, dx: int, dy: int) -> GameState:
+    """``c`` then a direction: shut the open door on the neighbouring cell.
+
+    **Any of the eight neighbours**, diagonals included — a door is reachable from a corner
+    and refusing that would be an arbitrary rule the player has to learn.
+
+    Three ways it can fail, all costing **no turn**, because none of them is an action:
+
+    * no open door that way — ``NOTHING_TO_CLOSE``;
+    * something is standing in the doorway — ``DOORWAY_BLOCKED``, naming it. A door cannot
+      shut through a creature, and a monster in the frame is exactly when a player most
+      wants to try, so it says which one rather than silently refusing;
+    * the player is standing in it themselves, which the neighbour rule already excludes.
+
+    Closing succeeds only on a door that is currently open, so it is never a way to
+    discover an unexplored cell.
+
+    Costs one turn when it works, and recomputes field of view — shutting a door changes
+    what can be seen, exactly as opening one does.
+    """
+    target = (state.player[0] + dx, state.player[1] + dy)
+    if target not in state.open_doors:
+        return replace(state, events=(Event(EventKind.NOTHING_TO_CLOSE),))
+    for npc in state.npcs:
+        if npc.position == target:
+            return replace(
+                state,
+                events=(
+                    Event(
+                        EventKind.DOORWAY_BLOCKED,
+                        name=SPECIES_DATA[npc.species].name,
+                    ),
+                ),
+            )
+    return _take_turn(
+        state,
+        state.player,
+        state.open_doors - {target},
+        (Event(EventKind.DOOR_CLOSED),),
+    )
+
+
 def _attack_towards(state: GameState, dx: int, dy: int) -> GameState:
     """``F`` then a direction: attack the adjacent cell that way, without moving.
 
@@ -2195,7 +2238,14 @@ def _npc_moves(
 ) -> tuple[NPC, frozenset[Coord], frozenset[Coord]]:
     """Carry out one ``MOVE`` intent: step, or bump a door open (CONTRACT-v5 §24.2).
 
-    A monster opens a closed door by the same rule the player does — it costs the action
+    **Only a species that opens doors may bump one open.** No animal can work a latch, so
+    for the whole of today's bestiary a shut door is a wall: the planner will not route
+    through one, and this refuses it a second time in case anything ever does. That
+    belt-and-braces matters because the two checks answer different questions — the
+    planner asks "where could I go?", this asks "what happens now?" — and a monster that
+    slipped through the first would otherwise open a door it cannot work.
+
+    A humanoid opens a closed door by the same rule the player does — it costs the action
     and does not move it — and the opening is announced **only if the door is somewhere the
     player can see**, which :func:`_perceived` decides from the coordinate handed along
     with the event. Off-screen monsters do not narrate themselves.
@@ -2205,6 +2255,8 @@ def _npc_moves(
     taken; the action is spent either way.
     """
     if is_closed_door(state.level, open_doors, *target):
+        if not SPECIES_DATA[npc.species].opens_doors:
+            return npc, open_doors, occupied
         emitted.append((Event(EventKind.DOOR_OPENED), target))
         return npc, open_doors | {target}, occupied
     if target not in occupied and is_passable(state.level, open_doors, *target):
@@ -2361,6 +2413,13 @@ def step(state: GameState, command: Command) -> GameState:
         # and the message already on screen is left alone.
         return state
 
+    if state.awaiting_close:
+        state = replace(state, awaiting_close=False)
+        if command.kind is CommandKind.MOVE:
+            return _close_towards(state, command.dx, command.dy)
+        # Same rule as every other prefix: a typo is swallowed whole and costs nothing.
+        return state
+
     if state.awaiting_attack:
         state = replace(state, awaiting_attack=False)
         if command.kind is CommandKind.MOVE:
@@ -2429,6 +2488,13 @@ def step(state: GameState, command: Command) -> GameState:
 
     if command.kind is CommandKind.LOOK:
         return _look_at(state, state.player)
+
+    if command.kind is CommandKind.CLOSE:
+        return replace(
+            state,
+            awaiting_close=True,
+            events=(Event(EventKind.CLOSE_WHICH_WAY),),
+        )
 
     if command.kind is CommandKind.ATTACK:
         return replace(

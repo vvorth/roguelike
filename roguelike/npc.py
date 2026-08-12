@@ -65,7 +65,7 @@ from roguelike.level import Level
 from roguelike.pathfind import DIRECTIONS, Coord, find_path
 from roguelike.stats import Actor, Condition, Stats, derive
 from roguelike.status import StatusKind
-from roguelike.world import is_passable, is_planning_passable
+from roguelike.world import is_closed_door, is_passable, is_planning_passable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from random import Random
@@ -105,6 +105,13 @@ class SpeciesData:
 
     ``name`` is lower-case on purpose: messages read ``The {name} hits you.``
 
+    ``opens_doors`` decides whether a closed door is an obstacle or an inconvenience. **No
+    animal can work a latch**, so every species in today's bestiary leaves it ``False`` and a
+    shut door genuinely stops them — which is what makes closing one behind you a tactic
+    rather than a gesture. A humanoid would set it ``True`` and could both open and close at
+    will; none exists yet, so the ``True`` branch ships tested and unused, the same honest
+    position ``interruption`` held in v4.
+
     ``hostile`` decides whether walking into this creature attacks it. Everything in
     today's bestiary is hostile, so the flag has no live counter-example yet — it exists
     because "bumping must not attack a peaceful creature" is a rule that has to be
@@ -135,6 +142,7 @@ class SpeciesData:
     poison_chance: int = 0
     hostile: bool = True
     flee_chance: int = 0
+    opens_doors: bool = False
     resistances: dict[DamageType, Resistance] = field(default_factory=dict)
 
 
@@ -535,7 +543,10 @@ def _flee(
     options = [
         (x + dx, y + dy)
         for dx, dy in DIRECTIONS
-        if _is_legal_move(level, open_doors, occupied, (x + dx, y + dy))
+        if _is_legal_move(
+            level, open_doors, occupied, (x + dx, y + dy),
+            SPECIES_DATA[npc.species].opens_doors,
+        )
     ]
     better = [cell for cell in options if _chebyshev(cell, player) > here]
     if better:
@@ -556,6 +567,7 @@ def _hunt(
     player: Coord,
 ) -> NpcAction:
     """The HUNTING half of :func:`plan_action`. Draws no randomness at all."""
+    opens_doors = SPECIES_DATA[npc.species].opens_doors
     if _chebyshev(npc.position, player) == 1:
         return NpcAction(NpcActionKind.ATTACK, player)
 
@@ -567,6 +579,11 @@ def _hunt(
         if (x, y) == player:
             return True
         if (x, y) in occupied:
+            return False
+        if not opens_doors and is_closed_door(level, open_doors, x, y):
+            # A shut door is a wall to an animal, so it must not be routed through
+            # either — otherwise a hunter would plan a path it can never walk and
+            # stall against the latch every turn.
             return False
         return is_planning_passable(level, open_doors, x, y)
 
@@ -593,7 +610,10 @@ def _wander(
     choices = [
         (x + dx, y + dy)
         for dx, dy in _ORTHOGONAL
-        if _is_legal_move(level, open_doors, occupied, (x + dx, y + dy))
+        if _is_legal_move(
+            level, open_doors, occupied, (x + dx, y + dy),
+            SPECIES_DATA[npc.species].opens_doors,
+        )
     ]
     if not choices:
         return NpcAction(NpcActionKind.WAIT)
@@ -605,6 +625,7 @@ def _is_legal_move(
     open_doors: frozenset[Coord],
     occupied: frozenset[Coord],
     cell: Coord,
+    opens_doors: bool = True,
 ) -> bool:
     """True iff a monster may intend to step onto ``cell``.
 
@@ -612,5 +633,9 @@ def _is_legal_move(
     another actor.
     """
     if cell in occupied:
+        return False
+    if not opens_doors and is_closed_door(level, open_doors, cell[0], cell[1]):
+        # An animal cannot work a latch, so a shut door is a wall to it — not a cell to
+        # route through and bump open, the way the player and a humanoid may.
         return False
     return is_planning_passable(level, open_doors, cell[0], cell[1])

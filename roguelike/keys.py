@@ -29,7 +29,7 @@ __all__ = [
 
 
 class CommandKind(Enum):
-    """The fifteen things a key press can mean."""
+    """The sixteen things a key press can mean."""
 
     MOVE = auto()
     QUIT = auto()
@@ -44,6 +44,7 @@ class CommandKind(Enum):
     ATTACK = auto()  # "a" -- prefix; the next key is the direction
     LOOK = auto()  # "x" -- examine mode; a cursor, not a turn
     REST = auto()  # "R" -- stand still until healed or disturbed
+    CLOSE = auto()  # "c" -- prefix; the next key is the direction
     INVENTORY = auto()  # "i" -- NEW in v6; opens the inventory screen, no turn
     PICK_UP = auto()  # "g" -- NEW in v6; take one item from a chest
 
@@ -129,6 +130,7 @@ _NO_ARG_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
     (CommandKind.ATTACK, "a"),
     (CommandKind.LOOK, "x"),
     (CommandKind.REST, "R"),
+    (CommandKind.CLOSE, "c"),
     (CommandKind.INVENTORY, "i"),
     (CommandKind.PICK_UP, "g"),
 )
@@ -155,6 +157,7 @@ HELP_ENTRIES: tuple[tuple[str, str], ...] = (
     ("<", "ascend, or travel to a known up staircase"),
     ("move into a monster", "attack it"),
     ("a + direction", "attack that way without moving"),
+    ("c + direction", "close an open door beside you"),
     ("f", "aim the bow; Tab cycles targets, f shoots"),
     ("Tab", "next target while aiming"),
     ("x", "look around; direction keys move the cursor"),

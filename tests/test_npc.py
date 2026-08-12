@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import contextlib
 import dataclasses
 from roguelike.npc import wants_to_flee
 from roguelike.status import StatusEffect, StatusKind
@@ -83,6 +84,22 @@ def make_level(
     assert len({len(row) for row in rows}) == 1, "all rows must be the same width"
     grid = [[CHAR_TO_TILE[c] for c in row] for row in rows]
     return Level(len(grid[0]), len(grid), freeze_grid(grid), (), player_start, seed)
+
+
+
+@contextlib.contextmanager
+def door_opening(species: Species = Species.RAT):
+    """Temporarily make `species` able to work a latch.
+
+    No animal in the shipped bestiary can, so any test about routing *through* a
+    closed door has to supply a creature that could — a humanoid, when one exists.
+    """
+    original = SPECIES_DATA[species]
+    SPECIES_DATA[species] = dataclasses.replace(original, opens_doors=True)
+    try:
+        yield
+    finally:
+        SPECIES_DATA[species] = original
 
 
 def make_npc(
@@ -296,6 +313,9 @@ def test_species_data_does_not_store_derived_values():
         # its glyph.
         "hostile",
         "flee_chance",
+        # Whether it can work a latch. No animal can, so a shut door is a wall to
+        # every species in today's bestiary.
+        "opens_doors",
         # How this species takes each DamageType (CONTRACT-v6 §26.3) -- also a fact
         # about the species, not a derived value. combat.py applies the multiplier;
         # this module only says how much.
@@ -764,40 +784,41 @@ def test_the_only_route_being_occupied_gives_wait_and_never_that_cell():
 
 
 def test_two_npcs_contending_for_one_corridor_cell_do_not_both_get_it():
-    """The bottleneck is the door at (3, 2); both monsters want it.
+    with door_opening():
+        """The bottleneck is the door at (3, 2); both monsters want it.
 
-    ``game.py`` plans in ``actor_id`` order and folds each accepted move into
-    ``occupied`` before planning the next NPC (CONTRACT-v5 §24.3), which is the
-    convention modelled here. The second monster must not be handed a cell the first
-    one has just taken.
-    """
-    level = make_level(DOOR_ROOM)
-    player = (8, 2)
-    first = make_npc((2, 1), AiState.HUNTING, actor_id=1)
-    second = make_npc((2, 3), AiState.HUNTING, actor_id=2)
-    door = (3, 2)
+        ``game.py`` plans in ``actor_id`` order and folds each accepted move into
+        ``occupied`` before planning the next NPC (CONTRACT-v5 §24.3), which is the
+        convention modelled here. The second monster must not be handed a cell the first
+        one has just taken.
+        """
+        level = make_level(DOOR_ROOM)
+        player = (8, 2)
+        first = make_npc((2, 1), AiState.HUNTING, actor_id=1)
+        second = make_npc((2, 3), AiState.HUNTING, actor_id=2)
+        door = (3, 2)
 
-    action_one = plan_action(
-        ForbiddenRandom(),
-        first,
-        level,
-        NO_DOORS,
-        frozenset({second.position, player}),
-        player,
-    )
-    assert action_one == NpcAction(NpcActionKind.MOVE, door)
+        action_one = plan_action(
+            ForbiddenRandom(),
+            first,
+            level,
+            NO_DOORS,
+            frozenset({second.position, player}),
+            player,
+        )
+        assert action_one == NpcAction(NpcActionKind.MOVE, door)
 
-    moved_first = dataclasses.replace(first, position=action_one.target)
-    action_two = plan_action(
-        ForbiddenRandom(),
-        second,
-        level,
-        NO_DOORS,
-        frozenset({moved_first.position, player}),
-        player,
-    )
-    assert action_two.target != door
-    assert action_two == NpcAction(NpcActionKind.WAIT)
+        moved_first = dataclasses.replace(first, position=action_one.target)
+        action_two = plan_action(
+            ForbiddenRandom(),
+            second,
+            level,
+            NO_DOORS,
+            frozenset({moved_first.position, player}),
+            player,
+        )
+        assert action_two.target != door
+        assert action_two == NpcAction(NpcActionKind.WAIT)
 
 
 def test_npcs_never_swap_places_while_hunting():
@@ -836,35 +857,37 @@ def test_npcs_never_swap_places_while_wandering():
 # ---------------------------------------------------------------------------
 
 
-def test_a_hunter_whose_only_path_runs_through_a_closed_door_moves_towards_it():
-    level = make_level(DOOR_BETWEEN)
-    player, door = (4, 1), (3, 1)
-    assert not is_passable(level, NO_DOORS, *door)
-    assert is_planning_passable(level, NO_DOORS, *door)
-    action = plan_action(
-        ForbiddenRandom(),
-        make_npc((2, 1), AiState.HUNTING),
-        level,
-        NO_DOORS,
-        frozenset({player}),
-        player,
-    )
-    assert action == NpcAction(NpcActionKind.MOVE, door)
+def test_a_hunter_whose_only_path_runs_through_a_closed_door_moves_towards_it() -> None:
+    with door_opening():
+        level = make_level(DOOR_BETWEEN)
+        player, door = (4, 1), (3, 1)
+        assert not is_passable(level, NO_DOORS, *door)
+        assert is_planning_passable(level, NO_DOORS, *door)
+        action = plan_action(
+            ForbiddenRandom(),
+            make_npc((2, 1), AiState.HUNTING),
+            level,
+            NO_DOORS,
+            frozenset({player}),
+            player,
+        )
+        assert action == NpcAction(NpcActionKind.MOVE, door)
 
 
-def test_a_hunter_in_a_room_whose_only_exit_is_a_closed_door_moves_to_the_door():
-    level = make_level(DOOR_ROOM)
-    player, door = (8, 2), (3, 2)
-    action = plan_action(
-        ForbiddenRandom(),
-        make_npc((1, 1), AiState.HUNTING),
-        level,
-        NO_DOORS,
-        frozenset({player}),
-        player,
-    )
-    assert action.kind is NpcActionKind.MOVE
-    assert chebyshev(action.target, door) <= 1
+def test_a_hunter_in_a_room_whose_only_exit_is_a_closed_door_moves_to_the_door() -> None:
+    with door_opening():
+        level = make_level(DOOR_ROOM)
+        player, door = (8, 2), (3, 2)
+        action = plan_action(
+            ForbiddenRandom(),
+            make_npc((1, 1), AiState.HUNTING),
+            level,
+            NO_DOORS,
+            frozenset({player}),
+            player,
+        )
+        assert action.kind is NpcActionKind.MOVE
+        assert chebyshev(action.target, door) <= 1
 
 
 def test_plan_action_takes_no_explored_argument():
@@ -1629,3 +1652,62 @@ def _corridor(length: int):
     rows = ["#" * (length + 2), "#" + "." * length + "#", "#" * (length + 2)]
     grid = [[{"#": Tile.WALL, ".": Tile.FLOOR}[c] for c in r] for r in rows]
     return Level(len(rows[0]), len(rows), freeze_grid(grid), (), (1, 1), 0)
+
+
+# --- Who can work a latch ------------------------------------------------------
+
+
+def test_no_shipped_species_can_open_a_door():
+    """Every creature in the bestiary is an animal.
+
+    This is what makes shutting a door a tactic rather than a gesture. A humanoid
+    would set `opens_doors=True`; none exists yet, so that branch ships tested and
+    unused — the position `interruption` held in v4 and `IMMUNE` holds now.
+    """
+    assert all(not data.opens_doors for data in SPECIES_DATA.values())
+
+
+def test_an_animal_will_not_route_through_a_closed_door():
+    level = make_level(DOOR_ROOM)
+    npc = make_npc((2, 1), AiState.HUNTING)
+    player = (8, 2)
+    for seed in range(30):
+        action = plan_action(
+            random.Random(seed), npc, level, frozenset(), frozenset({player}), player
+        )
+        assert action.target != (3, 2), "an animal planned a path through a shut door"
+
+
+def test_an_animal_wanders_past_a_closed_door_without_targeting_it():
+    level = make_level(DOOR_ROOM)
+    npc = make_npc((2, 1), AiState.WANDERING)
+    player = (8, 2)
+    targets = {
+        plan_action(
+            random.Random(seed), npc, level, frozenset(), frozenset({player}), player
+        ).target
+        for seed in range(60)
+    }
+    assert (3, 2) not in targets
+
+
+def test_the_same_door_open_is_routable_by_an_animal():
+    # The rule is about the latch, not the doorway: an open door is ordinary floor.
+    level = make_level(DOOR_ROOM)
+    npc = make_npc((2, 1), AiState.HUNTING)
+    player = (8, 2)
+    action = plan_action(
+        random.Random(0), npc, level, frozenset({(3, 2)}), frozenset({player}), player
+    )
+    assert action.target == (3, 2)
+
+
+def test_a_door_opening_species_routes_through_a_shut_door():
+    with door_opening():
+        level = make_level(DOOR_ROOM)
+        npc = make_npc((2, 1), AiState.HUNTING)
+        player = (8, 2)
+        action = plan_action(
+            random.Random(0), npc, level, frozenset(), frozenset({player}), player
+        )
+        assert action.target == (3, 2)
