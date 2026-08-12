@@ -27,10 +27,10 @@ def test_visibility_has_exactly_three_members():
     assert names == {"UNSEEN", "EXPLORED", "VISIBLE"}
 
 
-def test_role_has_exactly_five_members():
-    assert len(Role) == 5
+def test_role_has_exactly_six_members():
+    assert len(Role) == 6
     names = {m.name for m in Role}
-    assert names == {"TERRAIN", "DOOR", "PLAYER", "PROJECTILE", "NPC"}
+    assert names == {"TERRAIN", "DOOR", "PLAYER", "PROJECTILE", "NPC", "CHEST"}
 
 
 # ---------------------------------------------------------------------------
@@ -90,14 +90,72 @@ def test_only_player_is_bold():
     assert attr_for(Role.PLAYER, Visibility.VISIBLE).bold is True
 
 
-@pytest.mark.parametrize("role", [Role.TERRAIN, Role.DOOR])
+@pytest.mark.parametrize("role", [Role.TERRAIN, Role.DOOR, Role.CHEST])
 def test_explored_is_darker_than_visible(role):
-    # Both TERRAIN (grayscale ramp) and DOOR (brown/orange ramp) sit on xterm
-    # 256-colour ramps where a numerically lower index is a darker shade of the
+    # TERRAIN (grayscale ramp), DOOR (brown/orange ramp) and CHEST (gold ramp) all sit
+    # on xterm 256-colour ramps where a numerically lower index is a darker shade of the
     # same hue, so EXPLORED must be a strictly lower index than VISIBLE.
     visible = attr_for(role, Visibility.VISIBLE).color
     explored = attr_for(role, Visibility.EXPLORED).color
     assert explored < visible
+
+
+# ---------------------------------------------------------------------------
+# attr_for — Role.CHEST (CONTRACT-v6 §7.17/§27)
+# ---------------------------------------------------------------------------
+
+
+def test_chest_visible_256():
+    assert attr_for(Role.CHEST, Visibility.VISIBLE, colors=256).color == 220
+
+
+def test_chest_explored_256():
+    assert attr_for(Role.CHEST, Visibility.EXPLORED, colors=256).color == 178
+
+
+def test_chest_colour_is_distinct_from_every_other_roles_colour_at_256():
+    # CONTRACT-v6 §7.17/§27: "distinct from every existing role" — terrain 250/238,
+    # door 180/94, player 231, projectile 226, the four species 250/173/140/70.
+    other_colors = {
+        attr_for(Role.TERRAIN, Visibility.VISIBLE, colors=256).color,
+        attr_for(Role.TERRAIN, Visibility.EXPLORED, colors=256).color,
+        attr_for(Role.DOOR, Visibility.VISIBLE, colors=256).color,
+        attr_for(Role.DOOR, Visibility.EXPLORED, colors=256).color,
+        attr_for(Role.PLAYER, Visibility.VISIBLE, colors=256).color,
+        attr_for(Role.PROJECTILE, Visibility.VISIBLE, colors=256).color,
+        attr_for(Role.NPC, Visibility.VISIBLE, colors=256, species="rat").color,
+        attr_for(Role.NPC, Visibility.VISIBLE, colors=256, species="jackal").color,
+        attr_for(Role.NPC, Visibility.VISIBLE, colors=256, species="giant bat").color,
+        attr_for(Role.NPC, Visibility.VISIBLE, colors=256, species="cave snake").color,
+    }
+    chest_colors = {
+        attr_for(Role.CHEST, Visibility.VISIBLE, colors=256).color,
+        attr_for(Role.CHEST, Visibility.EXPLORED, colors=256).color,
+    }
+    assert chest_colors.isdisjoint(other_colors)
+
+
+def test_chest_visible_and_explored_do_not_raise_unlike_npc_and_player():
+    # The whole point of CHEST: unlike PLAYER/NPC/PROJECTILE, a chest is legitimately
+    # drawn from `explored` too, since it does not move.
+    attr_for(Role.CHEST, Visibility.VISIBLE)
+    attr_for(Role.CHEST, Visibility.EXPLORED)
+
+
+def test_chest_colors_8():
+    assert attr_for(Role.CHEST, Visibility.VISIBLE, colors=8).color <= 7
+    assert attr_for(Role.CHEST, Visibility.EXPLORED, colors=8).color <= 7
+
+
+@pytest.mark.parametrize("colors", [2, 0])
+def test_chest_monochrome_is_terminal_default(colors):
+    assert attr_for(Role.CHEST, Visibility.VISIBLE, colors=colors).color == -1
+    assert attr_for(Role.CHEST, Visibility.EXPLORED, colors=colors).color == -1
+
+
+def test_chest_is_not_bold():
+    assert attr_for(Role.CHEST, Visibility.VISIBLE).bold is False
+    assert attr_for(Role.CHEST, Visibility.EXPLORED).bold is False
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +222,7 @@ _ONLY_VISIBLE_ROLES = (Role.PLAYER, Role.PROJECTILE, Role.NPC)
 
 
 @pytest.mark.parametrize(
-    "role", [Role.TERRAIN, Role.DOOR, Role.PLAYER, Role.PROJECTILE, Role.NPC]
+    "role", [Role.TERRAIN, Role.DOOR, Role.PLAYER, Role.PROJECTILE, Role.NPC, Role.CHEST]
 )
 def test_unseen_raises_for_every_role(role):
     with pytest.raises(ValueError):

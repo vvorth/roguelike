@@ -59,7 +59,9 @@ from roguelike import combat, dungeon, events, fov, game, world
 from roguelike.activity import Activity, ActivityKind
 from roguelike.events import Event, EventKind
 from roguelike.game import (
+    BARE_HANDS,
     ENERGY_THRESHOLD,
+    ITEM_LETTERS,
     MAX_EVENTS,
     GameState,
     LevelState,
@@ -69,9 +71,12 @@ from roguelike.game import (
     advance_npcs,
     describe_cell,
     format_help_status,
+    format_inventory_status,
     format_stats,
     format_status_right,
     help_lines,
+    inventory_key,
+    inventory_lines,
     help_page_count,
     help_page_lines,
     interruption,
@@ -85,7 +90,23 @@ from roguelike.game import (
     xp_for_kill,
     NPC_XP_DIVISOR,
 )
-from roguelike.items import DAGGER, SHORTBOW
+from roguelike.items import (
+    BANDAGE,
+    BUCKLER,
+    CARRY_LIMIT,
+    CLUB,
+    DAGGER,
+    KITE_SHIELD,
+    LONGBOW,
+    POTION_OF_HEALING,
+    SHORTBOW,
+    SWORD,
+    TOWER_SHIELD,
+    DamageType,
+    Inventory,
+    Resistance,
+)
+from roguelike.loot import Chest
 from roguelike.keys import QUIT_COMMAND, Command, CommandKind, translate_key
 from roguelike.level import Level
 from roguelike.npc import (
@@ -93,6 +114,7 @@ from roguelike.npc import (
     SPECIES_DATA,
     AiState,
     Species,
+    resistance_of,
     spawn_npcs,
 )
 from roguelike.stats import Actor, Stats, derive
@@ -114,9 +136,30 @@ def _unpopulated(request, monkeypatch):
     monkeypatch.setattr(game, "spawn_npcs", lambda rng, level, first_actor_id=1: ())
 
 
+@pytest.fixture(autouse=True)
+def _chestless(request, monkeypatch):
+    """Generate levels with no chest on them unless the test asks for ``chests``.
+
+    The same reasoning as ``_unpopulated``, one increment later: a chest appears on 12% of
+    levels (CONTRACT-v6 §27), which is often enough to put a ``There is a chest here.``
+    into the middle of a test about staircases and rarely enough that the failure would
+    look like flakiness rather than a rule. Chest placement is real and is tested below;
+    a test that wants it asks for the ``chests`` fixture by name.
+    """
+    if "chests" in request.fixturenames:
+        return
+    monkeypatch.setattr(game, "place_chest", lambda rng, level, depth: None)
+
+
 @pytest.fixture
 def monsters():
     """Opt back in to real spawning (CONTRACT-v5 §24.4)."""
+    return True
+
+
+@pytest.fixture
+def chests():
+    """Opt back in to real chest placement (CONTRACT-v6 §27.2)."""
     return True
 
 # ---------------------------------------------------------------------------------------
@@ -439,6 +482,10 @@ STATE_FIELDS = (
     "awaiting_attack",
     "look_cursor",
     "projectile",
+    # v6 appends exactly three, on the same terms (CONTRACT-v6 §7 v6).
+    "chests",
+    "inventory_open",
+    "inventory_cursor",
 )
 
 
@@ -558,12 +605,22 @@ def test_levelstate_field_order_and_defaults() -> None:
     # CONTRACT-v5 §24.5 appends `npcs`, with a default, so every v3/v4 three-argument
     # construction still works — asserted directly below.
     fields = dataclasses.fields(LevelState)
-    assert [f.name for f in fields] == ["level", "explored", "open_doors", "npcs"]
+    assert [f.name for f in fields] == [
+        "level",
+        "explored",
+        "open_doors",
+        "npcs",
+        # v6 appends `chests` on the same terms: a chest is not terrain, so it lives
+        # beside the fog and the doors (CONTRACT-v6 §27.3).
+        "chests",
+    ]
     for field in fields[:3]:
         assert field.default is dataclasses.MISSING
     assert fields[3].default == ()
+    assert fields[4].default == ()
     entry = LevelState(room_level(), frozenset(), frozenset())
     assert entry.npcs == ()
+    assert entry.chests == ()
 
 
 def test_levelstate_is_frozen_and_compares_by_value() -> None:
@@ -604,7 +661,12 @@ def test_gamestate_field_order_and_defaults() -> None:
     assert fields[19].default is False       # awaiting_attack
     assert fields[20].default is None        # look_cursor
     assert fields[21].default == ()          # projectile
-    assert len(fields) == 22
+    # v6 appends exactly three, on the same terms again (CONTRACT-v6 §7 v6), so every
+    # v1-v5 construction — positional included — keeps working untouched.
+    assert fields[22].default == ()          # chests
+    assert fields[23].default is False       # inventory_open
+    assert fields[24].default == 0           # inventory_cursor
+    assert len(fields) == 25
 
 
 def test_gamestate_constructs_positionally_with_defaults() -> None:
@@ -626,8 +688,14 @@ def test_gamestate_constructs_positionally_with_defaults() -> None:
     assert state.targeting is None
     assert state.player_actor.actor.hp == 45
     assert state.player_actor.level == 1
-    assert state.player_actor.melee is DAGGER
-    assert state.player_actor.ranged is SHORTBOW
+    # v6's one breaking change: the weapons moved into `Player.inventory` (§7 v6).
+    assert state.player_actor.inventory.melee is DAGGER
+    assert state.player_actor.inventory.ranged is SHORTBOW
+    assert state.player_actor.inventory.shield is None
+    assert state.player_actor.inventory.carried == ()
+    assert state.chests == ()
+    assert state.inventory_open is False
+    assert state.inventory_cursor == 0
 
 
 def test_gamestate_is_frozen() -> None:
@@ -2257,6 +2325,7 @@ def test_import_set_matches_the_contract_import_graph() -> None:
         "roguelike.status",     # v5
         "roguelike.combat",     # v5
         "roguelike.npc",        # v5
+        "roguelike.loot",       # v6 (CONTRACT-v6 §10 v6)
     }
     assert "roguelike.game" not in roguelike_imports
     assert "roguelike.style" not in roguelike_imports
@@ -2334,8 +2403,9 @@ def test_the_loop_paces_with_timeout_and_nothing_else() -> None:
         and isinstance(child.func, ast.Attribute)
         and child.func.attr == "timeout"
     ]
-    assert len(timeouts) == 4, (
-        "an activity, ordinary play, a projectile frame, and the impact hold"
+    assert len(timeouts) == 5, (
+        "an activity, the inventory screen, ordinary play, a projectile frame, "
+        "and the impact hold"
     )
     # And `timeout` is called nowhere else in the module — pacing is the loop's alone.
     assert (
@@ -2348,7 +2418,7 @@ def test_the_loop_paces_with_timeout_and_nothing_else() -> None:
                 and child.func.attr == "timeout"
             ]
         )
-        == 4
+        == 5
     )
 
 
@@ -2545,6 +2615,11 @@ def test_public_surface_is_exactly_the_contract_surface() -> None:
         "help_page_count",
         "help_page_lines",
         "format_help_status",
+        "inventory_lines",
+        "format_inventory_status",
+        "inventory_key",
+        "ITEM_LETTERS",
+        "BARE_HANDS",
         "describe_cell",
         "format_stats",
         "format_status_right",
@@ -2667,6 +2742,12 @@ def test_no_extra_command_kind_was_invented() -> None:
         "ATTACK",
         "LOOK",
         "REST",
+        # v6 adds exactly two (CONTRACT-v6 §5 v6). The inventory screen's own keys —
+        # `e`, `d` and the item letters — are deliberately **not** here: they are a
+        # sub-mode's alphabet, read raw by `inventory_key`, and binding them globally
+        # would spend three keys everywhere to use them in one place.
+        "INVENTORY",
+        "PICK_UP",
     }
     for name in ("OPEN", "CLOSE", "WAIT", "SEARCH", "TRAVEL", "RUN"):
         assert f"CommandKind.{name}" not in GAME_SOURCE
@@ -3841,18 +3922,19 @@ def with_player(
     level: int = 1,
     regen_counter: int = 0,
     effects: tuple[StatusEffect, ...] = (),
+    inventory: Inventory | None = None,
 ) -> GameState:
     stats = Stats(10, 10, 10) if stats is None else stats
     hp = derive(stats).max_hp if hp is None else hp
-    return dataclasses.replace(
-        state,
-        player_actor=Player(
-            actor=Actor(stats=stats, hp=hp, status_effects=effects),
-            xp=xp,
-            level=level,
-            regen_counter=regen_counter,
-        ),
+    player = Player(
+        actor=Actor(stats=stats, hp=hp, status_effects=effects),
+        xp=xp,
+        level=level,
+        regen_counter=regen_counter,
     )
+    if inventory is not None:
+        player = dataclasses.replace(player, inventory=inventory)
+    return dataclasses.replace(state, player_actor=player)
 
 
 #: A player who cannot plausibly die, for tests that need to watch a monster act for
@@ -3883,6 +3965,12 @@ def player_attack_result(
     ``actor_id`` 0 and the attack salt, and the arithmetic comes from
     :func:`roguelike.combat.resolve_attack` itself. A test can therefore assert the damage
     the game *should* deal without restating a formula that lives elsewhere.
+
+    **The defender's resistance to this weapon's damage type is part of that roll** in v6
+    (CONTRACT-v6 §26.2) and is looked up through the same :func:`roguelike.npc.
+    resistance_of` the game uses, so a dagger against a cave snake replays exactly what
+    ``step`` will do rather than an unresisted version of it. The shield chance is 0
+    because nothing in the bestiary carries one.
     """
     rng = random.Random(roll_seed(state.master_seed, state.turns, 0, SALT_ATTACK))
     return combat.resolve_attack(
@@ -3892,6 +3980,9 @@ def player_attack_result(
         weapon.damage_min,
         weapon.damage_max,
         strength_applies,
+        0,
+        resistance_of(target.species, weapon.damage_type),
+        0,
     )
 
 
@@ -4700,7 +4791,12 @@ def test_target_next_with_nothing_being_targeted_does_nothing() -> None:
 
 def test_firing_resolves_a_ranged_attack_and_consumes_a_turn() -> None:
     state = with_player(start(fight_level()), stats=Stats(str_=16, agi=10, vit=10))
-    state = with_npcs(state, make_npc((7, 3), Species.CAVE_SNAKE))
+    # A jackal, not the cave snake this test used before v6: the snake **resists PIERCE**
+    # (CONTRACT-v6 §26.3), which halves the shortbow's 1-4 roll into the `max(1, ...)`
+    # floor and hides the +3 this test exists to see. The rule being pinned here is
+    # "strength does not apply to a bow", so the defender must be one that does not
+    # quietly floor the difference away.
+    state = with_npcs(state, make_npc((7, 3), Species.JACKAL, hp=90))
     state = dataclasses.replace(
         state, master_seed=seed_where_player(state, state.npcs[0], SHORTBOW, True)
     )
@@ -4718,6 +4814,7 @@ def test_firing_resolves_a_ranged_attack_and_consumes_a_turn() -> None:
     assert fired.targeting is None
     assert fired.player == (4, 3), "shooting does not move you"
     assert fired.npcs[0].actor.hp == without_strength.defender_hp
+    # A jackal resists nothing, so the hit says exactly one thing (CONTRACT-v6 §26.3).
     assert [e.kind for e in fired.events] == [EventKind.PLAYER_HIT_NPC]
 
 
@@ -6180,3 +6277,876 @@ def test_a_peaceful_creature_does_not_block_automatic_movement(monkeypatch) -> N
     )
     after = step(state, Command(CommandKind.AUTO_EXPLORE))
     assert after.activity is not None
+
+
+# ---------------------------------------------------------------------------------------
+# v6 — items, chests, resistance and shields (CONTRACT-v6 §7 v6, §25-§27)
+# ---------------------------------------------------------------------------------------
+#
+# Everything below goes through the real `step`, the real `advance_npcs` and the real
+# `inventory_key`. Nothing here asserts on a slot alone: "the sword is equipped" is not the
+# claim v6 makes, "the next blow does slashing damage" is, and only an attack can say so.
+
+INVENTORY_COMMAND = Command(CommandKind.INVENTORY)
+PICK_UP = Command(CommandKind.PICK_UP)
+
+
+def with_chest(
+    state: GameState, position: tuple[int, int], *contents: object, opened: bool = False
+) -> GameState:
+    """A game with exactly one chest, on ``position``, holding ``contents``."""
+    return dataclasses.replace(
+        state, chests=(Chest(position, tuple(contents), opened),)
+    )
+
+
+def carrying(state: GameState, *items: object, **slots: object) -> GameState:
+    """A game whose player carries ``items``, and wears ``slots`` where given.
+
+    Everything else about the player — hit points, stats, the slots not named — is left
+    exactly as it was, so this composes with :func:`with_player` in either order.
+    """
+    inventory = dataclasses.replace(
+        state.player_actor.inventory, carried=tuple(items), **slots
+    )
+    return dataclasses.replace(
+        state,
+        player_actor=dataclasses.replace(state.player_actor, inventory=inventory),
+    )
+
+
+def letter(index: int) -> int:
+    """The key that selects the ``index``-th carried item, as ``getch`` returns it."""
+    return ord(ITEM_LETTERS[index])
+
+
+# --- The player's kit moved into `Inventory` ---------------------------------
+
+
+def test_the_new_player_carries_the_v5_kit_in_the_new_place() -> None:
+    # v6's one breaking change (CONTRACT-v6 §7 v6). The dagger and the shortbow are the
+    # same objects with the same numbers; only the field they live on has moved.
+    inventory = new_game(1).player_actor.inventory
+    assert inventory.melee is DAGGER
+    assert inventory.ranged is SHORTBOW
+    assert inventory.shield is None
+    assert inventory.carried == ()
+    assert not hasattr(new_game(1).player_actor, "melee")
+    assert not hasattr(new_game(1).player_actor, "ranged")
+
+
+def test_player_field_order_is_the_contracts() -> None:
+    assert [f.name for f in dataclasses.fields(Player)] == [
+        "actor",
+        "inventory",
+        "xp",
+        "level",
+        "regen_counter",
+    ]
+
+
+# --- Chests are placed at generation -----------------------------------------
+
+
+def a_seed_with_a_chest(width: int = 40, height: int = 18) -> int:
+    """The first master seed whose level 1 carries a chest. Real placement, no mocking."""
+    for seed in range(200):
+        if game.new_game(seed, width, height).chests:
+            return seed
+    raise AssertionError("no seed in 200 produced a chest")
+
+
+def test_a_chest_is_placed_at_generation_and_lands_on_legal_ground(chests) -> None:
+    state = new_game(a_seed_with_a_chest(), *SMALL)
+    assert len(state.chests) == 1, "at most one chest per level (§27.2)"
+    chest = state.chests[0]
+    assert state.level.is_walkable(*chest.position)
+    assert chest.opened is False
+    assert 1 <= len(chest.contents) <= 3
+    # Never on the player's doorstep: CHEST_SAFE_RADIUS is Chebyshev, from player_start.
+    assert max(
+        abs(chest.position[0] - state.level.player_start[0]),
+        abs(chest.position[1] - state.level.player_start[1]),
+    ) >= 8
+
+
+def test_the_same_master_seed_places_the_same_chest(chests) -> None:
+    seed = a_seed_with_a_chest()
+    assert new_game(seed, *SMALL).chests == new_game(seed, *SMALL).chests
+
+
+def test_no_monster_ever_starts_on_a_chest(chests, monsters) -> None:
+    # CONTRACT-v6 §27.4, the amendment: `loot.py` structurally cannot see monsters, so
+    # `game.py` places them after the chest and treats its cell as occupied. Swept rather
+    # than probed once, because the collision is rare and a single seed proves nothing.
+    found = 0
+    for seed in range(120):
+        state = new_game(seed, *SMALL)
+        if not state.chests:
+            continue
+        found += 1
+        taken = {chest.position for chest in state.chests}
+        assert not (taken & {npc.position for npc in state.npcs})
+    assert found, "the sweep must actually have produced chests to check"
+
+
+def test_placing_a_chest_does_not_disturb_where_the_monsters_go(chests, monsters) -> None:
+    # The chest is drawn from its own stream off the level's seed, so adding chests to v6
+    # did not silently re-roll every v5 population (see `_SALT_CHEST`).
+    for seed in range(20):
+        with_chests = new_game(seed, *SMALL)
+        taken = {chest.position for chest in with_chests.chests}
+        expected = spawn_npcs(random.Random(with_chests.level.seed), with_chests.level)
+        assert with_chests.npcs == tuple(
+            npc for npc in expected if npc.position not in taken
+        )
+
+
+# --- Chests live on the level, and survive leaving it ------------------------
+
+
+def test_a_chest_is_filed_into_levelstate_and_comes_back_unchanged() -> None:
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    state = with_chest(state, (5, 1), CLUB)
+    below = step(state, DESCEND)
+
+    assert below.chests == (), "the level below has its own contents"
+    assert below.saved[1].chests == state.chests
+
+    back = step(below, ASCEND)
+    assert back.chests == state.chests
+
+
+def test_an_emptied_chest_is_still_empty_after_a_round_trip() -> None:
+    state = walk_to(start(stairs_level()), DOWN_CELL)
+    state = with_chest(state, DOWN_CELL, POTION_OF_HEALING)
+    emptied = step(state, PICK_UP)
+    assert emptied.chests[0].contents == ()
+    assert emptied.chests[0].opened is True
+
+    back = step(step(emptied, DESCEND), ASCEND)
+    assert back.chests == emptied.chests
+    assert back.player_actor.inventory.carried == (POTION_OF_HEALING,)
+
+
+def test_stepping_onto_a_chest_says_so_like_a_staircase() -> None:
+    state = with_chest(start(fight_level()), (5, 3), CLUB)
+    after = step(state, MOVE_E)
+    assert after.player == (5, 3)
+    assert [e.kind for e in after.events] == [EventKind.CHEST_HERE]
+    assert after.turns == state.turns + 1, "walking onto it is an ordinary step"
+
+
+def test_a_chest_on_a_staircase_reports_both() -> None:
+    state = start(stairs_level(), (15, 3))
+    state = with_chest(state, DOWN_CELL, CLUB)
+    after = step(state, MOVE_E)
+    assert [e.kind for e in after.events] == [
+        EventKind.STAIRS_HERE_DOWN,
+        EventKind.CHEST_HERE,
+    ]
+
+
+# --- PICK_UP (CONTRACT-v6 §7.16, §7.18) --------------------------------------
+
+
+def test_pick_up_takes_one_item_and_costs_a_turn() -> None:
+    state = with_chest(start(fight_level()), (4, 3), CLUB, POTION_OF_HEALING)
+    first = step(state, PICK_UP)
+
+    assert first.turns == state.turns + 1
+    assert first.player_actor.inventory.carried == (CLUB,)
+    assert first.chests[0].contents == (POTION_OF_HEALING,)
+    assert first.chests[0].opened is True
+    # The first item out of a closed chest is what the chest *held*; everything after it
+    # is something you picked up. Both sentences exist in §16 v6 and each says one thing.
+    assert first.events == (Event(EventKind.CHEST_OPENED, name="club"),)
+
+    second = step(first, PICK_UP)
+    assert second.turns == first.turns + 1
+    assert second.player_actor.inventory.carried == (CLUB, POTION_OF_HEALING)
+    assert second.events == (Event(EventKind.PICKED_UP, name="potion of healing"),)
+
+
+def test_pick_up_on_a_cell_with_no_chest_reports_and_costs_no_turn() -> None:
+    state = with_chest(start(fight_level()), (6, 3), CLUB)
+    after = step(state, PICK_UP)
+    assert after.turns == state.turns
+    assert after.events == (Event(EventKind.NOTHING_TO_PICK_UP),)
+    assert after.player_actor.inventory.carried == ()
+    assert after.chests == state.chests
+
+
+def test_pick_up_from_an_emptied_chest_reports_and_costs_no_turn() -> None:
+    state = with_chest(start(fight_level()), (4, 3), opened=True)
+    after = step(state, PICK_UP)
+    assert after.turns == state.turns
+    assert after.events == (Event(EventKind.CHEST_EMPTY),)
+
+
+def test_pick_up_with_a_full_pack_reports_and_changes_nothing() -> None:
+    full = tuple([CLUB] * CARRY_LIMIT)
+    state = carrying(with_chest(start(fight_level()), (4, 3), SWORD), *full)
+    after = step(state, PICK_UP)
+
+    assert after.turns == state.turns
+    assert after.events == (Event(EventKind.PACK_FULL),)
+    assert after.player_actor.inventory.carried == full
+    assert after.chests[0].contents == (SWORD,), "nothing left the chest"
+    assert after.chests[0].opened is False
+
+
+def test_a_refused_pick_up_does_not_tick_the_world() -> None:
+    # v1's headline rule, at the newest command: no turn, no world-tick.
+    state = with_npcs(with_player(start(fight_level()), hp=20), make_npc((7, 5)))
+    for _ in range(3):
+        after = step(state, PICK_UP)
+        assert after.turns == state.turns
+        assert after.npcs == state.npcs
+        assert after.player_actor.actor == state.player_actor.actor
+        state = after
+
+
+def test_a_successful_pick_up_does_tick_the_world() -> None:
+    state = with_npcs(
+        with_chest(start(fight_level()), (4, 3), CLUB), make_npc((7, 5), Species.RAT)
+    )
+    after = step(state, PICK_UP)
+    assert after.turns == state.turns + 1
+    assert after.npcs[0].position != state.npcs[0].position or after.npcs[0].energy != 0
+
+
+# --- The inventory screen (CONTRACT-v6 §7.17) --------------------------------
+
+
+def test_the_inventory_opens_and_costs_no_turn() -> None:
+    state = carrying(start(fight_level()), CLUB)
+    after = step(state, INVENTORY_COMMAND)
+    assert after.inventory_open is True
+    assert after.inventory_cursor == 0
+    assert after.turns == state.turns
+    assert after.player == state.player
+    assert after.visible is state.visible, "reading a screen recomputes nothing"
+
+
+def test_opening_the_inventory_never_ticks_the_world() -> None:
+    state = with_npcs(carrying(start(fight_level()), CLUB), make_npc((7, 5)))
+    for _ in range(5):
+        after = step(state, INVENTORY_COMMAND)
+        assert after.turns == state.turns
+        assert after.npcs == state.npcs
+        state = dataclasses.replace(after, inventory_open=False)
+
+
+def test_browsing_the_inventory_costs_no_turn_and_moves_the_cursor() -> None:
+    state = step(carrying(start(fight_level()), CLUB, SWORD, BANDAGE), INVENTORY_COMMAND)
+    for index in (2, 1, 0, 2):
+        state = inventory_key(state, letter(index))
+        assert state.inventory_cursor == index
+        assert state.inventory_open is True
+        assert state.turns == 0
+
+
+def test_any_other_key_closes_the_inventory_without_a_turn() -> None:
+    opened = step(carrying(start(fight_level()), CLUB), INVENTORY_COMMAND)
+    for key in (ord(" "), 27, ord("?"), ord("5"), -1):
+        closed = inventory_key(opened, key)
+        assert closed.inventory_open is False
+        assert closed.inventory_cursor == 0
+        assert closed.turns == opened.turns
+
+
+def test_a_letter_with_no_item_behind_it_closes_the_screen() -> None:
+    opened = step(carrying(start(fight_level()), CLUB), INVENTORY_COMMAND)
+    assert inventory_key(opened, letter(3)).inventory_open is False
+
+
+def test_the_screens_own_keys_are_not_command_kinds() -> None:
+    # CONTRACT-v6 §5 v6: `e`, `d` and the item letters must stay unbound globally, which
+    # is exactly why `inventory_key` takes a raw key rather than a `Command`.
+    for char in "ed":
+        assert translate_key(char).kind is CommandKind.UNKNOWN
+    assert translate_key("i").kind is CommandKind.INVENTORY
+    assert translate_key("g").kind is CommandKind.PICK_UP
+    assert "d" not in ITEM_LETTERS and "e" not in ITEM_LETTERS
+    assert len(ITEM_LETTERS) == CARRY_LIMIT
+    assert len(set(ITEM_LETTERS)) == CARRY_LIMIT
+
+
+def test_a_command_arriving_while_the_screen_is_open_just_closes_it() -> None:
+    opened = step(carrying(start(fight_level()), CLUB), INVENTORY_COMMAND)
+    for command in (MOVE_E, QUIT, DESCEND, UNKNOWN):
+        closed = step(opened, command)
+        assert closed.inventory_open is False
+        assert closed.turns == opened.turns
+        assert closed.player == opened.player
+        assert closed.running is True
+
+
+def test_inventory_key_ignores_a_state_that_is_not_showing_the_screen() -> None:
+    state = carrying(start(fight_level()), CLUB)
+    assert inventory_key(state, ord("e")) is state
+    dead = dataclasses.replace(state, inventory_open=True, running=False)
+    assert inventory_key(dead, ord("e")) is dead
+
+
+def test_the_inventory_lines_name_every_slot_and_every_carried_item() -> None:
+    state = step(
+        carrying(start(fight_level()), CLUB, BANDAGE, melee=DAGGER, shield=BUCKLER),
+        INVENTORY_COMMAND,
+    )
+    lines = inventory_lines(state)
+    assert "dagger" in lines[0] and "buckler" in lines[0]
+    assert lines[1] == ""
+    assert lines[2].startswith(">"), "the cursor marks the selection"
+    assert "club" in lines[2] and ITEM_LETTERS[0] in lines[2]
+    assert "bandage" in lines[3] and ITEM_LETTERS[1] in lines[3]
+    assert len(lines) == 4
+    assert "e " in format_inventory_status(state)
+
+
+def test_the_inventory_says_bare_hands_for_an_empty_melee_slot() -> None:
+    state = step(carrying(start(fight_level()), melee=None, ranged=None), INVENTORY_COMMAND)
+    assert "bare hands" in inventory_lines(state)[0]
+    assert "empty" in inventory_lines(state)[2]
+
+
+def test_a_full_pack_fits_the_default_screen() -> None:
+    # Twenty items, one equipment line and one blank: exactly the 22 body rows of a
+    # default map, so the screen needs no pagination.
+    state = step(carrying(start(hall_level()), *([CLUB] * CARRY_LIMIT)), INVENTORY_COMMAND)
+    assert len(inventory_lines(state)) == CARRY_LIMIT + 2 == 22
+
+
+# --- Equipping and using (CONTRACT-v6 §7.17) ---------------------------------
+
+
+def test_equipping_costs_a_turn_and_closes_the_screen() -> None:
+    state = step(carrying(start(fight_level()), SWORD), INVENTORY_COMMAND)
+    after = inventory_key(state, ord("e"))
+
+    assert after.turns == state.turns + 1
+    assert after.inventory_open is False
+    assert after.player_actor.inventory.melee is SWORD
+    assert after.player_actor.inventory.carried == (DAGGER,), "the dagger went to the pack"
+    assert after.events == (Event(EventKind.EQUIPPED, name="sword"),)
+
+
+def test_equipping_a_shield_fills_the_shield_slot() -> None:
+    state = step(carrying(start(fight_level()), KITE_SHIELD), INVENTORY_COMMAND)
+    after = inventory_key(state, ord("e"))
+    assert after.player_actor.inventory.shield is KITE_SHIELD
+    assert after.player_actor.inventory.melee is DAGGER, "a shield displaces no weapon"
+
+
+def test_equipping_a_bow_fills_the_ranged_slot() -> None:
+    state = step(carrying(start(fight_level()), LONGBOW), INVENTORY_COMMAND)
+    after = inventory_key(state, ord("e"))
+    assert after.player_actor.inventory.ranged is LONGBOW
+    assert after.player_actor.inventory.melee is DAGGER
+
+
+def test_e_on_a_consumable_drinks_it_rather_than_raising() -> None:
+    # `items.equip` RAISES on a Consumable (CONTRACT-v6 §11 v6): the "use" case has to be
+    # dispatched *before* it is called, never by catching the exception.
+    state = step(
+        carrying(with_player(start(fight_level()), hp=20), POTION_OF_HEALING),
+        INVENTORY_COMMAND,
+    )
+    after = inventory_key(state, ord("e"))
+    assert after.player_actor.inventory.carried == ()
+    assert after.player_actor.actor.hp == 30
+    assert after.events == (Event(EventKind.DRANK, name="potion of healing"),)
+    assert after.turns == state.turns + 1
+
+
+def test_dropping_costs_a_turn_and_removes_the_item() -> None:
+    state = step(carrying(start(fight_level()), CLUB, SWORD), INVENTORY_COMMAND)
+    after = inventory_key(inventory_key(state, letter(1)), ord("d"))
+    assert after.player_actor.inventory.carried == (CLUB,)
+    assert after.events == (Event(EventKind.DROPPED, name="sword"),)
+    assert after.turns == state.turns + 1
+    assert after.inventory_open is False
+
+
+def test_acting_on_an_empty_pack_does_nothing_and_costs_nothing() -> None:
+    state = step(start(fight_level()), INVENTORY_COMMAND)
+    for key in (ord("e"), ord("d")):
+        after = inventory_key(state, key)
+        assert after is state
+
+
+def test_an_inventory_action_ticks_the_world_exactly_once() -> None:
+    state = step(
+        with_npcs(carrying(start(fight_level()), SWORD), make_npc((7, 5), Species.RAT)),
+        INVENTORY_COMMAND,
+    )
+    after = inventory_key(state, ord("e"))
+    assert after.turns == state.turns + 1
+    # One tick: the rat banks exactly one action's worth of energy, or has spent it.
+    assert after.npcs[0] != state.npcs[0]
+
+
+# --- Equipment changes what an attack actually does --------------------------
+
+
+def test_equipping_a_weapon_changes_the_damage_of_the_next_blow() -> None:
+    # Asserted through a real `step`, not by reading the slot: the claim is about damage.
+    base = with_npcs(
+        with_player(start(fight_level()), stats=Stats(str_=10, agi=10, vit=10)),
+        make_npc((5, 3), Species.JACKAL, hp=90),
+    )
+    with_dagger = base
+    with_club = carrying(base, melee=CLUB, ranged=SHORTBOW)
+
+    differed = 0
+    for seed in range(40):
+        armed = dataclasses.replace(with_club, master_seed=seed)
+        unarmed = dataclasses.replace(with_dagger, master_seed=seed)
+        expected = player_attack_result(armed, armed.npcs[0], CLUB, True)
+        assert step(armed, MOVE_E).npcs[0].actor.hp == expected.defender_hp
+        assert (
+            step(unarmed, MOVE_E).npcs[0].actor.hp
+            == player_attack_result(unarmed, unarmed.npcs[0], DAGGER, True).defender_hp
+        )
+        if step(armed, MOVE_E).npcs[0].actor.hp != step(unarmed, MOVE_E).npcs[0].actor.hp:
+            differed += 1
+    assert differed, "2-4 blunt and 2-5 pierce cannot agree on all forty seeds"
+
+
+def test_equipping_a_shield_makes_a_blow_blockable() -> None:
+    unarmoured = with_npcs(
+        with_player(start(fight_level()), stats=UNKILLABLE),
+        make_npc((5, 3), Species.JACKAL),
+    )
+    shielded = carrying(unarmoured, melee=DAGGER, ranged=SHORTBOW, shield=TOWER_SHIELD)
+
+    blocked = None
+    for seed in range(200):
+        after = tick(dataclasses.replace(shielded, master_seed=seed))
+        if EventKind.SHIELD_BLOCKED in {e.kind for e in after.events}:
+            blocked = seed
+            break
+    assert blocked is not None, "a 25% shield blocks something inside 200 seeds"
+
+    with_shield = tick(dataclasses.replace(shielded, master_seed=blocked))
+    assert with_shield.player_actor.actor.hp == shielded.player_actor.actor.hp
+    assert with_shield.player_actor.actor.status_effects == (), "no venom either"
+
+    # The same seed, the same first draw: the blow still lands, it is the shield that
+    # stopped it. Without one, the player takes the damage.
+    without = tick(dataclasses.replace(unarmoured, master_seed=blocked))
+    assert EventKind.NPC_HIT_PLAYER in {e.kind for e in without.events}
+    assert without.player_actor.actor.hp < unarmoured.player_actor.actor.hp
+
+
+def test_a_shield_never_blocks_when_there_is_no_shield() -> None:
+    state = with_npcs(
+        with_player(start(fight_level()), stats=UNKILLABLE),
+        make_npc((5, 3), Species.JACKAL),
+    )
+    for seed in range(60):
+        after = tick(dataclasses.replace(state, master_seed=seed))
+        assert EventKind.SHIELD_BLOCKED not in {e.kind for e in after.events}
+
+
+# --- Resistance reaches combat (CONTRACT-v6 §26) -----------------------------
+
+
+def melee_damage_over_seeds(state: GameState, weapon, seeds: range) -> list[int]:
+    """The damage each seed's bump-attack actually deals, through the real ``step``."""
+    armed = carrying(state, melee=weapon, ranged=SHORTBOW)
+    damages = []
+    for seed in seeds:
+        one = dataclasses.replace(armed, master_seed=seed)
+        after = step(one, MOVE_E)
+        damages.append(one.npcs[0].actor.hp - after.npcs[0].actor.hp)
+    return damages
+
+
+def test_a_pierce_weapon_does_less_to_the_cave_snake_than_a_blunt_one() -> None:
+    # The cave snake resists PIERCE — which is the dagger the player starts with, and the
+    # whole reason a club is worth carrying (CONTRACT-v6 §26.3, §0.5).
+    state = with_npcs(start(fight_level()), make_npc((5, 3), Species.CAVE_SNAKE, hp=900))
+    seeds = range(120)
+    pierce = sum(melee_damage_over_seeds(state, DAGGER, seeds))
+    blunt = sum(melee_damage_over_seeds(state, CLUB, seeds))
+    assert pierce < blunt, (pierce, blunt)
+
+
+def test_the_giant_bat_takes_more_from_blunt_than_from_pierce() -> None:
+    state = with_npcs(start(fight_level()), make_npc((5, 3), Species.GIANT_BAT, hp=900))
+    seeds = range(120)
+    assert sum(melee_damage_over_seeds(state, CLUB, seeds)) > sum(
+        melee_damage_over_seeds(state, DAGGER, seeds)
+    )
+
+
+def test_the_same_weapon_is_resisted_by_one_species_and_not_another() -> None:
+    seeds = range(120)
+    snake = with_npcs(start(fight_level()), make_npc((5, 3), Species.CAVE_SNAKE, hp=900))
+    jackal = with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL, hp=900))
+    assert sum(melee_damage_over_seeds(snake, DAGGER, seeds)) < sum(
+        melee_damage_over_seeds(jackal, DAGGER, seeds)
+    )
+
+
+def test_a_resisted_hit_says_so_and_a_vulnerable_one_says_something_else() -> None:
+    for species, weapon, kind in (
+        (Species.CAVE_SNAKE, DAGGER, EventKind.RESISTED),
+        (Species.GIANT_BAT, CLUB, EventKind.VULNERABLE_HIT),
+        (Species.RAT, DAGGER, None),
+    ):
+        state = with_npcs(start(fight_level()), make_npc((5, 3), species, hp=900))
+        state = carrying(state, melee=weapon, ranged=SHORTBOW)
+        state = dataclasses.replace(
+            state, master_seed=seed_where_player(state, state.npcs[0], weapon, True)
+        )
+        after = step(state, MOVE_E)
+        kinds = [e.kind for e in after.events]
+        # The monster hits back on the same turn, so the blow and its flavour are read
+        # off the front of the line rather than by comparing the whole of it.
+        assert kinds[0] is EventKind.PLAYER_HIT_NPC
+        assert after.events[0].name == SPECIES_DATA[species].name
+        flavours = {EventKind.RESISTED, EventKind.VULNERABLE_HIT, EventKind.IMMUNE_HIT}
+        assert [k for k in kinds if k in flavours] == ([] if kind is None else [kind])
+        if kind is not None:
+            assert kinds[1] is kind, "the flavour rides with the blow it is about"
+
+
+def test_resistance_reaches_a_fired_shot_too() -> None:
+    state = with_npcs(start(fight_level()), make_npc((7, 3), Species.CAVE_SNAKE, hp=900))
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[0], SHORTBOW, True)
+    )
+    fired = step(step(state, FIRE), FIRE)
+    assert [e.kind for e in fired.events] == [
+        EventKind.PLAYER_HIT_NPC,
+        EventKind.RESISTED,
+    ]
+
+
+def test_nothing_the_player_carries_is_immune_or_immune_making() -> None:
+    # The tier exists and is tested in `combat.py`; no shipped species uses it (§26.3).
+    for species in Species:
+        for damage_type in DamageType:
+            assert resistance_of(species, damage_type) is not Resistance.IMMUNE
+
+
+# --- Bare-handed (CONTRACT-v6 §7.15) -----------------------------------------
+
+
+def test_bare_hands_are_one_to_two_blunt_with_strength() -> None:
+    assert (BARE_HANDS.damage_min, BARE_HANDS.damage_max) == (1, 2)
+    assert BARE_HANDS.damage_type is DamageType.BLUNT
+
+    state = with_npcs(
+        carrying(start(fight_level()), melee=None, ranged=None),
+        make_npc((5, 3), Species.JACKAL, hp=900),
+    )
+    seen = set()
+    for seed in range(60):
+        one = dataclasses.replace(state, master_seed=seed)
+        after = step(one, MOVE_E)
+        assert after.turns == one.turns + 1, "an unarmed swing is still a swing"
+        dealt = one.npcs[0].actor.hp - after.npcs[0].actor.hp
+        assert after.npcs[0].actor.hp == (
+            player_attack_result(one, one.npcs[0], BARE_HANDS, True).defender_hp
+        )
+        if dealt:
+            seen.add(dealt)
+    assert seen, "sixty unarmed swings cannot all miss"
+    # 1-2 raw, plus the STR modifier of 0 at baseline, minus the jackal's block, floored.
+    assert max(seen) <= 2
+
+
+def test_bare_handed_punching_is_blunt_where_that_matters() -> None:
+    # A bat is VULNERABLE to BLUNT, so fists route through the same resistance lookup an
+    # equipped weapon does — which is the point of expressing them as a `Weapon`.
+    state = with_npcs(
+        carrying(start(fight_level()), melee=None, ranged=None),
+        make_npc((5, 3), Species.GIANT_BAT, hp=900),
+    )
+    state = dataclasses.replace(
+        state, master_seed=seed_where_player(state, state.npcs[0], BARE_HANDS, True)
+    )
+    assert [e.kind for e in step(state, MOVE_E).events][:2] == [
+        EventKind.PLAYER_HIT_NPC,
+        EventKind.VULNERABLE_HIT,
+    ]
+
+
+def test_firing_with_no_bow_refuses_and_costs_no_turn() -> None:
+    state = with_npcs(
+        carrying(start(fight_level()), melee=DAGGER, ranged=None),
+        make_npc((6, 3), Species.RAT),
+    )
+    after = step(state, FIRE)
+    assert after.turns == state.turns
+    assert after.targeting is None
+    assert after.events == (Event(EventKind.NO_TARGET),)
+    assert after.npcs == state.npcs, "the world did not tick either"
+
+
+def test_unequipping_the_bow_mid_aim_cancels_the_shot() -> None:
+    state = with_npcs(
+        start(fight_level()), make_npc((6, 3), Species.RAT)
+    )
+    aiming = step(state, FIRE)
+    assert aiming.targeting is not None
+    disarmed = carrying(aiming, melee=DAGGER, ranged=None)
+    fired = step(disarmed, FIRE)
+    assert fired.turns == disarmed.turns
+    assert fired.events == (Event(EventKind.NO_TARGET),)
+
+
+# --- Consumables (CONTRACT-v6 §25.1) -----------------------------------------
+
+
+def drink(state: GameState, index: int = 0) -> GameState:
+    """Open the pack, select ``index`` and press ``e``, through the real key path."""
+    opened = step(state, INVENTORY_COMMAND)
+    return inventory_key(inventory_key(opened, letter(index)), ord("e"))
+
+
+def test_a_potion_heals_instantly_and_costs_a_turn() -> None:
+    state = carrying(with_player(start(fight_level()), hp=10), POTION_OF_HEALING)
+    after = drink(state)
+    assert after.player_actor.actor.hp == 20
+    assert after.turns == state.turns + 1
+    assert after.player_actor.actor.status_effects == (), "a potion is not a bandage"
+
+
+def test_a_potion_never_heals_past_the_maximum() -> None:
+    full = derive(Stats(10, 10, 10)).max_hp
+    state = carrying(
+        with_player(start(fight_level()), hp=full - 2), POTION_OF_HEALING
+    )
+    assert drink(state).player_actor.actor.hp == full
+
+
+def test_a_bandage_applies_regeneration_that_heals_over_turns() -> None:
+    state = carrying(with_player(start(fight_level()), hp=10), BANDAGE)
+    after = drink(state)
+
+    assert after.turns == state.turns + 1
+    assert after.events == (Event(EventKind.BANDAGED),)
+    effects = after.player_actor.actor.status_effects
+    assert [e.kind for e in effects] == [StatusKind.REGENERATING]
+    # Using it costs a turn and that turn ticks the world, so one of the five turns is
+    # already spent and the first three points are already mended — the effect is applied
+    # before the tick, exactly as a snake's venom is.
+    assert (effects[0].remaining_turns, effects[0].magnitude) == (
+        BANDAGE.regen_turns - 1,
+        BANDAGE.regen_magnitude,
+    )
+    assert after.player_actor.actor.hp == 10 + BANDAGE.regen_magnitude
+
+    # It heals *over turns*: one point of hit points per tick until it runs out. Natural
+    # regeneration is running underneath it (1 HP every REGEN_TURNS), so the floor is
+    # asserted rather than an exact total — the claim is that the bandage keeps mending.
+    seen = [after.player_actor.actor.hp]
+    healing = after
+    while healing.player_actor.actor.status_effects:
+        healing = tick(healing)
+        seen.append(healing.player_actor.actor.hp)
+    assert len(seen) == BANDAGE.regen_turns, "five turns of mending, one already spent"
+    assert all(before < later for before, later in zip(seen, seen[1:]))
+    assert healing.player_actor.actor.hp >= 10 + BANDAGE.regen_turns * BANDAGE.regen_magnitude
+    # And then it stops: whatever is left is natural regeneration, never three a turn.
+    assert tick(healing).player_actor.actor.hp - healing.player_actor.actor.hp <= 1
+
+
+def test_regeneration_stops_at_the_maximum() -> None:
+    full = derive(Stats(10, 10, 10)).max_hp
+    state = with_player(
+        start(fight_level()),
+        hp=full - 1,
+        effects=(StatusEffect(StatusKind.REGENERATING, 5, 3),),
+    )
+    for _ in range(5):
+        state = tick(state)
+        assert state.player_actor.actor.hp == full
+
+
+def test_poison_and_regeneration_are_told_apart_rather_than_netted() -> None:
+    # `tick_effects` reports damage and healing separately for exactly this case: two
+    # effects of equal magnitude are not "nothing happened".
+    state = with_player(
+        start(fight_level()),
+        hp=30,
+        effects=(
+            StatusEffect(StatusKind.POISONED, 3, 2),
+            StatusEffect(StatusKind.REGENERATING, 3, 2),
+        ),
+    )
+    after = tick(state)
+    assert after.player_actor.actor.hp == 30, "2 burned, 2 mended"
+    assert [e.kind for e in after.events] == [EventKind.POISON_DAMAGE]
+
+
+def test_a_bandage_does_not_save_a_player_from_poison_that_outpaces_it() -> None:
+    state = with_player(
+        start(fight_level()),
+        hp=3,
+        effects=(
+            StatusEffect(StatusKind.POISONED, 5, 4),
+            StatusEffect(StatusKind.REGENERATING, 5, 1),
+        ),
+    )
+    after = tick(state)
+    assert after.running is False
+    assert after.player_actor.actor.hp <= 0
+    assert EventKind.PLAYER_DIED in {e.kind for e in after.events}
+
+
+# --- Purity and determinism, for the v6 paths --------------------------------
+
+
+def v6_states() -> list[GameState]:
+    fight = with_npcs(start(fight_level()), make_npc((5, 3), Species.CAVE_SNAKE))
+    return [
+        with_chest(fight, (4, 3), CLUB, POTION_OF_HEALING),
+        step(carrying(fight, BANDAGE, SWORD, shield=BUCKLER), INVENTORY_COMMAND),
+        carrying(fight, melee=None, ranged=None),
+    ]
+
+
+@pytest.mark.parametrize("index", range(3))
+def test_step_and_inventory_key_never_mutate_a_v6_state(index: int) -> None:
+    state = v6_states()[index]
+    before = snapshot(state)
+    copied = copy.deepcopy((state.npcs, state.chests, state.player_actor))
+    for command in (PICK_UP, INVENTORY_COMMAND, MOVE_E, FIRE, UNKNOWN):
+        step(state, command)
+    for key in (ord("e"), ord("d"), letter(0), ord(" ")):
+        inventory_key(state, key)
+    advance_npcs(state)
+    for name, value in before.items():
+        assert getattr(state, name) == value
+    assert (state.npcs, state.chests, state.player_actor) == copied
+
+
+def test_no_random_is_stored_on_a_v6_state() -> None:
+    state = new_game(99, *SMALL)
+    state = step(with_chest(state, state.player, CLUB), PICK_UP)
+    for name in STATE_FIELDS:
+        assert not isinstance(getattr(state, name), random.Random)
+    assert not isinstance(state.player_actor.inventory, random.Random)
+    for chest in state.chests:
+        assert not isinstance(chest.contents, random.Random)
+
+
+def test_a_scripted_v6_run_is_reproducible_across_hash_seeds() -> None:
+    # The whole increment through one door: chests are placed, the pack fills, the screen
+    # opens, something is equipped and drunk, and monsters are fought — twice, under two
+    # hash seeds, with byte-identical output.
+    script = """
+from roguelike.game import inventory_key, new_game, step, advance
+from roguelike.keys import translate_key
+
+state = new_game(20260812, 40, 18)
+for key in "EgjjjlllgkkkhhhfffgjjjlllEgkkkhhhfffijjjlllgkkkhhh":
+    if state.inventory_open:
+        state = inventory_key(state, ord(key))
+    else:
+        state = step(state, translate_key(key))
+    for _ in range(6):
+        state = advance(state)
+    if not state.running:
+        break
+print(
+    state.turns,
+    state.player,
+    state.player_actor.actor.hp,
+    state.player_actor.inventory,
+    state.chests,
+    [(n.actor_id, n.position, n.energy, n.actor.hp) for n in state.npcs],
+    sorted(state.open_doors),
+    len(state.explored),
+)
+"""
+    root = str(Path(game.__file__).resolve().parent.parent)
+    outputs = []
+    for hash_seed in ("0", "98765"):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            cwd=root,
+            env={"PYTHONHASHSEED": hash_seed, "PATH": "/usr/bin:/bin"},
+            check=True,
+        )
+        outputs.append(result.stdout)
+    assert outputs[0] == outputs[1]
+    assert outputs[0].strip(), "the replay produced a state to compare"
+
+
+def test_the_same_seed_and_keys_produce_the_same_v6_run(monsters, chests) -> None:
+    keys = "gjjjklllgggEhhhkkjjjfffillljjjkkkhhhfffgjjjlllhhhkkkjjjlllgg"
+    first = new_game(31337, *SMALL)
+    second = new_game(31337, *SMALL)
+    for key in keys:
+        if first.inventory_open:
+            first = inventory_key(first, ord(key))
+            second = inventory_key(second, ord(key))
+        else:
+            first = step(first, translate_key(key))
+            second = step(second, translate_key(key))
+    assert first == second
+    assert first.chests == second.chests
+    assert first.player_actor == second.player_actor
+
+
+# --- The chest reaches the renderer, and the screen reaches the loop ----------
+
+
+def test_the_chest_cells_go_to_the_renderer_as_bare_positions() -> None:
+    state = with_chest(start(fight_level()), (5, 3), CLUB)
+    assert game._chest_cells(state) == frozenset({(5, 3)})
+    assert game._chest_cells(start(fight_level())) == frozenset()
+
+
+def test_the_loop_draws_the_inventory_screen_and_reads_a_raw_key() -> None:
+    # `run` must not translate the key while the screen is open, or `e` and `d` would
+    # arrive as one indistinguishable UNKNOWN (CONTRACT-v6 §5 v6).
+    screen = StubScreen([ord("i"), ord("e"), ord("q")])
+    state = carrying(start(fight_level()), SWORD)
+    final = run(screen, state)
+    assert final.running is False
+    assert final.player_actor.inventory.melee is SWORD
+    assert final.turns == 1, "equipping cost exactly one turn"
+
+
+def test_the_block_chance_handed_to_combat_is_the_callers_decision() -> None:
+    # `resolve_attack` rolls whatever it is given and cannot tell a fang from an arrow
+    # (CONTRACT-v6 §23.6), so this is the one place the two are told apart.
+    assert game._shield_block(None, False, 10, 10) == 0
+    assert game._shield_block(None, True, 10, 10) == 0, "no shield is 0, never the floor"
+    assert game._shield_block(TOWER_SHIELD, False, 10, 10) == TOWER_SHIELD.block_chance
+    assert game._shield_block(BUCKLER, False, 20, 4) == BUCKLER.block_chance, (
+        "agility does not enter a melee block"
+    )
+    for shield, defender_agi, attacker_agi in (
+        (TOWER_SHIELD, 10, 10),
+        (BUCKLER, 20, 4),
+        (KITE_SHIELD, 4, 20),
+    ):
+        assert game._shield_block(shield, True, defender_agi, attacker_agi) == (
+            combat.ranged_block_chance(shield.block_chance, defender_agi, attacker_agi)
+        )
+
+
+def test_a_monster_never_gets_a_shield_roll_it_did_not_earn() -> None:
+    # The player's own attacks pass 0, not a floored ranged chance: nothing in the
+    # bestiary carries a shield, and `ranged_block_chance(0, ...)` would still be 5%.
+    state = with_npcs(start(fight_level()), make_npc((5, 3), Species.JACKAL, hp=900))
+    for seed in range(80):
+        one = dataclasses.replace(state, master_seed=seed)
+        assert EventKind.NPC_SHIELD_BLOCKED not in {
+            e.kind for e in step(one, MOVE_E).events
+        }
+        assert EventKind.NPC_SHIELD_BLOCKED not in {
+            e.kind for e in step(step(one, FIRE), FIRE).events
+        }

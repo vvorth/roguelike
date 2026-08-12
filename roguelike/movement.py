@@ -29,6 +29,14 @@ holding both a closed door and an actor reports ``blocked_by_npc`` — you attac
 not the door. That combination cannot arise while monsters stand only on passable cells,
 but the precedence is defined rather than accidental.
 
+**v6 changes nothing here, and that is a result rather than an omission.** The increment
+adds items, chests, damage types, resistances and shields; none of them is a collision
+rule. A chest is not an obstacle — the player stands *on* it to open it — so it never
+joins ``occupied``, and there is no ``Tile.CHEST`` for the terrain half to learn about
+(CONTRACT-v6 §27.3). The pack changes what a bump *does*, in ``game.py``, and nothing
+about whether the step is allowed. So ``MoveResult`` keeps its four fields, ``try_move``
+keeps its six parameters, and this module keeps its two imports.
+
 Imports only from :mod:`roguelike.level` and :mod:`roguelike.world` (CONTRACT-v2 §10).
 Never touches curses.
 """

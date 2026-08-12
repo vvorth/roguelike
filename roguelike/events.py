@@ -1,5 +1,5 @@
 """Event vocabulary and message wording (CONTRACT-v3 §16, CONTRACT-v4 §16,
-CONTRACT-v5 §16).
+CONTRACT-v5 §16, CONTRACT-v6 §16).
 
 Game logic emits structured, terminal-free :class:`Event` values; all English
 wording lives in exactly one table, :data:`MESSAGES`. This module is a leaf:
@@ -67,6 +67,22 @@ class EventKind(Enum):
     RESTED = auto()
     CANNOT_REST = auto()
     HOSTILE_IN_VIEW = auto()
+    # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
+    SHIELD_BLOCKED = auto()
+    NPC_SHIELD_BLOCKED = auto()
+    RESISTED = auto()
+    VULNERABLE_HIT = auto()
+    IMMUNE_HIT = auto()
+    PICKED_UP = auto()
+    NOTHING_TO_PICK_UP = auto()
+    PACK_FULL = auto()
+    EQUIPPED = auto()
+    DROPPED = auto()
+    DRANK = auto()
+    BANDAGED = auto()
+    CHEST_HERE = auto()
+    CHEST_OPENED = auto()
+    CHEST_EMPTY = auto()
 
 
 @dataclass(frozen=True)
@@ -128,6 +144,22 @@ MESSAGES: dict[EventKind, str] = {
     EventKind.RESTED: "You feel rested.",
     EventKind.CANNOT_REST: "Not with enemies in view.",
     EventKind.HOSTILE_IN_VIEW: "Not while a {name} is in view.",
+    # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
+    EventKind.SHIELD_BLOCKED: "Your shield turns the blow.",
+    EventKind.NPC_SHIELD_BLOCKED: "The {name} blocks with its shield.",
+    EventKind.RESISTED: "The {name} shrugs it off.",
+    EventKind.VULNERABLE_HIT: "It tears into the {name}!",
+    EventKind.IMMUNE_HIT: "The {name} is unharmed.",
+    EventKind.PICKED_UP: "You pick up the {name}.",
+    EventKind.NOTHING_TO_PICK_UP: "There is nothing here to pick up.",
+    EventKind.PACK_FULL: "You cannot carry any more.",
+    EventKind.EQUIPPED: "You ready the {name}.",
+    EventKind.DROPPED: "You drop the {name}.",
+    EventKind.DRANK: "You drink the {name}.",
+    EventKind.BANDAGED: "You bind your wounds.",
+    EventKind.CHEST_HERE: "There is a chest here.",
+    EventKind.CHEST_OPENED: "The chest holds: {name}",
+    EventKind.CHEST_EMPTY: "The chest is empty.",
 }
 
 

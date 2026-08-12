@@ -4,7 +4,10 @@
 :class:`NpcAction` *intent* — wait, move here, attack that — and ``game.py`` carries it
 out. It is the same split that put the planners in :mod:`roguelike.activity` and
 ``advance`` in ``game.py``, and it is what keeps the import graph acyclic: nothing here
-imports ``combat``, ``game``, ``render``, ``keys`` or ``events`` (CONTRACT-v5 §10 v5).
+imports ``combat``, ``game``, ``render``, ``keys`` or ``events`` (CONTRACT-v6 §10 v6).
+It may, as of v6, import :mod:`roguelike.items` — a leaf itself — for :class:`DamageType`
+and :class:`Resistance`, since a species' resistance profile is a fact about the bestiary
+(CONTRACT-v6 §26.3), not about combat's damage pipeline (§26.2, owned by ``combat.py``).
 
 All coordinates are ``(x, y)`` with the origin at the top-left; ``x`` grows right and
 ``y`` grows down (CONTRACT §0.1). Every distance in this module is **Chebyshev** —
@@ -52,11 +55,12 @@ anywhere in this file. Never touches curses.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 from roguelike.fov import has_line_of_sight
+from roguelike.items import DamageType, Resistance
 from roguelike.level import Level
 from roguelike.pathfind import DIRECTIONS, Coord, find_path
 from roguelike.stats import Actor, Condition, Stats, derive
@@ -82,6 +86,7 @@ __all__ = [
     "wants_to_flee",
     "plan_action",
     "spawn_npcs",
+    "resistance_of",
 ]
 
 
@@ -109,6 +114,16 @@ class SpeciesData:
 
     There is deliberately **no** ``max_hp``, ``speed``, ``evasion`` or ``block`` field —
     those are :func:`roguelike.stats.derive` of :attr:`stats` (CONTRACT-v5 §24.1).
+
+    ``resistances`` maps a :class:`~roguelike.items.DamageType` this species takes
+    something other than :attr:`~roguelike.items.Resistance.NORMAL` from, to the tier it
+    takes it at. **Absence means ``NORMAL``** — nothing in the shipped bestiary is
+    written down for all three types, so the dict holds only the exceptions. Use
+    :func:`resistance_of` rather than indexing this field directly; it applies that
+    default. Nothing here is ever ``IMMUNE`` (CONTRACT-v6 §26.3) — the tier exists and is
+    tested, but no shipped species uses it. Applying the multiplier a tier means is
+    ``combat.py``'s job, not this module's (§26.2); ``SpeciesData`` only says *how much*,
+    never *what happens*.
     """
 
     name: str
@@ -120,6 +135,7 @@ class SpeciesData:
     poison_chance: int = 0
     hostile: bool = True
     flee_chance: int = 0
+    resistances: dict[DamageType, Resistance] = field(default_factory=dict)
 
 
 class AiState(Enum):
@@ -199,6 +215,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         attack_max=2,
         xp_value=8,
         flee_chance=3,
+        resistances={DamageType.BLUNT: Resistance.VULNERABLE},
     ),
     Species.CAVE_SNAKE: SpeciesData(
         name="cave snake",
@@ -209,6 +226,7 @@ SPECIES_DATA: dict[Species, SpeciesData] = {
         xp_value=12,
         poison_chance=30,
         flee_chance=1,
+        resistances={DamageType.PIERCE: Resistance.RESISTANT},
     ),
 }
 """The bestiary, one entry per :class:`Species` (CONTRACT-v5 §24.1).
@@ -475,6 +493,24 @@ def wants_to_flee(rng: "Random", npc: NPC, player: Actor) -> bool:
     if player.condition >= npc.actor.condition:
         return False
     return rng.randint(1, 100) <= chance
+
+
+def resistance_of(species: Species, damage_type: DamageType) -> Resistance:
+    """How ``species`` takes a hit of ``damage_type`` (CONTRACT-v6 §26.3).
+
+    Looks up :attr:`SpeciesData.resistances` for ``species`` and returns the tier stored
+    there, or :attr:`~roguelike.items.Resistance.NORMAL` for any type the table does not
+    mention — the same default the field's docstring promises, kept in the one place that
+    reads it so no caller has to spell out ``.get(..., Resistance.NORMAL)`` by hand.
+
+    This is a lookup, not a rule. ``combat.py`` calls it once per attack to learn *how
+    much* a defender resists, and applies the multiplier itself (§26.1, §26.2) — nothing
+    in ``npc.py`` ever multiplies a damage roll.
+
+    Pure: reads only :data:`SPECIES_DATA`, mutates nothing, and never raises for any real
+    :class:`Species` / :class:`~roguelike.items.DamageType` pair.
+    """
+    return SPECIES_DATA[species].resistances.get(damage_type, Resistance.NORMAL)
 
 
 def _flee(

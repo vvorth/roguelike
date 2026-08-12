@@ -1,4 +1,4 @@
-"""Unit tests for roguelike.events (CONTRACT-v3 §16).
+"""Unit tests for roguelike.events (CONTRACT-v3 §16, CONTRACT-v6 §16).
 
 These tests import no other project module and initialise no terminal; the
 suite passes with stdin redirected from /dev/null and no TTY attached.
@@ -61,16 +61,34 @@ EXPECTED_MESSAGES = {
     EventKind.RESTED: "You feel rested.",
     EventKind.CANNOT_REST: "Not with enemies in view.",
     EventKind.HOSTILE_IN_VIEW: "Not while a {name} is in view.",
+    # -- v6: shields, resistance, pickup, equipment, chests (CONTRACT-v6 §16) --
+    EventKind.SHIELD_BLOCKED: "Your shield turns the blow.",
+    EventKind.NPC_SHIELD_BLOCKED: "The {name} blocks with its shield.",
+    EventKind.RESISTED: "The {name} shrugs it off.",
+    EventKind.VULNERABLE_HIT: "It tears into the {name}!",
+    EventKind.IMMUNE_HIT: "The {name} is unharmed.",
+    EventKind.PICKED_UP: "You pick up the {name}.",
+    EventKind.NOTHING_TO_PICK_UP: "There is nothing here to pick up.",
+    EventKind.PACK_FULL: "You cannot carry any more.",
+    EventKind.EQUIPPED: "You ready the {name}.",
+    EventKind.DROPPED: "You drop the {name}.",
+    EventKind.DRANK: "You drink the {name}.",
+    EventKind.BANDAGED: "You bind your wounds.",
+    EventKind.CHEST_HERE: "There is a chest here.",
+    EventKind.CHEST_OPENED: "The chest holds: {name}",
+    EventKind.CHEST_EMPTY: "The chest is empty.",
 }
 
 
 # --- EventKind shape ----------------------------------------------------------
 
 
-def test_event_kind_has_exactly_thirty_six_members() -> None:
-    # The eight from v3, the eight from v4 (CONTRACT-v4 §16), plus the twelve
-    # new v5 combat/death/levelling/poison/targeting kinds (CONTRACT-v5 §16),
-    # in declaration order.
+def test_event_kind_has_exactly_fifty_one_members() -> None:
+    # The eight from v3, the eight from v4 (CONTRACT-v4 §16), the twenty new
+    # v5 kinds (combat/death/levelling/poison/targeting plus the melee,
+    # look and rest kinds that arrived alongside them), plus the fifteen new
+    # v6 shield/resistance/pickup/equipment/chest kinds (CONTRACT-v6 §16), in
+    # declaration order.
     assert [member.name for member in EventKind] == [
         "DOOR_OPENED",
         "STAIRS_HERE_UP",
@@ -108,15 +126,30 @@ def test_event_kind_has_exactly_thirty_six_members() -> None:
         "RESTED",
         "CANNOT_REST",
         "HOSTILE_IN_VIEW",
+        "SHIELD_BLOCKED",
+        "NPC_SHIELD_BLOCKED",
+        "RESISTED",
+        "VULNERABLE_HIT",
+        "IMMUNE_HIT",
+        "PICKED_UP",
+        "NOTHING_TO_PICK_UP",
+        "PACK_FULL",
+        "EQUIPPED",
+        "DROPPED",
+        "DRANK",
+        "BANDAGED",
+        "CHEST_HERE",
+        "CHEST_OPENED",
+        "CHEST_EMPTY",
     ]
 
 
-def test_event_kind_has_exactly_thirty_six_members_by_len() -> None:
-    assert len(list(EventKind)) == 36
+def test_event_kind_has_exactly_fifty_one_members_by_len() -> None:
+    assert len(list(EventKind)) == 51
 
 
 def test_event_kind_uses_auto_values() -> None:
-    assert [member.value for member in EventKind] == list(range(1, 37))
+    assert [member.value for member in EventKind] == list(range(1, 52))
 
 
 # --- MESSAGES: complete and exact --------------------------------------------
@@ -132,8 +165,8 @@ def test_messages_has_no_extra_entries() -> None:
     assert set(MESSAGES) == set(EventKind)
 
 
-def test_messages_has_exactly_thirty_six_entries() -> None:
-    assert len(MESSAGES) == 36
+def test_messages_has_exactly_fifty_one_entries() -> None:
+    assert len(MESSAGES) == 51
 
 
 @pytest.mark.parametrize("kind", list(EventKind))
@@ -336,6 +369,148 @@ def test_spotted_hostile_message() -> None:
         message_for((Event(EventKind.SPOTTED_HOSTILE, name="giant bat"),))
         == "There is a giant bat in view."
     )
+
+
+# --- message_for: the fifteen new v6 shield/resistance/pickup/equipment/chest
+# messages (CONTRACT-v6 §16) — each asserted literally ------------------------
+
+
+def test_shield_blocked_message() -> None:
+    assert (
+        message_for((Event(EventKind.SHIELD_BLOCKED),))
+        == "Your shield turns the blow."
+    )
+
+
+def test_npc_shield_blocked_message() -> None:
+    assert (
+        message_for((Event(EventKind.NPC_SHIELD_BLOCKED, name="orc"),))
+        == "The orc blocks with its shield."
+    )
+
+
+def test_resisted_message() -> None:
+    assert (
+        message_for((Event(EventKind.RESISTED, name="skeleton"),))
+        == "The skeleton shrugs it off."
+    )
+
+
+def test_vulnerable_hit_message() -> None:
+    assert (
+        message_for((Event(EventKind.VULNERABLE_HIT, name="zombie"),))
+        == "It tears into the zombie!"
+    )
+
+
+def test_immune_hit_message() -> None:
+    assert (
+        message_for((Event(EventKind.IMMUNE_HIT, name="rust monster"),))
+        == "The rust monster is unharmed."
+    )
+
+
+def test_picked_up_message() -> None:
+    assert (
+        message_for((Event(EventKind.PICKED_UP, name="dagger"),))
+        == "You pick up the dagger."
+    )
+
+
+def test_nothing_to_pick_up_message() -> None:
+    assert (
+        message_for((Event(EventKind.NOTHING_TO_PICK_UP),))
+        == "There is nothing here to pick up."
+    )
+
+
+def test_pack_full_message() -> None:
+    assert (
+        message_for((Event(EventKind.PACK_FULL),)) == "You cannot carry any more."
+    )
+
+
+def test_equipped_message() -> None:
+    assert (
+        message_for((Event(EventKind.EQUIPPED, name="long sword"),))
+        == "You ready the long sword."
+    )
+
+
+def test_dropped_message() -> None:
+    assert (
+        message_for((Event(EventKind.DROPPED, name="shield"),))
+        == "You drop the shield."
+    )
+
+
+def test_drank_message() -> None:
+    assert (
+        message_for((Event(EventKind.DRANK, name="potion of healing"),))
+        == "You drink the potion of healing."
+    )
+
+
+def test_bandaged_message() -> None:
+    assert message_for((Event(EventKind.BANDAGED),)) == "You bind your wounds."
+
+
+def test_chest_here_message() -> None:
+    assert (
+        message_for((Event(EventKind.CHEST_HERE),)) == "There is a chest here."
+    )
+
+
+def test_chest_opened_message() -> None:
+    assert (
+        message_for((Event(EventKind.CHEST_OPENED, name="a leather pack"),))
+        == "The chest holds: a leather pack"
+    )
+
+
+def test_chest_empty_message() -> None:
+    assert message_for((Event(EventKind.CHEST_EMPTY),)) == "The chest is empty."
+
+
+# --- v6: name requirement -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EventKind.NPC_SHIELD_BLOCKED,
+        EventKind.RESISTED,
+        EventKind.VULNERABLE_HIT,
+        EventKind.IMMUNE_HIT,
+        EventKind.PICKED_UP,
+        EventKind.EQUIPPED,
+        EventKind.DROPPED,
+        EventKind.DRANK,
+        EventKind.CHEST_OPENED,
+    ],
+)
+def test_v6_missing_name_raises_value_error(kind: EventKind) -> None:
+    with pytest.raises(ValueError):
+        message_for((Event(kind),))
+    with pytest.raises(ValueError):
+        message_for((Event(kind, name=None),))
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EventKind.SHIELD_BLOCKED,
+        EventKind.NOTHING_TO_PICK_UP,
+        EventKind.PACK_FULL,
+        EventKind.BANDAGED,
+        EventKind.CHEST_HERE,
+        EventKind.CHEST_EMPTY,
+    ],
+)
+def test_no_placeholder_v6_kinds_ignore_all_supplied_fields(kind: EventKind) -> None:
+    plain = message_for((Event(kind),))
+    with_everything = message_for((Event(kind, depth=1, name="rat", level=2),))
+    assert plain == with_everything == MESSAGES[kind]
 
 
 # --- v5: name/level requirement -----------------------------------------------
@@ -632,8 +807,13 @@ def test_events_uses_future_annotations() -> None:
 
 
 def test_no_bump_into_wall_event_exists() -> None:
+    # "BLOCKED" is deliberately not in this forbidden list as of v6:
+    # SHIELD_BLOCKED / NPC_SHIELD_BLOCKED are legitimate combat events about a
+    # shield turning a blow, not a player misstepping into scenery — the
+    # thing this test guards against. "SHIELD_BLOCKED" contains neither
+    # "BUMP" nor "WALL", so it cannot be confused with that here.
     names = {member.name for member in EventKind}
-    for forbidden in ("BUMP", "WALL", "BUMPED", "BLOCKED"):
+    for forbidden in ("BUMP", "WALL", "BUMPED"):
         assert not any(forbidden in name for name in names)
 
 

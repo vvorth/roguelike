@@ -1,4 +1,4 @@
-"""Unit tests for roguelike.keys (CONTRACT §5).
+"""Unit tests for roguelike.keys (CONTRACT §5, CONTRACT-v6 §5).
 
 These tests import curses only to reference its KEY_* constants; nothing here
 initialises a terminal, and the suite passes with stdin redirected from
@@ -20,6 +20,7 @@ import pytest
 from roguelike.keys import (
     Command,
     CommandKind,
+    HELP_ENTRIES,
     QUIT_COMMAND,
     UNKNOWN_COMMAND,
     translate_key,
@@ -303,6 +304,8 @@ def test_every_bound_key_in_the_table_is_expected() -> None:
     expected |= {ord("f"), curses.ascii.TAB}
     # The help screen, and the explicit-attack prefix.
     expected |= {ord("?"), ord("a"), ord("x"), ord("R")}
+    # v6 additions: inventory, pick-up.
+    expected |= {ord("i"), ord("g")}
     assert set(keys_module._KEY_BINDINGS) == expected
 
 
@@ -516,10 +519,11 @@ def test_a_is_the_melee_attack_prefix() -> None:
     assert translate_key("A") == UNKNOWN_COMMAND
 
 
-def test_t_i_g_remain_unknown() -> None:
-    # CONTRACT-v5 §5: "Verified unbound before assignment". Of that original set,
-    # "f" took ranged fire and "a" took melee; "F", "t", "i" and "g" stay unbound.
-    for char in "tigF":
+def test_t_remains_unknown() -> None:
+    # CONTRACT-v5 §5: "Verified unbound before assignment". Of that original
+    # set, "f" took ranged fire and "a" took melee; "i" and "g" are taken in
+    # v6 (see the v6 section below); "F" and "t" still stay unbound.
+    for char in "tF":
         assert translate_key(char) == UNKNOWN_COMMAND
         assert translate_key(char).kind is CommandKind.UNKNOWN
 
@@ -534,6 +538,163 @@ def test_fire_and_target_next_do_not_collide_with_anything_else() -> None:
         + ["q", "Q", ">", "<", "E", "w"]
     }
     assert new_commands.isdisjoint(other_commands)
+
+
+# --- Help, look and rest: regression coverage --------------------------------
+#
+# These three bindings predate v6 but, until now, had no dedicated assertion
+# anywhere in this suite — only indirect coverage via the exhaustiveness and
+# zero-delta sweeps below. The T30 acceptance criteria call for an explicit
+# regression sweep of "q/Q/>/</E/w/f/Tab/?/a/x/R"; this closes that gap for
+# "?", "x" and "R" ("a" already has dedicated coverage above).
+
+
+def test_help_as_str() -> None:
+    command = translate_key("?")
+    assert command.kind is CommandKind.HELP
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_help_as_int() -> None:
+    command = translate_key(ord("?"))
+    assert command.kind is CommandKind.HELP
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_look_as_str() -> None:
+    command = translate_key("x")
+    assert command.kind is CommandKind.LOOK
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_look_as_int() -> None:
+    command = translate_key(ord("x"))
+    assert command.kind is CommandKind.LOOK
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_rest_as_str() -> None:
+    command = translate_key("R")
+    assert command.kind is CommandKind.REST
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_rest_as_int() -> None:
+    command = translate_key(ord("R"))
+    assert command.kind is CommandKind.REST
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_uppercase_x_and_lowercase_r_are_unbound() -> None:
+    # "x" (lowercase) is LOOK and "R" (uppercase) is REST; the opposite case
+    # of each is not bound to anything.
+    assert translate_key("X") == UNKNOWN_COMMAND
+    assert translate_key("r") == UNKNOWN_COMMAND
+
+
+def test_help_look_rest_are_pairwise_distinct_and_do_not_collide() -> None:
+    new_commands = {translate_key("?"), translate_key("x"), translate_key("R")}
+    assert len(new_commands) == 3
+    other_commands = {
+        translate_key(c)
+        for c in list(LETTER_BINDINGS)
+        + list(DIGIT_BINDINGS)
+        + list(SHIFT_LETTER_BINDINGS)
+        + ["q", "Q", ">", "<", "E", "w", "f", "a"]
+    }
+    other_commands.add(translate_key(curses.ascii.TAB))
+    assert new_commands.isdisjoint(other_commands)
+
+
+# --- Inventory and pick-up (CONTRACT-v6 §5): new in v6 ----------------------
+
+
+def test_inventory_as_str() -> None:
+    command = translate_key("i")
+    assert command.kind is CommandKind.INVENTORY
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_inventory_as_int() -> None:
+    command = translate_key(ord("i"))
+    assert command.kind is CommandKind.INVENTORY
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_inventory_str_and_int_forms_agree() -> None:
+    assert translate_key("i") == translate_key(ord("i"))
+
+
+def test_pick_up_as_str() -> None:
+    command = translate_key("g")
+    assert command.kind is CommandKind.PICK_UP
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_pick_up_as_int() -> None:
+    command = translate_key(ord("g"))
+    assert command.kind is CommandKind.PICK_UP
+    assert command.dx == 0
+    assert command.dy == 0
+
+
+def test_pick_up_str_and_int_forms_agree() -> None:
+    assert translate_key("g") == translate_key(ord("g"))
+
+
+def test_inventory_and_pick_up_are_distinct_commands() -> None:
+    assert translate_key("i") != translate_key("g")
+
+
+def test_uppercase_inventory_and_pick_up_letters_are_unbound() -> None:
+    assert translate_key("I") == UNKNOWN_COMMAND
+    assert translate_key("G") == UNKNOWN_COMMAND
+
+
+def test_inventory_and_pick_up_do_not_collide_with_anything_else() -> None:
+    new_commands = {translate_key("i"), translate_key("g")}
+    other_commands = {
+        translate_key(c)
+        for c in list(LETTER_BINDINGS)
+        + list(DIGIT_BINDINGS)
+        + list(SHIFT_LETTER_BINDINGS)
+        + ["q", "Q", ">", "<", "E", "w", "f", "?", "a", "x", "R"]
+    }
+    other_commands.add(translate_key(curses.ascii.TAB))
+    assert new_commands.isdisjoint(other_commands)
+
+
+def test_e_d_t_remain_unknown() -> None:
+    # CRITICAL (CONTRACT-v6 §5): "e", "d" and "t" are live raw keys *inside*
+    # the inventory screen (equip, drop, and a carried-item slot letter
+    # respectively), read exactly as direction keys are read raw inside look
+    # mode. Binding any of them here as a CommandKind would break that
+    # screen, so they must stay UNKNOWN globally even though "i" and "g" —
+    # unbound in the very same v5 sentence that unbound these three — are
+    # now bound.
+    for char in "edt":
+        command = translate_key(char)
+        assert command == UNKNOWN_COMMAND
+        assert command.kind is CommandKind.UNKNOWN
+        assert translate_key(ord(char)) == UNKNOWN_COMMAND
+
+
+def test_help_entries_documents_inventory_and_pick_up() -> None:
+    keys_documented = [entry[0] for entry in HELP_ENTRIES]
+    assert "i" in keys_documented
+    assert "g" in keys_documented
+    for keys_text, description in HELP_ENTRIES:
+        assert isinstance(keys_text, str) and keys_text
+        assert isinstance(description, str) and description
 
 
 # --- Unknown keys: ordinary input, never an error ---------------------------
@@ -556,15 +717,15 @@ def test_fire_and_target_next_do_not_collide_with_anything_else() -> None:
         "0",
         " ",
         "\n",
-        "e",  # lowercase auto-explore is not bound — only "E" is
+        "e",  # lowercase auto-explore is not bound — only "E" is; also a
+        # live raw key *inside* the inventory screen (CONTRACT-v6 §5)
         "W",  # uppercase walk-prefix is not bound — only "w" is
         # v5: the still-unbound letters (CONTRACT-v5 §5). "F" is among them again:
         # melee is on "a", so "f"/"F" cannot be transposed into each other.
         "F",
         "A",
-        "t",
-        "i",
-        "g",
+        "t",  # a live raw key inside the inventory screen (CONTRACT-v6 §5)
+        "d",  # ditto — never a CommandKind member (CONTRACT-v6 §5)
         -1,  # getch() with no input in non-blocking mode
         0,
         4,  # the integer four, not the numpad-4 key
@@ -674,18 +835,22 @@ def test_command_kind_members() -> None:
         "ATTACK",
         "LOOK",
         "REST",
+        "INVENTORY",
+        "PICK_UP",
     ]
 
 
 def test_command_kind_uses_auto_values() -> None:
-    assert [member.value for member in CommandKind] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    assert [member.value for member in CommandKind] == list(range(1, 16))
 
 
-def test_command_kind_has_exactly_thirteen_members() -> None:
+def test_command_kind_has_exactly_fifteen_members() -> None:
     # The five from v3 (MOVE, QUIT, UNKNOWN, DESCEND, ASCEND), the two from v4
-    # (AUTO_EXPLORE, WALK_PREFIX), the two from v5 (FIRE, TARGET_NEXT), and HELP.
-    assert len(list(CommandKind)) == 13
-    assert len(CommandKind) == 13
+    # (AUTO_EXPLORE, WALK_PREFIX), the two from v5 (FIRE, TARGET_NEXT), HELP,
+    # ATTACK, LOOK and REST (which arrived without a version bump to this
+    # docstring's count), and the two from v6 (INVENTORY, PICK_UP).
+    assert len(list(CommandKind)) == 15
+    assert len(CommandKind) == 15
 
 
 def test_module_constants_are_the_expected_kinds() -> None:

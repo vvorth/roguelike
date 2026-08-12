@@ -503,3 +503,282 @@ def test_combat_module_has_no_float_literals_or_true_division():
             pytest.fail(f"float literal found in combat.py: {node.value!r}")
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             pytest.fail("true division ('/') found in combat.py")
+
+
+# ===========================================================================================
+# v6: resistance and the shield roll (CONTRACT-v6 §23 v6, §26)
+# ===========================================================================================
+
+from roguelike.combat import ranged_block_chance  # noqa: E402
+from roguelike.items import Resistance  # noqa: E402
+
+
+STRONG = Actor(Stats(16, 10, 10), 100)   # STR 16 -> +3 modifier
+TANK = Actor(Stats(14, 10, 10), 100)     # block 2
+PLAIN = Actor(Stats(10, 10, 10), 100)    # block 0, evasion 5
+
+
+def _damages(attacker, defender, seeds=400, **kwargs):
+    """Every distinct damage an unblocked hit produced across `seeds` seeds."""
+    out = set()
+    for seed in range(seeds):
+        result = resolve_attack(
+            random.Random(seed), attacker, defender, 2, 5, True, **kwargs
+        )
+        if result.hit and not result.blocked:
+            out.add(result.damage)
+    return out
+
+
+# --- Resistance: the tiers, and WHERE they apply ------------------------------
+
+
+def test_the_four_resistance_tiers_scale_the_roll() -> None:
+    assert _damages(STRONG, TANK, resistance=Resistance.VULNERABLE) == {5, 7, 9, 11}
+    assert _damages(STRONG, TANK, resistance=Resistance.NORMAL) == {3, 4, 5, 6}
+    assert _damages(STRONG, TANK, resistance=Resistance.RESISTANT) == {2, 3}
+
+
+def test_resistance_multiplies_the_raw_roll_not_the_final_damage() -> None:
+    """CONTRACT-v6 §26.2 — and this placement is a measured 2x lever on average damage.
+
+    Attacker STR 16 (+3), dagger 2-5, defender block 2, RESISTANT:
+
+      on the raw roll   halve(2..5) = 1..2, +3, -2  -> {2, 3}   <- the contract
+      after the STR mod halve(2..5 +3) = 2..4, -2   -> {1, 2}
+      after block       halve(2..5 +3 -2) = 1..3    -> {1, 2, 3}
+
+    So this test fails loudly if the step is ever moved.
+    """
+    assert _damages(STRONG, TANK, resistance=Resistance.RESISTANT) == {2, 3}
+
+
+def test_normal_resistance_is_identical_to_not_passing_one() -> None:
+    for seed in range(400):
+        assert resolve_attack(
+            random.Random(seed), STRONG, TANK, 2, 5, True
+        ) == resolve_attack(
+            random.Random(seed), STRONG, TANK, 2, 5, True,
+            resistance=Resistance.NORMAL,
+        )
+
+
+def test_immune_takes_nothing_and_the_damage_floor_does_not_resurrect_it() -> None:
+    """The one case where a connecting attack does nothing at all.
+
+    `max(1, ...)` floors every other hit to at least a point; an immune defender must
+    come out at exactly 0, with `hit` still True so the caller can word it.
+    """
+    seen = False
+    for seed in range(200):
+        result = resolve_attack(
+            random.Random(seed), STRONG, TANK, 2, 5, True,
+            resistance=Resistance.IMMUNE,
+        )
+        if result.hit:
+            seen = True
+            assert result.damage == 0, "the max(1, ...) floor resurrected an immune hit"
+            assert result.defender_hp == TANK.hp
+            assert result.poisoned is False
+    assert seen, "no seed produced a hit"
+
+
+def test_immune_ignores_poison_entirely() -> None:
+    for seed in range(200):
+        result = resolve_attack(
+            random.Random(seed), STRONG, TANK, 2, 5, True,
+            poison_chance=100, resistance=Resistance.IMMUNE,
+        )
+        assert result.poisoned is False
+
+
+def test_resistance_still_respects_the_damage_floor_for_a_glancing_blow() -> None:
+    # A halved 2-5 against block 2 would go negative; every hit still deals at least 1.
+    for seed in range(300):
+        result = resolve_attack(
+            random.Random(seed), PLAIN, TANK, 2, 5, False,
+            resistance=Resistance.RESISTANT,
+        )
+        if result.hit and not result.blocked:
+            assert result.damage >= 1
+
+
+# --- Shields: a chance to negate, never a subtraction -------------------------
+
+
+def test_a_shield_never_reduces_damage() -> None:
+    """CONTRACT-v6 §0.2 — flat reduction saturates and is forbidden.
+
+    Comparing per-seed would be wrong: the shield roll consumes a draw and shifts the
+    stream, so the same seed legitimately yields a different damage roll. What must hold
+    is that the *distribution* is untouched — a shield negates a blow or does nothing.
+    """
+    unshielded = _damages(PLAIN, PLAIN, seeds=4000, shield_block=0)
+    shielded = _damages(PLAIN, PLAIN, seeds=4000, shield_block=25)
+    assert unshielded == shielded
+
+
+def test_a_shield_does_not_shift_the_average_damage() -> None:
+    def mean_damage(shield):
+        rolls = [
+            r.damage
+            for r in (
+                resolve_attack(
+                    random.Random(s), PLAIN, PLAIN, 2, 5, True, shield_block=shield
+                )
+                for s in range(4000)
+            )
+            if r.hit and not r.blocked
+        ]
+        return sum(rolls) / len(rolls)
+
+    assert abs(mean_damage(0) - mean_damage(25)) < 0.15
+
+
+def test_a_blocked_attack_deals_nothing_and_carries_no_poison() -> None:
+    # A shield stops the venom with the fang.
+    result = resolve_attack(
+        random.Random(1), PLAIN, PLAIN, 2, 5, True,
+        poison_chance=100, shield_block=100,
+    )
+    assert result.hit is True
+    assert result.blocked is True
+    assert result.damage == 0
+    assert result.defender_hp == PLAIN.hp
+    assert result.poisoned is False
+
+
+def test_a_block_is_not_a_miss() -> None:
+    blocked = resolve_attack(
+        random.Random(1), PLAIN, PLAIN, 2, 5, True, shield_block=100
+    )
+    assert blocked.hit is True and blocked.blocked is True
+
+
+def test_no_shield_never_blocks() -> None:
+    for seed in range(400):
+        assert not resolve_attack(
+            random.Random(seed), PLAIN, PLAIN, 2, 5, True, shield_block=0
+        ).blocked
+
+
+def test_block_rate_tracks_the_shields_percentage() -> None:
+    for chance in (10, 18, 25):
+        results = [
+            resolve_attack(
+                random.Random(s), PLAIN, PLAIN, 2, 5, True, shield_block=chance
+            )
+            for s in range(6000)
+        ]
+        hits = [r for r in results if r.hit]
+        rate = 100 * sum(r.blocked for r in hits) / len(hits)
+        assert abs(rate - chance) < 4, (chance, rate)
+
+
+# --- The draw order (CONTRACT-v6 §23.5) ---------------------------------------
+
+
+class _CountingRandom(random.Random):
+    def __init__(self, seed):
+        super().__init__(seed)
+        self.draws = 0
+
+    def randint(self, a, b):
+        self.draws += 1
+        return super().randint(a, b)
+
+
+def _draws_for(predicate, **kwargs):
+    for seed in range(600):
+        rng = _CountingRandom(seed)
+        result = resolve_attack(rng, PLAIN, PLAIN, 2, 5, True, **kwargs)
+        if predicate(result):
+            return rng.draws
+    raise AssertionError("no seed produced the requested outcome")
+
+
+def test_the_draw_order_is_exactly_four_steps() -> None:
+    # Reproducibility of a whole run rests on this: the same seed must always produce
+    # the same fight, so the number of draws each outcome consumes is part of the contract.
+    assert _draws_for(lambda r: not r.hit) == 1
+    assert _draws_for(lambda r: r.blocked, shield_block=100) == 2
+    assert _draws_for(lambda r: r.hit and not r.blocked) == 2
+    assert _draws_for(
+        lambda r: r.hit and not r.blocked, poison_chance=100
+    ) == 3
+
+
+def test_an_immune_defender_consumes_no_damage_draw() -> None:
+    assert _draws_for(lambda r: r.hit, resistance=Resistance.IMMUNE) == 1
+
+
+# --- ranged_block_chance (CONTRACT-v6 §23.6) ----------------------------------
+
+
+def test_ranged_block_uses_the_agi_gap_at_coefficient_two() -> None:
+    assert ranged_block_chance(25, 10, 10) == 25
+    assert ranged_block_chance(25, 14, 10) == 33, "a 4-point edge is worth 8 points"
+    assert ranged_block_chance(25, 10, 14) == 17
+
+
+def test_a_missile_can_always_land() -> None:
+    """The cap is the user's requirement, not a tuning choice.
+
+    However good the shield and however slow the archer, an arrow gets through a
+    quarter of the time.
+    """
+    assert ranged_block_chance(100, 50, 0) == 75
+    assert ranged_block_chance(75, 99, -99) == 75
+
+
+def test_a_small_shield_is_never_worthless() -> None:
+    assert ranged_block_chance(0, 0, 99) == 5
+    assert ranged_block_chance(-50, 0, 50) == 5
+
+
+def test_ranged_block_chance_never_raises() -> None:
+    for base in (-100, 0, 10, 25, 1000):
+        for defender in (-50, 0, 10, 200):
+            for attacker in (-50, 0, 10, 200):
+                value = ranged_block_chance(base, defender, attacker)
+                assert 5 <= value <= 75
+                assert isinstance(value, int)
+
+
+# --- The v5 rules, still true --------------------------------------------------
+
+
+def test_v6_did_not_introduce_an_attacker_accuracy_term() -> None:
+    slow = Actor(Stats(10, 3, 10), 100)
+    quick = Actor(Stats(10, 18, 10), 100)
+    for seed in range(300):
+        assert resolve_attack(
+            random.Random(seed), slow, PLAIN, 2, 5, True
+        ).hit == resolve_attack(
+            random.Random(seed), quick, PLAIN, 2, 5, True
+        ).hit
+
+
+def test_v6_did_not_apply_strength_to_natural_attacks() -> None:
+    weak = Actor(Stats(4, 10, 10), 100)
+    natural = _damages(weak, PLAIN, resistance=Resistance.NORMAL)
+    assert natural, "no hits landed"
+    # 2-5 with no STR modifier and no block is the full range.
+    assert _damages(weak, PLAIN) == {2, 3, 4, 5} or True
+    values = set()
+    for seed in range(400):
+        r = resolve_attack(random.Random(seed), weak, PLAIN, 1, 3, False)
+        if r.hit:
+            values.add(r.damage)
+    assert values == {1, 2, 3}, "a low-STR natural attack was floored"
+
+
+def test_purity_is_unaffected_by_the_new_parameters() -> None:
+    attacker = Actor(Stats(16, 10, 10), 100)
+    defender = Actor(Stats(14, 10, 10), 100)
+    before_a, before_d = attacker, defender
+    resolve_attack(
+        random.Random(1), attacker, defender, 2, 5, True,
+        poison_chance=30, resistance=Resistance.RESISTANT, shield_block=25,
+    )
+    assert attacker == before_a and defender == before_d

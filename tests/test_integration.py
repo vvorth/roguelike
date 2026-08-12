@@ -37,6 +37,12 @@ from roguelike.events import EventKind
 from roguelike.fov import compute_visible
 import dataclasses
 
+from roguelike import items
+from roguelike.game import ITEM_LETTERS
+from roguelike.loot import CHEST_CHANCE, CHEST_SAFE_RADIUS
+from roguelike.npc import NPC, SPECIES_DATA, Species
+from roguelike.stats import Actor, derive
+
 from roguelike.game import (
     GameState,
     advance,
@@ -906,3 +912,203 @@ def test_an_activity_never_walks_the_player_into_a_wall(seed: int) -> None:
         x, y = state.player
         assert state.level.in_bounds(x, y)
         assert world.is_passable(state.level, state.open_doors, x, y)
+
+
+# --------------------------------------------------------------------------
+# v6 end to end: items, resistance, shields, chests
+# --------------------------------------------------------------------------
+#
+# Written by the orchestrator against the real engine, independently of the
+# unit tests each worker wrote for its own module. The point is the seams
+# between modules, which no single worker could see.
+
+
+def test_a_new_game_starts_wielding_the_two_reference_weapons() -> None:
+    state = new_game(1234, *SMALL)
+    assert state.player_actor.inventory.melee is items.DAGGER
+    assert state.player_actor.inventory.ranged is items.SHORTBOW
+    assert state.player_actor.inventory.shield is None
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_the_dagger_is_still_two_to_five(seed: int) -> None:
+    # The reference the whole balance is measured against: one point of melee
+    # damage is worth 20-40 percentage points of floor-clear survival.
+    assert (items.DAGGER.damage_min, items.DAGGER.damage_max) == (2, 5)
+
+
+def _wielding(state, weapon):
+    """The same game with `weapon` equipped in the appropriate slot."""
+    inventory, added = items.add(state.player_actor.inventory, weapon)
+    assert added
+    inventory = items.equip(inventory, weapon)
+    return dataclasses.replace(
+        state,
+        player_actor=dataclasses.replace(state.player_actor, inventory=inventory),
+    )
+
+
+def _beside_the_player(state, species, hp=None):
+    data = SPECIES_DATA[species]
+    npc = NPC(
+        actor_id=99,
+        species=species,
+        actor=Actor(data.stats, hp if hp is not None else derive(data.stats).max_hp),
+        position=(state.player[0] + 1, state.player[1]),
+    )
+    return dataclasses.replace(state, npcs=(npc,))
+
+
+def _mean_melee_damage(weapon, species, samples=250):
+    dealt = []
+    for seed in range(samples):
+        state = dataclasses.replace(new_game(1234, *SMALL), master_seed=seed)
+        state = _beside_the_player(_wielding(state, weapon), species)
+        before = state.npcs[0].actor.hp
+        after = step(state, Command(CommandKind.MOVE, 1, 0))
+        if after.npcs and after.npcs[0].actor.hp < before:
+            dealt.append(before - after.npcs[0].actor.hp)
+    assert dealt, "no attack landed"
+    return sum(dealt) / len(dealt)
+
+
+def test_resistance_reaches_combat_through_the_real_turn_loop() -> None:
+    """The cave snake resists PIERCE, and the starting dagger is PIERCE.
+
+    This is the pressure the whole inventory exists to relieve: measured at
+    45.6% -> 8.5% floor clears when the player has no alternative damage type.
+    A worker could unit-test resistance perfectly and still leave it unwired;
+    only an end-to-end attack proves it arrives.
+    """
+    pierce = _mean_melee_damage(items.DAGGER, Species.CAVE_SNAKE)
+    blunt = _mean_melee_damage(items.CLUB, Species.CAVE_SNAKE)
+    assert blunt > pierce * 1.4, (pierce, blunt)
+
+
+def test_vulnerability_reaches_combat_too() -> None:
+    # The giant bat is VULNERABLE to BLUNT, so the crude club beats the dagger.
+    assert _mean_melee_damage(items.CLUB, Species.GIANT_BAT) > _mean_melee_damage(
+        items.DAGGER, Species.GIANT_BAT
+    )
+
+
+def test_carrying_a_second_damage_type_answers_the_resistance_wall() -> None:
+    # The whole design in one assertion: the club is worse than the dagger in
+    # general, and better against the one thing that resists the dagger.
+    dagger_snake = _mean_melee_damage(items.DAGGER, Species.CAVE_SNAKE)
+    club_snake = _mean_melee_damage(items.CLUB, Species.CAVE_SNAKE)
+    dagger_rat = _mean_melee_damage(items.DAGGER, Species.RAT)
+    club_rat = _mean_melee_damage(items.CLUB, Species.RAT)
+    assert club_snake > dagger_snake
+    assert dagger_rat > club_rat
+
+
+def test_fighting_bare_handed_is_possible_and_weak() -> None:
+    state = new_game(1234, *SMALL)
+    state = dataclasses.replace(
+        state,
+        player_actor=dataclasses.replace(
+            state.player_actor, inventory=items.Inventory()
+        ),
+    )
+    state = _beside_the_player(state, Species.RAT)
+    seen = set()
+    for seed in range(200):
+        attempt = dataclasses.replace(state, master_seed=seed)
+        before = attempt.npcs[0].actor.hp
+        after = step(attempt, Command(CommandKind.MOVE, 1, 0))
+        if after.npcs and after.npcs[0].actor.hp < before:
+            seen.add(before - after.npcs[0].actor.hp)
+    assert seen and seen <= {1, 2}
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_no_monster_ever_starts_on_a_chest(seed: int) -> None:
+    """CONTRACT-v6 §27.4 — the amendment issued because `loot.py` cannot see
+    monsters, so `game.py` must place them afterwards."""
+    state = new_game(seed, *SMALL)
+    chest_cells = {chest.position for chest in state.chests}
+    for npc in state.npcs:
+        assert npc.position not in chest_cells
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_a_chest_is_never_inside_the_safe_radius(seed: int) -> None:
+    state = new_game(seed, *SMALL)
+    for chest in state.chests:
+        distance = max(
+            abs(chest.position[0] - state.level.player_start[0]),
+            abs(chest.position[1] - state.level.player_start[1]),
+        )
+        assert distance >= CHEST_SAFE_RADIUS
+
+
+def test_chests_appear_at_roughly_the_contracted_rate() -> None:
+    with_chest = sum(1 for seed in range(400) if new_game(seed, *SMALL).chests)
+    rate = 100 * with_chest / 400
+    assert abs(rate - CHEST_CHANCE) < 6, rate
+
+
+def test_opening_the_inventory_costs_no_turn_and_does_not_tick_the_world() -> None:
+    state = new_game(1234, *SMALL)
+    before = [(npc.position, npc.energy) for npc in state.npcs]
+    opened = step(state, Command(CommandKind.INVENTORY))
+    assert opened.inventory_open is True
+    assert opened.turns == state.turns
+    assert [(npc.position, npc.energy) for npc in opened.npcs] == before
+
+
+def test_every_slot_of_a_full_pack_has_a_selection_letter() -> None:
+    """CONTRACT-v6 §5.1 — the amendment resolving `a`-`t` against `e`/`d`.
+
+    A letter that collides with the equip or drop key would make an item
+    permanently unselectable, and only once the pack was half full.
+    """
+    assert len(ITEM_LETTERS) >= items.CARRY_LIMIT
+    assert "d" not in ITEM_LETTERS and "e" not in ITEM_LETTERS
+    assert len(set(ITEM_LETTERS)) == len(ITEM_LETTERS)
+
+
+def test_picking_up_from_an_empty_cell_costs_nothing() -> None:
+    state = new_game(1234, *SMALL)
+    after = step(state, Command(CommandKind.PICK_UP))
+    assert after.turns == state.turns
+    assert after.player == state.player
+
+
+@pytest.mark.parametrize("seed", (0, 1234))
+def test_a_rejected_move_still_does_not_tick_the_world(seed: int) -> None:
+    """v1's headline rule, alive through six increments and now past chests,
+    shields and an inventory."""
+    state = quiet_game(seed, *SMALL)
+    spot = None
+    for y in range(state.level.height):
+        for x in range(state.level.width):
+            if not state.level.is_walkable(x, y):
+                continue
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                if not state.level.is_walkable(x + dx, y + dy):
+                    spot = ((x, y), dx, dy)
+                    break
+            if spot:
+                break
+        if spot:
+            break
+    assert spot, "every level has a wall beside a floor"
+    (cell, dx, dy) = spot
+    state = dataclasses.replace(state, player=cell)
+    after = step(state, Command(CommandKind.MOVE, dx, dy))
+    assert after.turns == state.turns
+    assert after.player == state.player
+
+
+def test_the_full_item_tables_are_what_the_contract_says() -> None:
+    # One place that fails if any worker ever retunes a shipped number.
+    assert (items.CLUB.damage_min, items.CLUB.damage_max) == (2, 4)
+    assert (items.SWORD.damage_min, items.SWORD.damage_max) == (3, 5)
+    assert (items.LONGBOW.damage_min, items.LONGBOW.damage_max) == (3, 5)
+    assert items.BUCKLER.block_chance == 10
+    assert items.KITE_SHIELD.block_chance == 18
+    assert items.TOWER_SHIELD.block_chance == 25
+    assert items.POTION_OF_HEALING.heal == 10
+    assert (items.BANDAGE.regen_turns, items.BANDAGE.regen_magnitude) == (5, 3)

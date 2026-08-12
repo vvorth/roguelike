@@ -57,6 +57,8 @@ class Role(Enum):
     PLAYER = auto()
     PROJECTILE = auto()  # a missile in flight
     NPC = auto()  # a monster — only ever drawn at Visibility.VISIBLE (CONTRACT-v5 §4/§15 v5)
+    CHEST = auto()  # a chest — drawn at both VISIBLE and EXPLORED, like terrain: unlike a
+    # monster it does not move, so a remembered chest is still there (CONTRACT-v6 §7.17/§27)
 
 
 @dataclass(frozen=True)
@@ -154,14 +156,19 @@ def attr_for(
             return Attr(_ANSI_RED)
         return Attr(-1)
 
-    # role is TERRAIN or DOOR.
+    # role is TERRAIN, DOOR or CHEST.
     if colors >= 256:
-        # Binding palette (CONTRACT-v2 §15.1). Both pairs sit on xterm ramps
-        # where a lower index is a darker shade of the same hue: 250->238 is the
-        # 256-colour grayscale ramp, 180->94 is the 256-colour orange/brown ramp.
+        # Binding palette (CONTRACT-v2 §15.1, CONTRACT-v6 §7.17/§27 for CHEST). All
+        # three pairs sit on xterm ramps where a lower index is a darker shade of the
+        # same hue: 250->238 is the 256-colour grayscale ramp, 180->94 is the
+        # 256-colour orange/brown ramp, 220->178 is the 256-colour gold ramp — chosen
+        # to read as treasure and distinct from every other role's colour (terrain
+        # 250/238, door 180/94, player 231, projectile 226, the four species
+        # 250/173/140/70).
         palette = {
             Role.TERRAIN: {Visibility.VISIBLE: 250, Visibility.EXPLORED: 238},
             Role.DOOR: {Visibility.VISIBLE: 180, Visibility.EXPLORED: 94},
+            Role.CHEST: {Visibility.VISIBLE: 220, Visibility.EXPLORED: 178},
         }
         return Attr(palette[role][visibility])
 

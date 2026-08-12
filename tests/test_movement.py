@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import copy
 import dataclasses
+import inspect
 import pathlib
 
 import pytest
@@ -767,3 +768,51 @@ def test_module_still_imports_only_level_and_world():
         "roguelike.level",
         "roguelike.world",
     }
+
+
+# --------------------------------------------------------------------------
+# v6 — the increment that added nothing here (CONTRACT-v6 §27.3, §10 v6)
+# --------------------------------------------------------------------------
+#
+# Items, chests, damage types, resistances and shields are all rules about what a bump
+# *does*, never about whether the step is allowed. These pin that, so a later increment
+# that quietly grows a fifth collision case has to say so out loud.
+
+
+def test_v6_added_no_collision_case_and_no_parameter():
+    assert [f.name for f in dataclasses.fields(MoveResult)] == [
+        "position",
+        "moved",
+        "blocked_by_door",
+        "blocked_by_npc",
+    ]
+    parameters = list(inspect.signature(try_move).parameters)
+    assert parameters == ["level", "position", "dx", "dy", "open_doors", "occupied"]
+
+
+def test_a_cell_holding_a_chest_is_entered_like_any_other_floor():
+    # A chest is not an obstacle: the player stands on it to open it (CONTRACT-v6 §7.18).
+    # This module is never told about one, which is exactly why stepping onto it works —
+    # asserted here as the property it is, rather than left to `game.py` to imply.
+    level = open_level()
+    result = try_move(level, (2, 1), 1, 0)
+    assert result.moved is True
+    assert result.blocked_by_npc is None
+    assert result.blocked_by_door is None
+
+
+def test_movement_names_nothing_from_items_or_loot():
+    # Asked of the code, not of the text: the module docstring explains *why* v6 left this
+    # file alone, so it necessarily contains the words "items" and "chest".
+    source = pathlib.Path(
+        __import__("roguelike.movement", fromlist=["movement"]).__file__
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    forbidden = {"Chest", "Inventory", "Weapon", "Shield", "items", "loot"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            assert node.id not in forbidden
+        elif isinstance(node, ast.Attribute):
+            assert node.attr not in forbidden
+        elif isinstance(node, ast.ImportFrom):
+            assert (node.module or "") not in {"roguelike.items", "roguelike.loot"}

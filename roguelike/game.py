@@ -114,12 +114,37 @@ stop the walk *and* move you into whatever you were fleeing.
   not substituted for them — substituting would throw away ``The jackal hits you.`` in
   favour of a bare ``You stop.``
 
+**v6 gives the player things to carry, and lands here for the same reason.** Seven
+modules shipped the vocabulary — items and the pack, resistance and the shield roll,
+species resistances, chests and depth-scaled loot, the chest glyph, the regeneration
+effect, the keys and the wording — and **none of them is connected to anything** until
+this module joins them up:
+
+* **Equipment moved into the pack** (CONTRACT-v6 §7 v6). ``Player.melee`` and
+  ``Player.ranged`` are now :attr:`Player.inventory`'s, because a shield slot on
+  ``Player`` as well would put equipment in two places. It is v6's one breaking change.
+* **A damage type meets a hide.** Every attack looks the defender's species up through
+  :func:`roguelike.npc.resistance_of` and hands the answer to ``resolve_attack``, which
+  applies it **to the raw roll** (§26.2). The player starts with a PIERCE dagger and the
+  cave snake resists PIERCE — with no alternative that is 45.6% of floors cleared down to
+  8.5% (§0.5), which is the pressure the whole pack exists to relieve.
+* **A shield is a chance, never a subtraction** (§0.2). Which chance is the *caller's*
+  decision — ``resolve_attack`` rolls what it is given and cannot tell a fang from an
+  arrow — so :func:`_shield_block` makes it once, here.
+* **Chests are not terrain** (§27.3). They live on ``LevelState`` beside the fog and the
+  doors, exactly as ``open_doors`` did before them, and ``game.py`` places the monsters
+  *after* them so nothing starts the game sitting on the level's only chest (§27.4).
+* **The inventory screen is a sub-mode reading raw keys.** Its alphabet deliberately has
+  no :class:`~roguelike.keys.CommandKind` (§5 v6), so :func:`run` hands the key straight
+  to :func:`inventory_key` and every rule about what it means stays in this module.
+
 This is the only module permitted to import this widely: :mod:`roguelike.level`,
 :mod:`roguelike.keys`, :mod:`roguelike.movement`, :mod:`roguelike.render`,
 :mod:`roguelike.fov`, :mod:`roguelike.world`, :mod:`roguelike.dungeon`,
 :mod:`roguelike.events`, :mod:`roguelike.pathfind`, :mod:`roguelike.activity`,
 :mod:`roguelike.stats`, :mod:`roguelike.items`, :mod:`roguelike.status`,
-:mod:`roguelike.combat` and :mod:`roguelike.npc` (CONTRACT-v5 §10 v5).
+:mod:`roguelike.combat`, :mod:`roguelike.npc` and :mod:`roguelike.loot`
+(CONTRACT-v6 §10 v6).
 """
 
 from __future__ import annotations
@@ -130,11 +155,25 @@ from dataclasses import dataclass, replace
 
 from roguelike import dungeon, events, fov, render
 from roguelike.activity import Activity, ActivityKind, frontier_cells, walk_step
-from roguelike.combat import resolve_attack
+from roguelike.combat import ranged_block_chance, resolve_attack
 from roguelike.events import Event, EventKind
-from roguelike.items import DAGGER, SHORTBOW, Weapon
+from roguelike.items import (
+    DAGGER,
+    SHORTBOW,
+    Consumable,
+    DamageType,
+    Inventory,
+    Resistance,
+    Shield,
+    Weapon,
+    WeaponKind,
+    add,
+    drop,
+    equip,
+)
 from roguelike.keys import HELP_ENTRIES, Command, CommandKind, translate_key
 from roguelike.level import Level
+from roguelike.loot import Chest, place_chest
 from roguelike.movement import try_move
 from roguelike.npc import (
     wants_to_flee,
@@ -145,6 +184,7 @@ from roguelike.npc import (
     AiState,
     NpcActionKind,
     plan_action,
+    resistance_of,
     spawn_npcs,
 )
 from roguelike.pathfind import Coord, Passable, find_path, line_cells, octile
@@ -179,6 +219,11 @@ __all__ = [
     "help_page_count",
     "help_page_lines",
     "format_help_status",
+    "inventory_lines",
+    "format_inventory_status",
+    "inventory_key",
+    "ITEM_LETTERS",
+    "BARE_HANDS",
     "describe_cell",
     "format_stats",
     "format_status_right",
@@ -215,6 +260,41 @@ _PLAYER_ACTOR_ID: int = 0
 _SALT_ATTACK: int = 1
 _SALT_WANDER: int = 4
 
+#: Roll salt for a level's chest (CONTRACT-v6 §27.2). A chest is drawn from **the level's
+#: own seed**, like its monsters — but from a *separate* stream, derived through
+#: :func:`roll_seed`, rather than from the same generator ``spawn_npcs`` draws from. Both
+#: are equally reproducible; a separate stream is chosen because sharing one would make
+#: the chest's very first "is there a chest at all?" draw shift every monster on every
+#: level, silently re-rolling the whole v5 bestiary layout for no gain.
+_SALT_CHEST: int = 5
+
+#: What a ``None`` melee slot swings (CONTRACT-v6 §7.15): 1–2 BLUNT, and strength still
+#: applies, because a fist is an arm. It is a :class:`~roguelike.items.Weapon` rather than
+#: a special case in :func:`_player_attack` so that bare-handed combat goes down the exact
+#: same path as an equipped one — resistance included, which is the point: a giant bat is
+#: vulnerable to BLUNT, and punching one is measurably better than stabbing it.
+#: It is **not** in ``items.py``: §7.15 makes "what bare-handed means" this module's rule.
+BARE_HANDS: Weapon = Weapon(
+    "bare hands", WeaponKind.MELEE, 1, 2, range=1, damage_type=DamageType.BLUNT
+)
+
+#: The kit every run starts with (CONTRACT-v6 §7 v6). The same dagger and shortbow v5
+#: carried on ``Player.melee``/``Player.ranged``; only where they live has changed.
+_STARTING_INVENTORY: Inventory = Inventory(melee=DAGGER, ranged=SHORTBOW)
+
+#: The letters that select a carried item on the inventory screen, index by index — so the
+#: item shown as ``c`` is ``carried[2]``.
+#:
+#: **``d`` and ``e`` are missing on purpose, and this resolves a contradiction in the
+#: contract.** §5 v6 says the letters ``a``–``t`` select an item; §7.17 says ``e`` equips
+#: or uses the selection and ``d`` drops it. Both cannot be true of the same keystroke: if
+#: ``d`` selected the fourth item there would be no key left to drop anything with. §7.17
+#: describes the screen the player actually operates, so the two action keys win, and the
+#: labels simply skip them — what is printed beside an item is exactly the key that
+#: selects it, so nothing is hidden and no item is unreachable. Twenty letters for
+#: :data:`roguelike.items.CARRY_LIMIT` items, eighteen of them inside §5 v6's ``a``–``t``.
+ITEM_LETTERS: str = "abcfghijklmnopqrstuv"
+
 
 @dataclass(frozen=True)
 class LevelState:
@@ -232,6 +312,12 @@ class LevelState:
     on the level the player is standing on. Climb back down and the pack is exactly where
     you left it.
 
+    ``chests`` is here for the third time the same reason applies (CONTRACT-v6 §27.3): a
+    chest is **not terrain**, because an opened one has changed and ``Level`` is frozen.
+    That is precisely the problem doors had and it is solved precisely the way doors
+    solved it (CONTRACT-v2 §0.6). Which chest has been emptied is a runtime fact about a
+    particular game, so it travels with the level the player left, not with the player.
+
     There is deliberately no player position here: you always re-enter a level at a known
     staircase, never where you happened to be standing.
     """
@@ -240,6 +326,7 @@ class LevelState:
     explored: frozenset[tuple[int, int]]
     open_doors: frozenset[tuple[int, int]]
     npcs: tuple[NPC, ...] = ()
+    chests: tuple[Chest, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -251,10 +338,15 @@ class Player:
     :func:`roguelike.combat.resolve_attack` is written once and used by both sides of
     every fight.
 
-    **Inventory is static.** ``melee`` and ``ranged`` are set at :func:`new_game` and
-    never change: there is no pickup, no drop, no ground item and no ammunition count
-    anywhere (CONTRACT-v5 §21). Ammo is infinite, so there is no counter to go out of
-    sync.
+    **v6's one breaking change lives here.** ``melee`` and ``ranged`` were fields of this
+    class in v5; they are now :attr:`roguelike.items.Inventory.melee` and ``.ranged``
+    inside ``inventory``, so every read of ``player.melee`` is ``player.inventory.melee``
+    (CONTRACT-v6 §7 v6). It is deliberate: keeping equipment on ``Player`` *and* adding a
+    shield slot would put the same idea in two places, and the pack has to live somewhere
+    anyway. Ammunition is still infinite — there is no counter to go out of sync.
+
+    Every slot may be ``None``: bare-handed is a legal state, and what it means is this
+    module's rule (§7.15, :data:`BARE_HANDS`).
 
     ``regen_counter`` counts world-ticks towards the next point of natural healing
     (:data:`roguelike.status.REGEN_TURNS`). It is a plain integer on the state rather than
@@ -263,8 +355,7 @@ class Player:
     """
 
     actor: Actor
-    melee: Weapon = DAGGER
-    ranged: Weapon = SHORTBOW
+    inventory: Inventory = _STARTING_INVENTORY
     xp: int = 0
     level: int = 1
     regen_counter: int = 0
@@ -372,6 +463,15 @@ class GameState:
     ``targeting`` is the ranged sub-mode, ``None`` whenever the player is not choosing a
     target. It does not survive a level change.
 
+    ``chests`` are the chests **on the current level only**, exactly as ``npcs`` are, and
+    for the same reason (CONTRACT-v6 §27.3): every other level's chests live in ``saved``
+    beside its fog, its doors and its monsters. At most one is ever placed per level.
+
+    ``inventory_open`` and ``inventory_cursor`` are the inventory screen: whether it is
+    showing, and which carried item is selected. It is a sub-mode in the mould of the help
+    screen — it swallows every key and **costs no turn to open, browse or close** (§7.17).
+    The cursor is an index into ``player_actor.inventory.carried``.
+
     ``running`` goes ``False`` when the player quits, climbs out of the dungeon — or
     **dies**, which is v5's third and only involuntary ending (CONTRACT-v5 §7.12). All
     three set it in the same way and there is no separate death flag.
@@ -403,6 +503,9 @@ class GameState:
     awaiting_attack: bool = False
     look_cursor: Coord | None = None
     projectile: tuple[Coord, ...] = ()
+    chests: tuple[Chest, ...] = ()
+    inventory_open: bool = False
+    inventory_cursor: int = 0
 
 
 def new_game(
@@ -441,6 +544,7 @@ def new_game(
     player = level.player_start
     open_doors: frozenset[tuple[int, int]] = frozenset()
     visible = fov.compute_visible(level, open_doors, player, radius)
+    npcs, chests = _populate(level, 1)
     return GameState(
         master_seed,
         1,
@@ -456,7 +560,8 @@ def new_game(
         events=(),
         outcome=None,
         player_actor=_NEW_PLAYER,
-        npcs=_populate(level),
+        npcs=npcs,
+        chests=chests,
     )
 
 
@@ -485,15 +590,43 @@ def roll_seed(master_seed: int, turns: int, actor_id: int, salt: int) -> int:
     ) & 0x7FFFFFFF
 
 
-def _populate(level: Level) -> tuple[NPC, ...]:
-    """Spawn a freshly generated level's monsters from that level's own seed (§24.4).
+def _populate(level: Level, depth: int) -> tuple[tuple[NPC, ...], tuple[Chest, ...]]:
+    """Fill a freshly generated level: its chest first, then its monsters (§24.4, §27.4).
 
-    The one place :func:`roguelike.npc.spawn_npcs` is called. A level is populated exactly
-    once — when it is first generated — and its monsters thereafter live on the state or,
-    once the player has left, in the :class:`LevelState` filed under its depth. Coming
-    back down a staircase never re-rolls them.
+    The one place :func:`roguelike.npc.spawn_npcs` and :func:`roguelike.loot.place_chest`
+    are called. A level is populated exactly once — when it is first generated — and its
+    contents thereafter live on the state or, once the player has left, in the
+    :class:`LevelState` filed under its depth. Coming back down a staircase never re-rolls
+    either of them.
+
+    **The chest is placed first and the monsters second, and the order is binding**
+    (CONTRACT-v6 §27.4). §27.2 requires that no chest sits on a cell holding a monster,
+    but ``place_chest(rng, level, depth)`` is handed no monster list and ``loot.py`` may
+    not import ``npc.py`` — the rule is unsatisfiable by the module that owns it, so the
+    amendment moved it here, where both are visible. ``spawn_npcs`` likewise takes no set
+    of forbidden cells, so the constraint is applied the only way this module can apply
+    it: **a monster that lands on the chest is dropped**, exactly as ``spawn_npcs`` itself
+    drops a monster it has no legal cell for (CONTRACT-v5 §11 v5) rather than relaxing a
+    rule. The chest wins because it was placed first, and the rule the amendment names —
+    "the *starting* state is never one where a monster is sitting on the level's only
+    chest" — is what comes out.
+
+    The two draws come from two streams, both derived from the level's own seed, so both
+    are as reproducible as the level's rooms (§27.2). See :data:`_SALT_CHEST` for why they
+    are not one stream.
     """
-    return spawn_npcs(random.Random(level.seed), level)
+    chest = place_chest(
+        random.Random(roll_seed(level.seed, 0, _PLAYER_ACTOR_ID, _SALT_CHEST)),
+        level,
+        depth,
+    )
+    chests: tuple[Chest, ...] = () if chest is None else (chest,)
+
+    npcs = spawn_npcs(random.Random(level.seed), level)
+    taken = {chest.position for chest in chests}
+    if taken:
+        npcs = tuple(npc for npc in npcs if npc.position not in taken)
+    return npcs, chests
 
 
 # --------------------------------------------------------------------------------------
@@ -518,6 +651,32 @@ def _stair_events(level: Level, position: tuple[int, int]) -> tuple[Event, ...]:
     if position in level.stairs_down:
         return (Event(EventKind.STAIRS_HERE_DOWN),)
     return ()
+
+
+def _chest_at(chests: tuple[Chest, ...], cell: Coord) -> Chest | None:
+    """The chest standing on ``cell``, or ``None``. At most one is ever placed."""
+    for chest in chests:
+        if chest.position == cell:
+            return chest
+    return None
+
+
+def _arrival_events(state: GameState, position: Coord) -> tuple[Event, ...]:
+    """What stepping onto ``position`` announces: a staircase, and now a chest.
+
+    "Stepping onto a chest's cell emits ``CHEST_HERE``, like a staircase" (CONTRACT-v6
+    §7.18) — so it is said in the same place, by the same rule, and a cell that is both a
+    staircase and a chest says both. Nothing here consumes a turn; the caller has already
+    decided that.
+
+    A chest and a staircase *can* share a cell: :func:`roguelike.loot.place_chest` keeps
+    its distance from ``player_start`` and from doors, but a down-staircase is ordinary
+    walkable floor to it.
+    """
+    emitted = _stair_events(state.level, position)
+    if _chest_at(state.chests, position) is not None:
+        emitted += (Event(EventKind.CHEST_HERE),)
+    return emitted
 
 
 def _take_turn(
@@ -560,6 +719,7 @@ def _change_level(
     explored: frozenset[tuple[int, int]],
     open_doors: frozenset[tuple[int, int]],
     npcs: tuple[NPC, ...],
+    chests: tuple[Chest, ...],
     emitted: tuple[Event, ...],
 ) -> GameState:
     """Return ``state`` moved to ``depth``, one turn later. The other kind of turn.
@@ -582,13 +742,15 @@ def _change_level(
     The monsters travel with the level, not with the player (CONTRACT-v5 §24.5): the
     departed level's ``npcs`` are filed into ``saved`` beside its fog, and the arrived
     level's become the live set. Nothing ticks them in between, so a level left mid-fight
-    is found mid-fight. ``targeting`` is dropped, because the cells it names belong to a
-    level that is no longer under the player's feet.
+    is found mid-fight. ``chests`` travel exactly the same way (CONTRACT-v6 §27.3), which
+    is what makes a chest you emptied on level 3 still empty when you climb back down to
+    it. ``targeting`` is dropped, because the cells it names belong to a level that is no
+    longer under the player's feet.
     """
     saved = {
         **state.saved,
         state.depth: LevelState(
-            state.level, state.explored, state.open_doors, state.npcs
+            state.level, state.explored, state.open_doors, state.npcs, state.chests
         ),
     }
     saved.pop(depth, None)
@@ -606,6 +768,7 @@ def _change_level(
         turns=state.turns + 1,
         events=emitted,
         npcs=npcs,
+        chests=chests,
         targeting=None,
     )
 
@@ -741,13 +904,14 @@ def _descend(state: GameState) -> GameState:
         )
         explored: frozenset[tuple[int, int]] = frozenset()
         open_doors: frozenset[tuple[int, int]] = frozenset()
-        # A level is populated once, when it is generated (CONTRACT-v5 §24.4).
-        npcs = _populate(level)
+        # A level is populated once, when it is generated (CONTRACT-v5 §24.4, §27.4).
+        npcs, chests = _populate(level, depth)
     else:
         level = below.level
         explored = below.explored
         open_doors = below.open_doors
         npcs = below.npcs
+        chests = below.chests
 
     return _change_level(
         state,
@@ -757,6 +921,7 @@ def _descend(state: GameState) -> GameState:
         explored,
         open_doors,
         npcs,
+        chests,
         (Event(EventKind.DESCENDED, depth=depth),),
     )
 
@@ -801,6 +966,7 @@ def _ascend(state: GameState) -> GameState:
         above.explored,
         above.open_doors,
         above.npcs,
+        above.chests,
         (Event(EventKind.ASCENDED, depth=depth),),
     )
 
@@ -851,10 +1017,16 @@ _EVENT_PRIORITY: dict[EventKind, int] = {
     EventKind.LEVELLED_UP: 1,
     EventKind.NPC_KILLED: 1,
     EventKind.NPC_HIT_PLAYER: 2,
+    EventKind.SHIELD_BLOCKED: 2,
     EventKind.POISONED: 2,
     EventKind.POISON_DAMAGE: 2,
     EventKind.PLAYER_HIT_NPC: 3,
     EventKind.PLAYER_MISSED_NPC: 3,
+    # The resistance flavour rides with the blow it is about, so a capped line never
+    # keeps "It tears into the bat!" while dropping "You hit the bat."
+    EventKind.RESISTED: 3,
+    EventKind.VULNERABLE_HIT: 3,
+    EventKind.IMMUNE_HIT: 3,
 }
 
 _DEFAULT_PRIORITY: int = 4
@@ -864,7 +1036,7 @@ _DEFAULT_PRIORITY: int = 4
 #: about an unseen monster is dropped — there is no ambient "you hear scurrying" in this
 #: project, for the same reason there is no "you bump into a wall".
 _ALWAYS_PERCEIVED: frozenset[EventKind] = frozenset(
-    {EventKind.NPC_HIT_PLAYER, EventKind.POISONED}
+    {EventKind.NPC_HIT_PLAYER, EventKind.SHIELD_BLOCKED, EventKind.POISONED}
 )
 
 
@@ -976,6 +1148,52 @@ def level_up(state: GameState) -> GameState:
     )
 
 
+def _melee_weapon(player: Player) -> Weapon:
+    """What the player swings: the equipped melee weapon, or their fists (§7.15).
+
+    An empty melee slot is a legal state, not a missing one, so it resolves to
+    :data:`BARE_HANDS` here — one place, so that bump-to-attack and ``a``-plus-direction
+    cannot disagree about what an unarmed player hits with.
+    """
+    return player.inventory.melee or BARE_HANDS
+
+
+def _shield_block(
+    shield: Shield | None, missile: bool, defender_agi: int, attacker_agi: int
+) -> int:
+    """The block chance to hand :func:`roguelike.combat.resolve_attack`, in percent.
+
+    **The caller's decision, and it has to be, because ``resolve_attack`` rolls whatever
+    it is given and cannot tell a fist from an arrow** (CONTRACT-v6 §23.6). A shield's
+    plain ``block_chance`` stops a blow; a *missile* is stopped by
+    :func:`roguelike.combat.ranged_block_chance`, which shifts that number by the
+    agility gap and clamps it to 5–75 so there is always a chance to be hit anyway.
+
+    **No shield is zero, never a floor.** ``ranged_block_chance``'s floor of 5 keeps a
+    small shield from being worthless; passing it for a defender carrying *no* shield
+    would invent a 5% block out of nothing — which is what a monster would get, since
+    nothing in the bestiary carries one.
+
+    In v6 the missile case has no live caller: nothing shoots at the player, and no
+    monster owns a shield (§23.6 records this as a choice). The rule is written here once
+    rather than guessed at two call sites.
+    """
+    if shield is None:
+        return 0
+    if not missile:
+        return shield.block_chance
+    return ranged_block_chance(shield.block_chance, defender_agi, attacker_agi)
+
+
+#: What a hit says about the defender's hide, beyond the blow itself (CONTRACT-v6 §16 v6).
+#: ``NORMAL`` is absent: an ordinary hit on an ordinary body has nothing extra to report.
+_RESISTANCE_EVENT: dict[Resistance, EventKind] = {
+    Resistance.RESISTANT: EventKind.RESISTED,
+    Resistance.VULNERABLE: EventKind.VULNERABLE_HIT,
+    Resistance.IMMUNE: EventKind.IMMUNE_HIT,
+}
+
+
 def _player_attack(
     state: GameState, cell: Coord, weapon: Weapon, strength_applies: bool
 ) -> GameState:
@@ -986,6 +1204,18 @@ def _player_attack(
     applies. **Ranged weapons pass ``strength_applies=False``** even though they are
     wielded — a bow's power is the bow's, and :func:`roguelike.combat.resolve_attack` has
     no way to tell a bow from a dagger, so getting this right is this call site's job.
+
+    ``weapon`` may be :data:`BARE_HANDS`; nothing here treats it differently, which is the
+    point of expressing "unarmed" as a weapon (§7.15).
+
+    **The weapon's damage type is looked up against the defender's species** and handed to
+    ``resolve_attack`` as its ``resistance`` (CONTRACT-v6 §26.2, §26.3), so a PIERCE dagger
+    does measurably less to a cave snake than a BLUNT club does, and the giant bat takes
+    double from BLUNT. That is not flavour: with no alternative weapon, one resisting
+    species takes floor clears from 45.6% to 8.5% (§0.5), which is the pressure the whole
+    inventory exists to relieve. The defender's shield chance is ``0`` because **no
+    monster in the bestiary carries a shield** — see :func:`_shield_block` for the rule
+    that would apply if one ever did.
 
     A turn is consumed whether the blow lands or not, and the player does not move. A kill
     removes the monster, credits its experience and may level the character up. Events
@@ -1002,6 +1232,7 @@ def _player_attack(
     rng = random.Random(
         roll_seed(state.master_seed, state.turns, _PLAYER_ACTOR_ID, _SALT_ATTACK)
     )
+    resistance = resistance_of(target.species, weapon.damage_type)
     result = resolve_attack(
         rng,
         state.player_actor.actor,
@@ -1009,6 +1240,12 @@ def _player_attack(
         weapon.damage_min,
         weapon.damage_max,
         strength_applies,
+        0,
+        resistance,
+        # No monster owns a shield, so this is `_shield_block(None, ...)` by construction
+        # — and it must be 0 rather than a floor, or every monster would block one arrow
+        # in twenty with a shield it does not have.
+        0,
     )
 
     name = _species_name(target)
@@ -1018,8 +1255,15 @@ def _player_attack(
 
     if not result.hit:
         emitted.append((Event(EventKind.PLAYER_MISSED_NPC, name=name), cell))
+    elif result.blocked:
+        # Unreachable in v6 — nothing in the bestiary carries a shield — but the event
+        # exists and this is the one place it could ever be said (§16 v6).
+        emitted.append((Event(EventKind.NPC_SHIELD_BLOCKED, name=name), cell))
     else:
         emitted.append((Event(EventKind.PLAYER_HIT_NPC, name=name), cell))
+        flavour = _RESISTANCE_EVENT.get(resistance)
+        if flavour is not None:
+            emitted.append((Event(flavour, name=name), cell))
         if result.killed:
             npcs = tuple(npc for npc in state.npcs if npc is not target)
             emitted.append((Event(EventKind.NPC_KILLED, name=name), cell))
@@ -1056,7 +1300,12 @@ def _target_cells(state: GameState) -> tuple[Coord, ...]:
     sources of truth for "can I see it" would let the screen and the target list disagree
     (CONTRACT-v5 §14 v5).
     """
-    reach = state.player_actor.ranged.range
+    ranged = state.player_actor.inventory.ranged
+    if ranged is None:
+        # Nothing to shoot *with*, so nothing is shootable. §7.15 makes the refusal
+        # `NO_TARGET`-style, and an empty list is exactly how that refusal is produced.
+        return ()
+    reach = ranged.range
     cells = [
         npc.position
         for npc in state.npcs
@@ -1070,6 +1319,11 @@ def _start_targeting(state: GameState) -> GameState:
     """``f`` with no target chosen yet: build the list, or say there is nothing to shoot.
 
     Costs no turn either way — choosing is not acting, exactly as with the ``w`` prefix.
+
+    **Bare-handed, it always refuses** (§7.15, §11 v6): an empty ranged slot has no range,
+    so :func:`_target_cells` returns nothing and the same ``NO_TARGET`` refusal comes out
+    as for an empty room. There is no separate "you have no bow" wording, and no turn is
+    spent finding out.
     """
     targets = _target_cells(state)
     if not targets:
@@ -1098,16 +1352,17 @@ def _fire(state: GameState) -> GameState:
     """
     targeting = state.targeting
     assert targeting is not None  # only ever reached with a target already chosen
+    ranged = state.player_actor.inventory.ranged
     cell = targeting.targets[targeting.index]
     targets = _target_cells(state)
-    if cell not in targets:
+    if ranged is None or cell not in targets:
         if not targets:
             return replace(state, targeting=None, events=(Event(EventKind.NO_TARGET),))
         return _targeting_at(state, Targeting(targets, 0))
     # The flight path is recorded on the state, not drawn here: `step` stays pure and
     # `run` owns every clock in this project (CONTRACT-v4 §0.10). It is presentation
     # only -- the shot is already fully resolved by the time the arrow is drawn moving.
-    after = _player_attack(state, cell, state.player_actor.ranged, False)
+    after = _player_attack(state, cell, ranged, False)
     return replace(after, projectile=tuple(line_cells(state.player, cell)))
 
 
@@ -1251,7 +1506,7 @@ def _swap_with(state: GameState, cell: Coord) -> GameState:
         cell,
         state.open_doors,
         (Event(EventKind.SWAPPED_PLACES, name=name),)
-        + _stair_events(state.level, cell),
+        + _arrival_events(state, cell),
     )
 
 
@@ -1274,13 +1529,314 @@ def _attack_towards(state: GameState, dx: int, dy: int) -> GameState:
     """
     target = (state.player[0] + dx, state.player[1] + dy)
     if any(npc.position == target for npc in state.npcs):
-        return _player_attack(state, target, state.player_actor.melee, True)
+        return _player_attack(state, target, _melee_weapon(state.player_actor), True)
     return _take_turn(
         state,
         state.player,
         state.open_doors,
         (Event(EventKind.ATTACKED_NOTHING),),
     )
+
+
+# --------------------------------------------------------------------------------------
+# Chests, the pack and the inventory screen (CONTRACT-v6 §7.16 - §7.18)
+# --------------------------------------------------------------------------------------
+
+
+def _pick_up(state: GameState) -> GameState:
+    """``g``: take one item out of the chest under the player (CONTRACT-v6 §7.16, §7.18).
+
+    One item per turn, and **only the taking costs one**:
+
+    * no chest on this cell — ``NOTHING_TO_PICK_UP``, **no turn** (§11 v6);
+    * a chest that has been emptied — ``CHEST_EMPTY``, **no turn**. The contract charges a
+      turn for *taking one item*, and there is none to take; this is the same rule as the
+      empty cell above, and it means a player who keeps pressing ``g`` at an empty chest
+      is not fed to the monsters by the message they are reading;
+    * a full pack — ``PACK_FULL``, **no turn**, and nothing leaves the chest;
+    * otherwise the first item moves from the chest to the pack, the chest is marked
+      ``opened``, and the turn is spent.
+
+    The first item out of a closed chest reports ``CHEST_OPENED`` — *"The chest holds:
+    dagger"* — and every item after it reports ``PICKED_UP``. §16 v6 provides both
+    sentences and each says exactly one thing: the first tells you what you have found,
+    the rest tell you what you took. Saying both at once would read *"The chest holds:
+    dagger You pick up the dagger."*
+
+    An emptied chest stays on the map with ``opened=True`` (§7.18) — it is not removed and
+    it does not change how it is drawn (T35 records that as a decision, not an oversight).
+
+    Pure; the caller ticks the world, which by :func:`_tick_world` happens only in the one
+    case that consumed a turn.
+    """
+    chest = _chest_at(state.chests, state.player)
+    if chest is None:
+        return replace(state, events=(Event(EventKind.NOTHING_TO_PICK_UP),))
+    if not chest.contents:
+        return replace(state, events=(Event(EventKind.CHEST_EMPTY),))
+
+    player = state.player_actor
+    item = chest.contents[0]
+    inventory, taken = add(player.inventory, item)
+    if not taken:
+        return replace(state, events=(Event(EventKind.PACK_FULL),))
+
+    emptied = replace(chest, contents=chest.contents[1:], opened=True)
+    kind = EventKind.PICKED_UP if chest.opened else EventKind.CHEST_OPENED
+    return _take_turn(
+        replace(
+            state,
+            chests=tuple(emptied if held is chest else held for held in state.chests),
+            player_actor=replace(player, inventory=inventory),
+        ),
+        state.player,
+        state.open_doors,
+        (Event(kind, name=item.name),),
+    )
+
+
+def _selected_item(state: GameState) -> object | None:
+    """The carried item the inventory cursor is on, or ``None`` if it is on nothing.
+
+    A cursor out of range is not an error: the pack shrinks when something is dropped,
+    equipped or drunk, and asking about a slot that is no longer there simply answers
+    "nothing".
+    """
+    carried = state.player_actor.inventory.carried
+    if 0 <= state.inventory_cursor < len(carried):
+        return carried[state.inventory_cursor]
+    return None
+
+
+def _use_or_equip(state: GameState) -> GameState:
+    """``e`` on the inventory screen: wear it, wield it, or drink it (§7.17).
+
+    **The dispatch happens here, before :func:`roguelike.items.equip` is called, and it
+    has to**: ``equip`` raises :class:`ValueError` on a :class:`~roguelike.items.
+    Consumable`, because a potion has no slot (T29's decision, CONTRACT-v6 §11 v6). "``e``
+    equips *or uses*" is one key with two meanings and the meaning is decided by what the
+    item is, never by catching the exception.
+
+    Either way it **costs one turn** and closes the screen: a turn has passed, the world
+    has moved, and what the player needs to see next is the map rather than their pack.
+    With the cursor on nothing at all, nothing happens and no turn is spent.
+    """
+    item = _selected_item(state)
+    if item is None:
+        return state
+
+    player = state.player_actor
+    closed = replace(state, inventory_open=False, inventory_cursor=0)
+    if isinstance(item, Consumable):
+        return _consume(closed, state.inventory_cursor, item)
+    if not isinstance(item, (Weapon, Shield)):
+        # Nothing else can reach the pack — chests hold only §25.1's eleven items — so
+        # this is the answer to a question that cannot be asked, chosen to be a no-op
+        # rather than the ValueError `equip` would raise.
+        return state
+
+    return _take_turn(
+        replace(
+            closed,
+            player_actor=replace(player, inventory=equip(player.inventory, item)),
+        ),
+        state.player,
+        state.open_doors,
+        (Event(EventKind.EQUIPPED, name=item.name),),
+    )
+
+
+def _consume(state: GameState, index: int, item: Consumable) -> GameState:
+    """Drink or apply the consumable at ``index``, and spend the turn it costs.
+
+    Two shapes, and an item may carry both (§25): ``heal`` is instant hit points, capped
+    at ``max_hp`` through the same :func:`roguelike.stats.derive` as everything else;
+    ``regen_turns``/``regen_magnitude`` become a ``REGENERATING`` status effect, which
+    :func:`roguelike.status.apply_effect` **refreshes rather than stacks**, so a second
+    bandage extends the mending instead of doubling it.
+
+    The healing itself arrives a tick at a time through :func:`_tick_status`, exactly as
+    poison damage does and through the same function — which is why a bandage and a snake
+    bite running at once are reported as two separate numbers rather than one net.
+
+    The item is consumed whether or not it did anything: it has been used up.
+    """
+    player = state.player_actor
+    inventory, _used = drop(player.inventory, index)
+    actor = player.actor
+    emitted: list[Event] = []
+
+    if item.heal:
+        max_hp = derive(actor.stats).max_hp
+        actor = replace(actor, hp=min(max_hp, actor.hp + item.heal))
+        emitted.append(Event(EventKind.DRANK, name=item.name))
+    if item.regen_turns and item.regen_magnitude:
+        actor = replace(
+            actor,
+            status_effects=apply_effect(
+                actor.status_effects,
+                StatusEffect(
+                    StatusKind.REGENERATING, item.regen_turns, item.regen_magnitude
+                ),
+            ),
+        )
+        emitted.append(Event(EventKind.BANDAGED))
+    if not emitted:
+        emitted.append(Event(EventKind.DRANK, name=item.name))
+
+    return _take_turn(
+        replace(state, player_actor=replace(player, actor=actor, inventory=inventory)),
+        state.player,
+        state.open_doors,
+        tuple(emitted),
+    )
+
+
+def _drop_selected(state: GameState) -> GameState:
+    """``d`` on the inventory screen: put the selected item down (§7.17).
+
+    **It costs a turn**, which §7.17 does not say either way: it names equipping and
+    drinking as costing one and opening, browsing and closing as costing none, and
+    dropping is plainly an action rather than a look. Like the other two actions it closes
+    the screen. Dropping onto a cursor that is on nothing does nothing and costs nothing.
+
+    There is no item glyph on the floor in v6 — that is explicitly out of scope — so a
+    dropped item is gone. The wording (``DROPPED``) is the contract's and is unchanged by
+    that; picking it back up is a v7 problem.
+    """
+    item = _selected_item(state)
+    if item is None:
+        return state
+
+    player = state.player_actor
+    inventory, dropped = drop(player.inventory, state.inventory_cursor)
+    if dropped is None:  # pragma: no cover - `_selected_item` already ruled this out
+        return state
+
+    return _take_turn(
+        replace(
+            state,
+            inventory_open=False,
+            inventory_cursor=0,
+            player_actor=replace(player, inventory=inventory),
+        ),
+        state.player,
+        state.open_doors,
+        (Event(EventKind.DROPPED, name=dropped.name),),
+    )
+
+
+def inventory_key(state: GameState, key: int) -> GameState:
+    """Apply one raw keystroke to the open inventory screen. Pure, and a rule, not a loop.
+
+    **Why a raw key and not a :class:`~roguelike.keys.Command`.** The screen's keys are
+    ``e``, ``d`` and the item letters, and §5 v6 is explicit that none of them may become a
+    :class:`~roguelike.keys.CommandKind`: they are a sub-mode's alphabet, and binding them
+    globally would cost the game three keys everywhere else in order to spend them in one
+    place. ``translate_key`` therefore reports every one of them as ``UNKNOWN``, and the
+    only way to tell an ``e`` from a ``d`` is to be handed the key itself. :func:`run` owns
+    the keyboard and hands it over; every rule about what the key *means* is here.
+
+    * an item letter (:data:`ITEM_LETTERS`) selects that item — **no turn**. A letter
+      with no item beside it selects nothing, and so closes like any other key;
+    * ``e`` equips or uses the selection, ``d`` drops it — **one turn each**, and the
+      screen closes;
+    * **any other key closes the screen** — no turn, no event, and the message that was on
+      the map before it opened is still there.
+
+    A dead or unopened state comes back untouched, so this is safe to call unconditionally.
+    """
+    if not state.running or not state.inventory_open:
+        return state
+
+    char = chr(key) if 0x20 <= key < 0x7F else ""
+
+    if char == "e":
+        return _tick_world(state, _use_or_equip(state))
+    if char == "d":
+        return _tick_world(state, _drop_selected(state))
+    if char and char in ITEM_LETTERS:
+        index = ITEM_LETTERS.index(char)
+        if index < len(state.player_actor.inventory.carried):
+            return replace(state, inventory_cursor=index)
+        # A letter with no item beside it selects nothing, so it is one of the "any
+        # other key" that close. Treating it as a silent no-op instead would leave an
+        # empty pack answering to almost nothing — most of the alphabet is an item
+        # letter — and a screen that ignores `q` reads as a stuck screen.
+
+    return replace(state, inventory_open=False, inventory_cursor=0)
+
+
+def _describe_item(item: object) -> str:
+    """One line about one item: its name, and the number that makes it worth carrying.
+
+    Grade is deliberately absent. It is a label and never a modifier (§25), so printing it
+    beside the damage it does not change would read as though it did; the damage range,
+    the damage type and the block chance are the whole of an item's effect.
+    """
+    if isinstance(item, Weapon):
+        return (
+            f"{item.name}  {item.damage_min}-{item.damage_max}"
+            f" {item.damage_type.name.lower()}"
+        )
+    if isinstance(item, Shield):
+        return f"{item.name}  blocks {item.block_chance}%"
+    if isinstance(item, Consumable):
+        if item.heal and item.regen_turns:
+            return (
+                f"{item.name}  heals {item.heal},"
+                f" then {item.regen_magnitude} for {item.regen_turns} turns"
+            )
+        if item.heal:
+            return f"{item.name}  heals {item.heal}"
+        if item.regen_turns:
+            return (
+                f"{item.name}  mends {item.regen_magnitude} a turn"
+                f" for {item.regen_turns}"
+            )
+        return item.name
+    return str(item)  # pragma: no cover - nothing else ever reaches the pack
+
+
+#: What an empty slot is called on the inventory screen. Bare hands are a state, not an
+#: absence (§7.15), so the melee slot says what it *is* rather than what it lacks.
+_NO_MELEE: str = "bare hands"
+_NO_ITEM: str = "-"
+
+
+def inventory_lines(state: GameState) -> tuple[str, ...]:
+    """Every line of the inventory screen (CONTRACT-v6 §7.17).
+
+    One equipment line, one blank, then the pack — one item per line, each behind the
+    letter that selects it, with ``>`` against the selected one. That is twenty-two lines
+    for a full pack, which is exactly the body of a default 22-row map, so the screen fits
+    without pagination; :func:`roguelike.render.render_text_page` clips anything longer on
+    a shorter level, as it does for the help.
+
+    Layout only. The item names are the items' own, and the two sentences the screen shows
+    the player — the footer, and whatever the action emits — come from
+    :func:`format_inventory_status` and :mod:`roguelike.events` respectively.
+    """
+    inventory = state.player_actor.inventory
+    melee = inventory.melee.name if inventory.melee is not None else _NO_MELEE
+    ranged = inventory.ranged.name if inventory.ranged is not None else _NO_ITEM
+    shield = inventory.shield.name if inventory.shield is not None else _NO_ITEM
+
+    lines = [f"Melee: {melee}   Ranged: {ranged}   Shield: {shield}", ""]
+    if not inventory.carried:
+        lines.append("  (your pack is empty)")
+        return tuple(lines)
+
+    for index, item in enumerate(inventory.carried):
+        letter = ITEM_LETTERS[index] if index < len(ITEM_LETTERS) else " "
+        marker = ">" if index == state.inventory_cursor else " "
+        lines.append(f"{marker} {letter}  {_describe_item(item)}")
+    return tuple(lines)
+
+
+def format_inventory_status(state: GameState) -> str:
+    """The footer under the inventory: what the three keys do."""
+    return "e wields or drinks  -  d drops  -  any other key returns"
 
 
 def _tick_status(actor: Actor) -> tuple[Actor, int]:
@@ -1291,13 +1847,27 @@ def _tick_status(actor: Actor) -> tuple[Actor, int]:
     — it does not wait for the actor's energy to cross the threshold, or poison could dodge
     a tick by being slow.
 
-    Returns the actor with its effects advanced and the damage already subtracted, plus
-    that damage, so the caller can decide what to say about it.
+    :func:`roguelike.status.tick_effects` reports **damage and healing separately**, not a
+    signed net (CONTRACT-v6, T31): a net of zero cannot tell "nothing happened" from
+    "poison burned for 2 while a bandage closed 2", and those are different sentences. The
+    two are applied together here and only the damage is handed back, because damage is
+    the half that can kill and the half that has something to say — a bandage ticking is
+    as quiet as natural regeneration.
+
+    **Healing is capped at ``max_hp``** by the same :func:`roguelike.stats.derive` every
+    other derived number in this project comes from; poison damage is not floored, because
+    reaching zero is exactly how poison kills.
+
+    Returns the actor with its effects advanced and the arithmetic already applied, plus
+    the damage, so the caller can decide what to say about it.
     """
     if not actor.status_effects:
         return actor, 0
-    effects, damage = tick_effects(actor.status_effects)
-    return replace(actor, hp=actor.hp - damage, status_effects=effects), damage
+    effects, damage, healing = tick_effects(actor.status_effects)
+    hp = actor.hp - damage + healing
+    if healing:
+        hp = min(hp, derive(actor.stats).max_hp)
+    return replace(actor, hp=hp, status_effects=effects), damage
 
 
 def _regenerate(player: Player) -> Player:
@@ -1398,6 +1968,16 @@ def _npc_attacks_player(
     (CONTRACT-v5 §23.2). :func:`roguelike.combat.resolve_attack` rolls the poison but never
     applies it — that is this call site's job, through
     :func:`roguelike.status.apply_effect`, which refreshes rather than stacks.
+
+    **This is where a shield earns its place** (CONTRACT-v6 §23.5). Every bite in the
+    bestiary is a melee attack, so the chance passed is the shield's plain ``block_chance``
+    — see :func:`_shield_block`. A blocked blow deals no damage **and no poison**: the
+    shield stops the venom with the fang, which is a rule of the draw order, not of this
+    call site. Measured end to end, the three shields take floor clears from 45.6% bare to
+    60.9 / 77.7 / 85.8 percent (§0.4).
+
+    The player has **no resistance of their own**: resistance is a property of a species
+    (§26.3) and the player is not one, so the default ``NORMAL`` is what applies.
     """
     data = SPECIES_DATA[npc.species]
     result = resolve_attack(
@@ -1408,9 +1988,20 @@ def _npc_attacks_player(
         data.attack_max,
         False,
         data.poison_chance,
+        Resistance.NORMAL,
+        _shield_block(
+            player.inventory.shield,
+            False,
+            player.actor.stats.agi,
+            npc.actor.stats.agi,
+        ),
     )
     if not result.hit:
         emitted.append((Event(EventKind.NPC_MISSED_PLAYER, name=data.name), npc.position))
+        return player
+
+    if result.blocked:
+        emitted.append((Event(EventKind.SHIELD_BLOCKED), npc.position))
         return player
 
     emitted.append((Event(EventKind.NPC_HIT_PLAYER, name=data.name), npc.position))
@@ -1696,6 +2287,13 @@ def step(state: GameState, command: Command) -> GameState:
       cycles and wraps; ``f`` again fires and consumes the turn. **Any other key while
       choosing cancels**, and is swallowed whole exactly like a mistyped ``w`` prefix — no
       turn, no action, not even a new message.
+    - :attr:`~roguelike.keys.CommandKind.PICK_UP` takes one item out of the chest under
+      the player and **costs a turn**; with no chest there, an emptied one, or a full
+      pack it reports why and costs none (CONTRACT-v6 §7.16, §7.18). See :func:`_pick_up`.
+    - :attr:`~roguelike.keys.CommandKind.INVENTORY` opens the inventory screen and
+      **costs no turn, ever** — like the help and look screens. The screen's own keys do
+      not arrive here at all: they are raw keys with no ``CommandKind``, and
+      :func:`inventory_key` is what interprets them (§5 v6, §7.17).
     - **Any command clears a running activity first.** The loop normally cancels before
       it ever gets here, but the rule cannot depend on that: a command the player typed is
       always about now, never about the walk they had started.
@@ -1723,6 +2321,13 @@ def step(state: GameState, command: Command) -> GameState:
     # must not disturb a walk in progress.
     if state.help_page is not None:
         return _turn_help_page(state)
+
+    # The inventory screen is driven by raw keys through `inventory_key`, because its
+    # alphabet deliberately has no `CommandKind` (§5 v6) — so a *command* arriving while
+    # it is open is a key `run` never routes here. It is answered the way the screen
+    # answers every key it has no use for: close, no turn, message untouched.
+    if state.inventory_open:
+        return replace(state, inventory_open=False, inventory_cursor=0)
 
     if state.look_cursor is not None:
         if command.kind is CommandKind.MOVE:
@@ -1798,6 +2403,14 @@ def step(state: GameState, command: Command) -> GameState:
     if command.kind is CommandKind.HELP:
         return replace(state, help_page=0)
 
+    if command.kind is CommandKind.INVENTORY:
+        # **No turn, ever** (§7.16) — like the help and look screens. Opening it is
+        # reading the screen, and the world does not move while you read.
+        return replace(state, inventory_open=True, inventory_cursor=0)
+
+    if command.kind is CommandKind.PICK_UP:
+        return _tick_world(state, _pick_up(state))
+
     if command.kind is CommandKind.REST:
         # Refused outright with something already in view. `interruption` only fires on
         # a hostile that *newly* appears, so without this the player would settle down
@@ -1844,7 +2457,10 @@ def step(state: GameState, command: Command) -> GameState:
                 return _tick_world(
                     state,
                     _player_attack(
-                        state, result.blocked_by_npc, state.player_actor.melee, True
+                        state,
+                        result.blocked_by_npc,
+                        _melee_weapon(state.player_actor),
+                        True,
                     ),
                 )
             # Walking into a peaceful creature **swaps places with it**. Without this a
@@ -1859,7 +2475,7 @@ def step(state: GameState, command: Command) -> GameState:
                     state,
                     result.position,
                     state.open_doors,
-                    _stair_events(state.level, result.position),
+                    _arrival_events(state, result.position),
                 ),
             )
         if result.blocked_by_door is not None:
@@ -2023,7 +2639,7 @@ def advance(state: GameState) -> GameState:
             state,
             result.position,
             state.open_doors,
-            _stair_events(state.level, result.position),
+            _arrival_events(state, result.position),
         )
         if activity.kind is ActivityKind.AUTO_WALK:
             after = replace(after, activity=replace(activity, came_from=state.player))
@@ -2314,6 +2930,18 @@ def _target_cell(state: GameState) -> Coord | None:
     return state.targeting.targets[state.targeting.index]
 
 
+def _chest_cells(state: GameState) -> frozenset[Coord]:
+    """Where the chests are, as the renderer wants them: bare coordinates.
+
+    A chest reaches the renderer as plain positions, because ``render.py`` may not import
+    ``loot.py`` (CONTRACT-v6 §10 v6) — and unlike a monster it needs nothing else, since
+    every chest draws with the same glyph whether it is full or empty (T35). The whole set
+    goes over every time: *when* a chest may be drawn is decided inside the pure renderer,
+    which draws one from ``explored`` because — unlike a monster — a chest does not move.
+    """
+    return frozenset(chest.position for chest in state.chests)
+
+
 def _npc_glyphs(state: GameState) -> tuple[render.NpcGlyph, ...]:
     """The monsters as the renderer wants them: position, glyph, species name.
 
@@ -2354,6 +2982,7 @@ def _projectile_frame(state: GameState, cell: Coord) -> list[list[render.Cell]]:
         _npc_glyphs(state),
         None,
         cell,
+        _chest_cells(state),
     )
 
 
@@ -2376,6 +3005,12 @@ def run(stdscr, state: GameState) -> GameState:
     it composes the chrome text, renders the current state to cells, blits them, asks for
     a key, and hands the result to whichever of the two owns the next transition.
     ``stdscr`` must already be initialised — :func:`play` does that, and nothing here does.
+
+    **The inventory screen is the one place a key is not translated.** Its keys — ``e``,
+    ``d`` and the item letters — have no :class:`~roguelike.keys.CommandKind` by design
+    (CONTRACT-v6 §5 v6), so while it is open the raw key goes to :func:`inventory_key`
+    instead of to :func:`step`. That is a routing decision, not a rule: what the key
+    *means* is decided there, with everything else this module knows.
 
     **The keyboard is read two different ways, and that is the whole of the v4 loop.**
     With no activity in progress it blocks for a key exactly as v3 did (``timeout(-1)``)
@@ -2428,6 +3063,19 @@ def run(stdscr, state: GameState) -> GameState:
                 state.level.width,
                 state.level.height,
             )
+        elif state.inventory_open:
+            # The inventory is the second full-screen page, and it needed no new drawing
+            # code at all (T35): same `render_text_page`, same frame shape, same `draw`.
+            cells = render.render_text_page(
+                inventory_lines(state),
+                render.Chrome(
+                    stats="Inventory",
+                    message=format_inventory_status(state),
+                    status_right="",
+                ),
+                state.level.width,
+                state.level.height,
+            )
         else:
             chrome = render.Chrome(
                 stats=format_stats(state),
@@ -2443,6 +3091,8 @@ def run(stdscr, state: GameState) -> GameState:
                 chrome,
                 _npc_glyphs(state),
                 _target_cell(state),
+                None,
+                _chest_cells(state),
             )
         render.draw(stdscr, cells)
 
@@ -2478,6 +3128,14 @@ def run(stdscr, state: GameState) -> GameState:
             stdscr.timeout(_ACTIVITY_TICK_MS)
             key = stdscr.getch()
             state = advance(state) if key == _NO_KEY else _cancelled(state)
+        elif state.inventory_open:
+            # The one place a key is not translated. The inventory screen's alphabet has
+            # no `CommandKind` on purpose (§5 v6), so `translate_key` would flatten `e`,
+            # `d` and every item letter into a single `UNKNOWN` and the screen could not
+            # work at all. The key goes over raw and `inventory_key` decides what it
+            # means — the rule stays in this module, the keyboard stays in this function.
+            stdscr.timeout(_BLOCKING)
+            state = inventory_key(state, stdscr.getch())
         else:
             stdscr.timeout(_BLOCKING)
             state = step(state, translate_key(stdscr.getch()))

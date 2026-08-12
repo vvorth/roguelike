@@ -23,6 +23,7 @@ import pytest
 
 from roguelike.level import Level, Room, freeze_grid
 from roguelike.render import (
+    CHEST_CHAR,
     Cell,
     Chrome,
     NpcGlyph,
@@ -672,6 +673,154 @@ def test_repeated_calls_with_npcs_and_target_are_equal():
     assert first == second
 
 
+# ------------------------------------------------------------------------------- chests
+#
+# CONTRACT-v6 §7.17/§27: unlike an NPC, a chest does not move, so — deliberately unlike
+# the NPC rule above — it *is* drawn from `explored`, not only `visible`. That is the one
+# renderer decision T35 made rather than inherited; the tests below pin it explicitly.
+
+
+def test_visible_chest_is_drawn_with_its_glyph_and_role():
+    level = all_floor_level(4, 3)
+    cells = render_to_cells(
+        level, (0, 0), frozenset({(2, 1)}), EMPTY, EMPTY, Chrome(), chests=frozenset({(2, 1)})
+    )
+    cell = cells[1 + 1][2]
+    assert cell.char == CHEST_CHAR
+    assert cell.role is Role.CHEST
+    assert cell.visibility is Visibility.VISIBLE
+
+
+def test_chest_is_drawn_from_explored_because_it_does_not_move():
+    """The one decision this task made: a chest does not move, so — unlike an NPC — a
+    chest remembered from `explored` is not a lie. Drawing it from `explored` is what
+    makes a remembered chest worth walking back to (CONTRACT-v6 §7.17/§27)."""
+    level = all_floor_level(4, 3)
+    cells = render_to_cells(
+        level, (0, 0), EMPTY, frozenset({(2, 1)}), EMPTY, Chrome(), chests=frozenset({(2, 1)})
+    )
+    cell = cells[1 + 1][2]
+    assert cell.char == CHEST_CHAR
+    assert cell.role is Role.CHEST
+    assert cell.visibility is Visibility.EXPLORED
+
+
+def test_chest_visible_wins_over_explored_when_in_both():
+    level = all_floor_level(4, 3)
+    cells = render_to_cells(
+        level,
+        (0, 0),
+        frozenset({(2, 1)}),
+        frozenset({(2, 1)}),
+        EMPTY,
+        Chrome(),
+        chests=frozenset({(2, 1)}),
+    )
+    cell = cells[1 + 1][2]
+    assert cell.visibility is Visibility.VISIBLE
+
+
+def test_chest_on_unseen_cell_is_not_drawn_and_reveals_no_terrain():
+    level = all_floor_level(4, 3)
+    cells = render_to_cells(
+        level, (99, 99), EMPTY, EMPTY, EMPTY, Chrome(), chests=frozenset({(2, 1)})
+    )
+    cell = cells[1 + 1][2]
+    assert cell.char == " "
+    assert cell.role is Role.TERRAIN
+    assert cell.visibility is Visibility.UNSEEN
+
+
+def test_npc_wins_over_chest_on_the_same_cell():
+    """Acceptance criterion: the player and monsters still win over a chest on the same
+    cell (CONTRACT-v6 §7.17/§27) — half of it."""
+    level = all_floor_level(3, 3)
+    npc = NpcGlyph(position=(1, 1), glyph="j", species="jackal")
+    cells = render_to_cells(
+        level,
+        (0, 0),
+        frozenset({(1, 1)}),
+        EMPTY,
+        EMPTY,
+        Chrome(),
+        npcs=(npc,),
+        chests=frozenset({(1, 1)}),
+    )
+    cell = cells[1 + 1][1]
+    assert cell.char == "j"
+    assert cell.role is Role.NPC
+
+
+def test_player_wins_over_chest_on_the_same_cell():
+    """Acceptance criterion: the player and monsters still win over a chest on the same
+    cell (CONTRACT-v6 §7.17/§27) — the other half."""
+    level = all_floor_level(3, 3)
+    cells = render_to_cells(
+        level, (1, 1), frozenset({(1, 1)}), EMPTY, EMPTY, Chrome(), chests=frozenset({(1, 1)})
+    )
+    cell = cells[1 + 1][1]
+    assert cell.char == PLAYER_CHAR
+    assert cell.role is Role.PLAYER
+
+
+def test_chest_glyph_does_not_collide_with_any_forbidden_glyph():
+    """Explicit collision check (CONTRACT-v6 §7.17/§27 acceptance criteria): the chosen
+    chest glyph must not collide with any tile glyph, the player glyph, the projectile
+    glyph or any species glyph."""
+    forbidden = {"#", ".", "+", "'", "<", ">", "@", "*", "r", "j", "B", "s"}
+    assert CHEST_CHAR not in forbidden
+
+
+def test_multiple_chests_render_simultaneously():
+    level = all_floor_level(5, 3)
+    chests = frozenset({(0, 1), (2, 1), (4, 1)})
+    cells = render_to_cells(level, (99, 99), chests, EMPTY, EMPTY, Chrome(), chests=chests)
+    row = cells[1 + 1]
+    for x in (0, 2, 4):
+        assert row[x].char == CHEST_CHAR
+        assert row[x].role is Role.CHEST
+    for x in (1, 3):
+        assert row[x].role is Role.TERRAIN
+
+
+@pytest.mark.parametrize("pos", [(-1, 0), (0, -1), (5, 0), (0, 3), (-1, -1), (99, 99)])
+def test_chest_out_of_bounds_position_is_not_drawn_and_does_not_raise(pos):
+    level = small_level()  # 5 wide, 3 high
+    cells = render_to_cells(
+        level, (99, 99), all_coords(level), EMPTY, EMPTY, Chrome(), chests=frozenset({pos})
+    )
+    flat = [c for row in cells[1:-1] for c in row]
+    assert all(c.role is not Role.CHEST for c in flat)
+
+
+def test_render_to_cells_defaults_to_no_chests():
+    """`chests` is appended with a default, so every pre-v6 call site keeps working
+    unchanged — asserted here exactly as the equivalent npcs/target default test above."""
+    level = all_floor_level(3, 3)
+    explicit = render_to_cells(
+        level, (0, 0), all_coords(level), EMPTY, EMPTY, Chrome(), chests=frozenset()
+    )
+    implicit = render_to_cells(level, (0, 0), all_coords(level), EMPTY, EMPTY, Chrome())
+    assert explicit == implicit
+
+
+def test_chests_set_is_not_mutated():
+    level = all_floor_level(3, 3)
+    chests = frozenset({(1, 1)})
+    visible = frozenset({(1, 1)})
+    render_to_cells(level, (0, 0), visible, EMPTY, EMPTY, Chrome(), chests=chests)
+    assert chests == frozenset({(1, 1)})
+
+
+def test_repeated_calls_with_chests_are_equal():
+    level = all_floor_level(3, 3)
+    chests = frozenset({(1, 1)})
+    visible = frozenset({(1, 1)})
+    first = render_to_cells(level, (0, 0), visible, EMPTY, EMPTY, Chrome(), chests=chests)
+    second = render_to_cells(level, (0, 0), visible, EMPTY, EMPTY, Chrome(), chests=chests)
+    assert first == second
+
+
 # ------------------------------------------------------------------ ranged target cursor
 
 
@@ -923,7 +1072,7 @@ def test_render_source_contains_no_glyph_literals(glyph):
     assert f"'{glyph}'" not in src
 
 
-@pytest.mark.parametrize("color_number", [250, 238, 180, 94, 231, 173, 140])
+@pytest.mark.parametrize("color_number", [250, 238, 180, 94, 231, 173, 140, 220, 178])
 def test_render_source_contains_no_bare_palette_colour_literals(color_number):
     """None of the binding palette's 256-colour indices (style.py §15.1, §24.1) may be
     re-spelled here; they must only ever be reached via style.attr_for.
@@ -973,6 +1122,8 @@ def test_render_imports_only_permitted_modules():
         "roguelike.npc",
         "roguelike.combat",
         "roguelike.stats",
+        "roguelike.items",
+        "roguelike.loot",
     ],
 )
 def test_render_does_not_import_sibling_modules(forbidden):
@@ -1045,6 +1196,7 @@ def test_public_surface():
         "render_to_cells",
         "render_text_page",
         "PROJECTILE_CHAR",
+        "CHEST_CHAR",
         "to_lines",
         "init_colors",
         "draw",
@@ -1282,6 +1434,8 @@ def test_init_colors_populates_module_level_attr_table_for_every_combo():
         (Role.DOOR, Visibility.EXPLORED),
         (Role.PLAYER, Visibility.VISIBLE),
         (Role.PROJECTILE, Visibility.VISIBLE),
+        (Role.CHEST, Visibility.VISIBLE),
+        (Role.CHEST, Visibility.EXPLORED),
     }
     assert set(render_module._CELL_ATTRS.keys()) == expected_keys
 
@@ -1443,3 +1597,35 @@ def test_a_text_page_with_no_lines_is_blank_but_well_formed() -> None:
     page = _page([], width=12, height=3)
     assert len(page) == 5
     assert to_lines(page)[1].strip() == ""
+
+
+# --------------------------------------------------------------- the inventory screen
+#
+# CONTRACT-v6 §7.17: "A full-screen page built with render.render_text_page, exactly as
+# the help screen is." No new layout function — game.py composes the wording (a title,
+# per-item lines and a footer) and hands it to the very same render_text_page the help
+# screen already uses. These tests exercise that composition shape; render_text_page's
+# own behaviour is already fully pinned by the tests above and is unchanged by T35.
+
+
+def test_inventory_screen_renders_through_render_text_page_with_map_frame_shape():
+    level = all_floor_level(20, 10)
+    map_frame = render_to_cells(
+        level, (0, 0), all_coords(level), EMPTY, EMPTY, Chrome(stats="", message="", status_right="")
+    )
+
+    title = "Inventory"
+    item_lines = ("a) dagger (equipped)", "b) potion of healing", "c) buckler")
+    footer = "e-equip d-drop"
+    lines = (title, "", *item_lines)
+    inventory_chrome = Chrome(stats="", message=footer, status_right="")
+    inventory_frame = render_text_page(lines, inventory_chrome, level.width, level.height)
+
+    assert len(inventory_frame) == len(map_frame)
+    assert all(len(row) == level.width for row in inventory_frame)
+    body = to_lines(inventory_frame)
+    assert body[1].startswith(title)
+    assert body[3].startswith(item_lines[0])
+    assert body[4].startswith(item_lines[1])
+    assert body[5].startswith(item_lines[2])
+    assert body[-1].startswith(footer)

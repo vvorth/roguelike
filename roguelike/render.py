@@ -36,7 +36,13 @@ the stair glyphs, which need no special handling here since they are just anothe
 :func:`roguelike.style.attr_for`. NPC glyphs and species identity are no exception to
 "never spelled out here" — they arrive as parameters via :class:`NpcGlyph`, since this
 module may not import the monster module, ``npc.py`` (CONTRACT-v5 §10 v5), and must
-therefore stay usable without it ever existing.
+therefore stay usable without it ever existing. Chests are the same story one module
+over: this module may not import ``items.py`` or ``loot.py`` (CONTRACT-v6 §10 v6), so a
+chest arrives as a plain ``(x, y)`` position via the ``chests`` parameter — there is no
+per-chest data to carry (every chest draws identically), so unlike :class:`NpcGlyph`
+there is no small structure wrapping it, just the position itself. The one glyph this
+module *does* own outright is :data:`CHEST_CHAR`, exactly as it already owns
+:data:`PROJECTILE_CHAR` — both are the renderer's own invented symbols, not tile data.
 
 ``curses`` is imported for :class:`curses.error` and its attribute/colour constants;
 nothing in this module calls a terminal-mutating curses function at import time, and only
@@ -44,8 +50,9 @@ nothing in this module calls a terminal-mutating curses function at import time,
 their caller (CONTRACT §0.3). Imports from :mod:`roguelike` are limited to
 :mod:`roguelike.tiles`, :mod:`roguelike.level` and :mod:`roguelike.style` (CONTRACT-v3
 §10). This module never imports ``events``, ``fov``, ``game``, ``generator``, ``movement``,
-``keys``, ``npc``, ``combat`` or ``stats`` — it receives finished strings via
-:class:`Chrome` and finished NPC glyphs via :class:`NpcGlyph`, never events or game state.
+``keys``, ``npc``, ``combat``, ``stats``, ``items`` or ``loot`` — it receives finished
+strings via :class:`Chrome`, finished NPC glyphs via :class:`NpcGlyph` and finished chest
+positions via ``chests``, never events or game state.
 
 **The one visibility rule that matters (CONTRACT-v5 §4/§15 v5):** an NPC is drawn only
 when its position is in ``visible``, never from ``explored``. Terrain is remembered — a
@@ -53,6 +60,12 @@ wall seen an hour ago is still a wall — but a monster seen an hour ago has mov
 drawing it from memory would draw a lie. The player glyph always wins over an NPC glyph
 on the same cell, drawn last and unconditionally rather than relying on the upstream
 occupancy invariant that is supposed to make the collision unreachable.
+
+**Chests are the deliberate exception to that rule (CONTRACT-v6 §7.17/§27):** a chest
+does not move, so it is drawn from ``explored`` exactly like terrain, not hidden the
+instant it leaves view like an NPC. A remembered chest is not a lie — it is still there —
+and that is precisely what makes walking back to one worth doing. Chests are drawn after
+terrain but before NPCs and the player, so either of those still wins on the same cell.
 """
 
 from __future__ import annotations
@@ -71,6 +84,7 @@ __all__ = [
     "render_to_cells",
     "render_text_page",
     "PROJECTILE_CHAR",
+    "CHEST_CHAR",
     "to_lines",
     "init_colors",
     "draw",
@@ -133,6 +147,11 @@ class Chrome:
 #: every species glyph in the bestiary.
 PROJECTILE_CHAR: str = "*"
 
+#: Drawn for a chest (CONTRACT-v6 §7.17/§27). Distinct from every tile glyph
+#: (``#``, ``.``, ``+``, ``'``, ``<``, ``>``), the player glyph (``@``), the projectile
+#: glyph (``*``), and every species glyph in the bestiary (``r``, ``j``, ``B``, ``s``).
+CHEST_CHAR: str = "~"
+
 
 def _chrome_row(text: str, width: int) -> list[Cell]:
     """Pad/truncate ``text`` to exactly ``width`` and wrap it as a terrain/visible row."""
@@ -169,6 +188,7 @@ def render_to_cells(
     npcs: tuple[NpcGlyph, ...] = (),
     target: tuple[int, int] | None = None,
     projectile: tuple[int, int] | None = None,
+    chests: frozenset[tuple[int, int]] = frozenset(),
 ) -> list[list[Cell]]:
     """Render one frame as a grid of styled :class:`Cell`. Pure.
 
@@ -190,6 +210,12 @@ def render_to_cells(
             (CONTRACT-v5 §7.10, §4/§15 v5). **Appended with a default of ``None``.**
             When set and in bounds, that cell's :attr:`Cell.reverse` is ``True`` and
             nothing else about it changes — no separate cursor glyph is drawn.
+        chests: positions of chests to draw this frame (CONTRACT-v6 §7.17/§27).
+            **Appended with a default of ``frozenset()``, so every pre-v6 call site
+            keeps working unchanged.** Unlike ``npcs``, each is drawn whenever its
+            position is in ``visible`` *or* ``explored`` — a chest does not move, so a
+            remembered one is still there. Out-of-bounds positions are simply not
+            drawn, exactly like ``player_pos``.
 
     Returns:
         Exactly ``level.height + 2`` rows of exactly ``level.width`` :class:`Cell` each:
@@ -198,17 +224,21 @@ def render_to_cells(
 
     Visibility precedence per map cell: ``visible`` beats ``explored`` beats unseen.
     An unseen cell is blank (``char == " "``, ``role == Role.TERRAIN``) — the map shape
-    must never leak through unexplored area. NPCs are drawn over that terrain next, each
-    only if currently ``visible``. The player glyph is drawn last and unconditionally
-    overrides whatever is on its cell — terrain, door, *or* NPC — drawn on a wall exactly
-    as readily as on a floor. The ranged-target highlight, if any, is applied last of all,
-    so it survives on top of terrain, an NPC or the player alike without altering any of
-    their glyphs. Both chrome rows are ``Role.TERRAIN``, ``Visibility.VISIBLE`` in every
-    cell, and never carry a target highlight (``target`` addresses map coordinates only).
+    must never leak through unexplored area. Chests are drawn over that terrain next,
+    at ``Visibility.VISIBLE`` or ``Visibility.EXPLORED`` matching the same precedence,
+    but never on an unseen cell. NPCs are drawn over that next, each only if currently
+    ``visible`` — so an NPC standing on a chest hides it, exactly as intended (a monster
+    always wins over a chest on the same cell). The player glyph is drawn last of the
+    glyphs and unconditionally overrides whatever is on its cell — terrain, door, chest,
+    *or* NPC — drawn on a wall exactly as readily as on a floor. The ranged-target
+    highlight, if any, is applied last of all, so it survives on top of terrain, a
+    chest, an NPC or the player alike without altering any of their glyphs. Both chrome
+    rows are ``Role.TERRAIN``, ``Visibility.VISIBLE`` in every cell, and never carry a
+    target highlight (``target`` addresses map coordinates only).
 
     None of ``level``, ``player_pos``, ``visible``, ``explored``, ``open_doors``,
-    ``chrome``, ``npcs`` or ``target`` is mutated; a fresh grid of fresh ``Cell``s is
-    returned each call.
+    ``chrome``, ``npcs``, ``target`` or ``chests`` is mutated; a fresh grid of fresh
+    ``Cell``s is returned each call.
     """
     width = level.width
 
@@ -235,8 +265,21 @@ def render_to_cells(
             row.append(Cell(char, role, visibility))
         rows.append(row)
 
-    # NPCs — over the terrain, only when currently visible, never from `explored`
-    # (the headline correctness rule: a remembered monster is a lie).
+    # Chests — over the terrain, drawn from `explored` as well as `visible`, unlike an
+    # NPC: a chest does not move, so a remembered one is still there and worth walking
+    # back to (CONTRACT-v6 §7.17/§27). Never drawn on an unseen cell, so the map shape
+    # still leaks through nowhere unexplored.
+    for chest_x, chest_y in chests:
+        if not level.in_bounds(chest_x, chest_y):
+            continue
+        if (chest_x, chest_y) in visible:
+            rows[chest_y + 1][chest_x] = Cell(CHEST_CHAR, Role.CHEST, Visibility.VISIBLE)
+        elif (chest_x, chest_y) in explored:
+            rows[chest_y + 1][chest_x] = Cell(CHEST_CHAR, Role.CHEST, Visibility.EXPLORED)
+
+    # NPCs — over the chests and the terrain, only when currently visible, never from
+    # `explored` (the headline correctness rule: a remembered monster is a lie). Drawn
+    # after chests so a monster standing on a chest wins, per CONTRACT-v6 §7.17/§27.
     for npc in npcs:
         npc_x, npc_y = npc.position
         if level.in_bounds(npc_x, npc_y) and npc.position in visible:
@@ -245,8 +288,8 @@ def render_to_cells(
             )
 
     # The player — drawn last of the glyphs and unconditionally, so it wins over an NPC
-    # on the same cell without depending on the upstream occupancy invariant that is
-    # supposed to make the collision unreachable in the first place.
+    # or a chest on the same cell without depending on the upstream occupancy invariant
+    # that is supposed to make the collision unreachable in the first place.
     player_x, player_y = player_pos
     if level.in_bounds(player_x, player_y):
         rows[player_y + 1][player_x] = Cell(PLAYER_CHAR, Role.PLAYER, Visibility.VISIBLE)
@@ -329,7 +372,9 @@ def render_text_page(
 # and attr_for raises for UNSEEN), and Role.PLAYER is always Visibility.VISIBLE, so those
 # combinations are deliberately absent here. Role.NPC is likewise absent: an NPC's colour
 # depends on its species, not just its (role, visibility), so it is allocated separately
-# below into `_NPC_ATTRS` rather than crammed into this dict's key shape.
+# below into `_NPC_ATTRS` rather than crammed into this dict's key shape. Role.CHEST gets
+# both VISIBLE and EXPLORED, like TERRAIN and DOOR — a chest does not move, so it is
+# drawn (and needs a colour) at both (CONTRACT-v6 §7.17/§27).
 _ATTR_COMBOS: tuple[tuple[Role, Visibility], ...] = (
     (Role.TERRAIN, Visibility.VISIBLE),
     (Role.TERRAIN, Visibility.EXPLORED),
@@ -337,6 +382,8 @@ _ATTR_COMBOS: tuple[tuple[Role, Visibility], ...] = (
     (Role.DOOR, Visibility.EXPLORED),
     (Role.PLAYER, Visibility.VISIBLE),
     (Role.PROJECTILE, Visibility.VISIBLE),
+    (Role.CHEST, Visibility.VISIBLE),
+    (Role.CHEST, Visibility.EXPLORED),
 )
 
 # The species keys style.attr_for accepts for Role.NPC (CONTRACT-v5 §24.1's four-species

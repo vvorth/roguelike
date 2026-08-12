@@ -491,7 +491,7 @@ must still hold an entry for **every** `EventKind`.
 | `POISON_DAMAGE` | `The poison burns.` |
 | `NO_TARGET` | `There is nothing to shoot at.` |
 | `TARGETING` | `Target: {name}. [Tab] next, [f] fire, any other key cancels.` |
-| `SPOTTED_HOSTILE` | `A {name} comes into view!` |
+| `SPOTTED_HOSTILE` | ~~`A {name} comes into view!`~~ → **`There is a {name} in view.`** — see the amendment below |
 
 `Event` gains two optional fields alongside `depth`:
 
@@ -863,3 +863,23 @@ silently reverts the balance to the unplayable version.
    never a precondition checked before the status phase.
 
 Everything else in §7.8's ordering is unchanged.
+
+---
+
+## §16.2 (amendment) — `SPOTTED_HOSTILE`'s wording
+
+**Issued after T30 flagged the drift. This corrects the contract to match shipped behaviour;
+the code was already right.**
+
+§7.14 originally interrupted an activity when a hostile *newly* entered view, and
+`A {name} comes into view!` described that exactly. The rule was later widened, at the user's
+request, to interrupt whenever **any** hostile is visible — at which point the old wording was
+simply false: it fired for a monster that had been on screen for ten turns.
+
+The shipped message is **`There is a {name} in view.`**, which is true in both cases. The code
+and its tests were changed at the time; this contract row was not, and stayed stale until a v6
+worker read both and reported the mismatch rather than "fixing" one to match the other.
+
+Also amended alongside that change and recorded here for completeness: `interruption` now
+answers **damage and status changes before the hostile check**, so a bitten player reads
+`The jackal hits you. You stop.` rather than being told about a jackal they have been watching.

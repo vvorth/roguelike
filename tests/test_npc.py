@@ -37,6 +37,7 @@ import pytest
 
 from roguelike import npc as npc_module
 from roguelike.generator import generate_level
+from roguelike.items import DamageType, Resistance
 from roguelike.level import Level, freeze_grid
 from roguelike.npc import (
     FORGET_TICKS,
@@ -52,6 +53,7 @@ from roguelike.npc import (
     Species,
     SpeciesData,
     plan_action,
+    resistance_of,
     spawn_npcs,
 )
 from roguelike.stats import Actor, Stats, derive
@@ -220,17 +222,20 @@ def test_species_data_has_exactly_one_entry_per_species():
 
 
 @pytest.mark.parametrize(
-    "species, name, glyph, stats, attack, xp, poison",
+    "species, name, glyph, stats, attack, xp, poison, flee",
     [
-        (Species.RAT, "rat", "r", (4, 14, 3), (1, 3), 5, 0),
-        (Species.JACKAL, "jackal", "j", (8, 13, 5), (2, 4), 10, 0),
-        (Species.GIANT_BAT, "giant bat", "B", (3, 18, 2), (1, 2), 8, 0),
-        (Species.CAVE_SNAKE, "cave snake", "s", (6, 8, 5), (2, 4), 12, 30),
+        (Species.RAT, "rat", "r", (4, 14, 3), (1, 3), 5, 0, 2),
+        (Species.JACKAL, "jackal", "j", (8, 13, 5), (2, 4), 10, 0, 5),
+        (Species.GIANT_BAT, "giant bat", "B", (3, 18, 2), (1, 2), 8, 0, 3),
+        (Species.CAVE_SNAKE, "cave snake", "s", (6, 8, 5), (2, 4), 12, 30, 1),
     ],
 )
 def test_species_data_fields_match_the_binding_table(
-    species, name, glyph, stats, attack, xp, poison
+    species, name, glyph, stats, attack, xp, poison, flee
 ):
+    # The whole existing bestiary, re-asserted literally so a stray edit to any one
+    # number is loud (T33 brief: "do not change any existing stat ... every existing
+    # number in npc.py stays exactly as it is").
     data = SPECIES_DATA[species]
     assert isinstance(data, SpeciesData)
     assert data.name == name
@@ -239,6 +244,8 @@ def test_species_data_fields_match_the_binding_table(
     assert (data.attack_min, data.attack_max) == attack
     assert data.xp_value == xp
     assert data.poison_chance == poison
+    assert data.flee_chance == flee
+    assert data.hostile is True
 
 
 def test_species_names_are_lower_case_because_messages_interpolate_them():
@@ -289,6 +296,10 @@ def test_species_data_does_not_store_derived_values():
         # its glyph.
         "hostile",
         "flee_chance",
+        # How this species takes each DamageType (CONTRACT-v6 §26.3) -- also a fact
+        # about the species, not a derived value. combat.py applies the multiplier;
+        # this module only says how much.
+        "resistances",
     }
     assert fields.isdisjoint({"max_hp", "hp", "speed", "evasion", "block"})
 
@@ -304,6 +315,83 @@ def test_attack_ranges_are_ordered_positive_integers():
         assert isinstance(data.attack_min, int)
         assert isinstance(data.attack_max, int)
         assert 0 < data.attack_min <= data.attack_max
+
+
+# ---------------------------------------------------------------------------
+# Resistances (CONTRACT-v6 §26.3, task T33)
+# ---------------------------------------------------------------------------
+
+#: The §26.3 table, spelled out for all four species x all three damage types. Anything
+#: not the giant bat/BLUNT or cave snake/PIERCE cell is NORMAL.
+RESISTANCE_TABLE = {
+    (Species.RAT, DamageType.SLASH): Resistance.NORMAL,
+    (Species.RAT, DamageType.PIERCE): Resistance.NORMAL,
+    (Species.RAT, DamageType.BLUNT): Resistance.NORMAL,
+    (Species.JACKAL, DamageType.SLASH): Resistance.NORMAL,
+    (Species.JACKAL, DamageType.PIERCE): Resistance.NORMAL,
+    (Species.JACKAL, DamageType.BLUNT): Resistance.NORMAL,
+    (Species.GIANT_BAT, DamageType.SLASH): Resistance.NORMAL,
+    (Species.GIANT_BAT, DamageType.PIERCE): Resistance.NORMAL,
+    (Species.GIANT_BAT, DamageType.BLUNT): Resistance.VULNERABLE,
+    (Species.CAVE_SNAKE, DamageType.SLASH): Resistance.NORMAL,
+    (Species.CAVE_SNAKE, DamageType.PIERCE): Resistance.RESISTANT,
+    (Species.CAVE_SNAKE, DamageType.BLUNT): Resistance.NORMAL,
+}
+
+
+@pytest.mark.parametrize("species, damage_type", list(RESISTANCE_TABLE))
+def test_resistance_of_matches_the_binding_table(species, damage_type):
+    assert resistance_of(species, damage_type) == RESISTANCE_TABLE[(species, damage_type)]
+
+
+def test_only_the_giant_bat_and_cave_snake_have_any_exception_at_all():
+    # Everything else -- rat and jackal, wholly -- reads NORMAL for every type, so their
+    # `resistances` dicts hold no exceptions (CONTRACT-v6 §26.3: "absence means NORMAL").
+    assert SPECIES_DATA[Species.RAT].resistances == {}
+    assert SPECIES_DATA[Species.JACKAL].resistances == {}
+
+
+def test_giant_bat_is_vulnerable_to_blunt_and_only_blunt():
+    resistances = SPECIES_DATA[Species.GIANT_BAT].resistances
+    assert resistances == {DamageType.BLUNT: Resistance.VULNERABLE}
+
+
+def test_cave_snake_resists_pierce_and_only_pierce():
+    resistances = SPECIES_DATA[Species.CAVE_SNAKE].resistances
+    assert resistances == {DamageType.PIERCE: Resistance.RESISTANT}
+
+
+def test_nothing_in_the_shipped_bestiary_is_immune():
+    # The tier exists and is tested elsewhere (items.py); no shipped species uses it
+    # (CONTRACT-v6 §26.3).
+    for species in Species:
+        for damage_type in DamageType:
+            assert resistance_of(species, damage_type) != Resistance.IMMUNE
+    for data in SPECIES_DATA.values():
+        assert Resistance.IMMUNE not in data.resistances.values()
+
+
+def test_resistance_of_defaults_to_normal_for_anything_not_in_the_table():
+    for species in Species:
+        for damage_type in DamageType:
+            if (species, damage_type) not in RESISTANCE_TABLE or RESISTANCE_TABLE[
+                (species, damage_type)
+            ] is Resistance.NORMAL:
+                assert resistance_of(species, damage_type) == Resistance.NORMAL
+
+
+def test_resistance_of_never_mutates_or_indexes_the_dict_directly():
+    # A caller should never need `.get(..., Resistance.NORMAL)` by hand.
+    before = copy.deepcopy(SPECIES_DATA)
+    for species in Species:
+        for damage_type in DamageType:
+            resistance_of(species, damage_type)
+    assert SPECIES_DATA == before
+
+
+def test_resistance_of_signature():
+    parameters = list(inspect.signature(resistance_of).parameters)
+    assert parameters == ["species", "damage_type"]
 
 
 # ---------------------------------------------------------------------------
@@ -1287,7 +1375,10 @@ def _module_imports(tree: ast.Module) -> set[str]:
     return names
 
 
-def test_npc_imports_only_the_six_permitted_project_modules():
+def test_npc_imports_only_the_seven_permitted_project_modules():
+    # roguelike.items joined the permitted set in v6 (CONTRACT-v6 §10 v6): npc.py may
+    # import it for DamageType/Resistance, since a species' resistance profile is a fact
+    # about the bestiary, not about combat's damage pipeline (§26.3 vs §26.2).
     tree = ast.parse(_module_path().read_text())
     imports = _module_imports(tree)
     project = {name for name in imports if name.split(".")[0] == "roguelike"}
@@ -1298,8 +1389,17 @@ def test_npc_imports_only_the_six_permitted_project_modules():
         "roguelike.world",
         "roguelike.pathfind",
         "roguelike.fov",
+        "roguelike.items",
     }
     assert project <= permitted, sorted(project - permitted)
+
+
+def test_npc_does_import_items_for_the_resistance_types():
+    # Not merely permitted -- required, since resistance_of and SpeciesData.resistances
+    # are typed in terms of DamageType/Resistance.
+    tree = ast.parse(_module_path().read_text())
+    imports = _module_imports(tree)
+    assert "roguelike.items" in imports
 
 
 def test_npc_does_not_import_the_forbidden_modules():
@@ -1418,6 +1518,8 @@ def test_npc_exports_exactly_the_contract_surface():
         "wants_to_flee",
         "plan_action",
         "spawn_npcs",
+        # NEW in v6 (§26.3, T33): how a species takes a damage type.
+        "resistance_of",
     }
 
 

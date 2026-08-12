@@ -1,11 +1,15 @@
-"""Status-effect vocabulary and ticking rules (CONTRACT-v5 §22).
+"""Status-effect vocabulary and ticking rules (CONTRACT-v5 §22, CONTRACT-v6 §25.1).
 
 A leaf: imports nothing from :mod:`roguelike`. Every actor (player or NPC) carries a tuple of
 :class:`StatusEffect` — at most one entry per :class:`StatusKind`, refreshed via
 :func:`apply_effect` and advanced one world-tick at a time via :func:`tick_effects`.
 
-Only ``POISONED`` exists. Adding a second :class:`StatusKind`, a registry, or any per-kind
-behaviour beyond "deal damage each tick" is out of scope for this module (task T22).
+Three kinds exist: ``POISONED`` and ``REGENERATING`` each carry a per-tick magnitude that
+:func:`tick_effects` reports back (as damage and healing respectively); ``ENRAGED`` is a pure
+duration flag — nothing applies it yet, and it contributes neither damage nor healing when
+ticked (task T22's seam, unchanged by T31). Adding a further :class:`StatusKind` or any
+per-kind behaviour beyond "contribute a per-tick number, or don't" is out of scope for this
+module.
 """
 
 from __future__ import annotations
@@ -23,10 +27,11 @@ __all__ = [
 
 
 class StatusKind(Enum):
-    """The status-effect vocabulary (CONTRACT-v5 §22)."""
+    """The status-effect vocabulary (CONTRACT-v5 §22, CONTRACT-v6 §25.1)."""
 
     POISONED = auto()
     ENRAGED = auto()
+    REGENERATING = auto()
 
 
 #: An enraged creature never flees, however badly hurt it is (see
@@ -37,8 +42,13 @@ class StatusKind(Enum):
 class StatusEffect:
     """One active status effect on an actor.
 
-    ``magnitude`` is the damage dealt on each tick (see :func:`tick_effects`); it is not
-    reinterpreted per-kind since ``POISONED`` is the only kind that exists.
+    ``magnitude`` is always a non-negative per-tick number; what it *means* depends on
+    ``kind`` (see :func:`tick_effects`):
+
+    - ``POISONED`` — HP lost on that tick.
+    - ``REGENERATING`` — HP regained on that tick.
+    - ``ENRAGED`` — carries no numeric effect; ``magnitude`` is conventionally 0 and is
+      ignored by :func:`tick_effects` either way.
     """
 
     kind: StatusKind
@@ -85,19 +95,35 @@ def apply_effect(
 
 def tick_effects(
     effects: tuple[StatusEffect, ...],
-) -> tuple[tuple[StatusEffect, ...], int]:
-    """Advance every effect by one world-tick (CONTRACT-v5 §22.2).
+) -> tuple[tuple[StatusEffect, ...], int, int]:
+    """Advance every effect by one world-tick (CONTRACT-v5 §22.2, CONTRACT-v6 §25.1).
 
-    Each effect contributes its ``magnitude`` to the returned damage total and has
-    ``remaining_turns`` reduced by 1 — including the tick that drops it to 0, which still
-    counts toward the damage total. An effect at ``remaining_turns == 0`` after the
-    decrement is dropped from the surviving tuple. Order is preserved. Pure — ``effects`` is
-    never mutated.
+    Returns ``(surviving_effects, total_damage, total_healing)`` — three values, not a
+    signed net. A net of zero is ambiguous between "nothing happened" and "2 damage and 2
+    healing"; callers (the game loop) word those two outcomes differently, so both totals
+    are always reported separately.
+
+    Every effect has ``remaining_turns`` reduced by 1, including the tick that drops it to
+    0 — that tick still contributes the effect's ``magnitude`` before the entry is dropped
+    from the surviving tuple (poison still deals its damage, and regeneration still heals,
+    on the tick that removes them). Order is preserved.
+
+    Each effect's ``magnitude`` is routed by its ``kind``:
+
+    - ``POISONED`` adds to ``total_damage``.
+    - ``REGENERATING`` adds to ``total_healing``.
+    - ``ENRAGED`` (or any other kind) adds to neither — it is a duration flag only.
+
+    Pure — ``effects`` is never mutated.
     """
     surviving: tuple[StatusEffect, ...] = ()
     total_damage = 0
+    total_healing = 0
     for effect in effects:
-        total_damage += effect.magnitude
+        if effect.kind is StatusKind.POISONED:
+            total_damage += effect.magnitude
+        elif effect.kind is StatusKind.REGENERATING:
+            total_healing += effect.magnitude
         remaining = effect.remaining_turns - 1
         if remaining > 0:
             surviving += (
@@ -107,4 +133,4 @@ def tick_effects(
                     magnitude=effect.magnitude,
                 ),
             )
-    return surviving, total_damage
+    return surviving, total_damage, total_healing

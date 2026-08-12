@@ -29,7 +29,7 @@ __all__ = [
 
 
 class CommandKind(Enum):
-    """The thirteen things a key press can mean."""
+    """The fifteen things a key press can mean."""
 
     MOVE = auto()
     QUIT = auto()
@@ -44,6 +44,8 @@ class CommandKind(Enum):
     ATTACK = auto()  # "a" -- prefix; the next key is the direction
     LOOK = auto()  # "x" -- examine mode; a cursor, not a turn
     REST = auto()  # "R" -- stand still until healed or disturbed
+    INVENTORY = auto()  # "i" -- NEW in v6; opens the inventory screen, no turn
+    PICK_UP = auto()  # "g" -- NEW in v6; take one item from a chest
 
 
 @dataclass(frozen=True)
@@ -99,8 +101,9 @@ _QUIT_KEYS: tuple[int | str, ...] = ("q", "Q")
 # Stairs are used by an explicit command, as in ADOM (CONTRACT-v3 §5) — not by
 # stepping on the tile. AUTO_EXPLORE ("E") and WALK_PREFIX ("w") are new in
 # v4. FIRE ("f") and TARGET_NEXT (Tab) are new in v5, for ranged combat and
-# cycling targets (CONTRACT-v5 §5). HELP ("?") and ATTACK ("a") followed. All
-# eight carry dx == dy == 0.
+# cycling targets (CONTRACT-v5 §5). HELP ("?") and ATTACK ("a") followed.
+# INVENTORY ("i") and PICK_UP ("g") are new in v6 (CONTRACT-v6 §5). All ten
+# carry dx == dy == 0.
 #
 # ATTACK is a *prefix*, like WALK_PREFIX: the key that follows it names the
 # direction. It is "a", deliberately NOT "F": "f" already opens ranged targeting,
@@ -109,6 +112,12 @@ _QUIT_KEYS: tuple[int | str, ...] = ("q", "Q")
 #
 # Tab is referenced as `curses.ascii.TAB`, never the literal 9, matching the
 # rule already followed for KEY_SR and friends.
+#
+# "e", "d" and "t" are deliberately ABSENT from this table and stay UNKNOWN:
+# they are read as raw keys *inside* the inventory screen (equip, drop, and a
+# carried-item slot letter respectively) exactly as direction keys are read
+# raw inside look mode, and binding them here would break that screen
+# (CONTRACT-v6 §5).
 _NO_ARG_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
     (CommandKind.DESCEND, ">"),
     (CommandKind.ASCEND, "<"),
@@ -120,6 +129,8 @@ _NO_ARG_BINDINGS: tuple[tuple[CommandKind, int | str], ...] = (
     (CommandKind.ATTACK, "a"),
     (CommandKind.LOOK, "x"),
     (CommandKind.REST, "R"),
+    (CommandKind.INVENTORY, "i"),
+    (CommandKind.PICK_UP, "g"),
 )
 
 
@@ -148,6 +159,8 @@ HELP_ENTRIES: tuple[tuple[str, str], ...] = (
     ("Tab", "next target while aiming"),
     ("x", "look around; direction keys move the cursor"),
     ("R", "rest until healed, or until something disturbs you"),
+    ("g", "pick up an item from a chest"),
+    ("i", "open your inventory"),
     ("?", "this help"),
     ("q", "quit"),
 )
