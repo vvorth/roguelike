@@ -1,13 +1,13 @@
 # roguelike
 
-A terminal roguelike engine with ASCII graphics, in the spirit of [ADOM](https://www.adom.de/).
+A terminal roguelike with ASCII graphics, in the spirit of [ADOM](https://www.adom.de/).
 A procedurally generated multi-level dungeon, permissive field of view, fog of war, openable
-doors, automatic navigation and 256-colour rendering — in Python 3.10+, using **nothing but
-the standard library**.
+doors, automatic navigation, monsters that hunt and flee, melee and ranged combat, damage types
+and resistances, an inventory with weapons and shields, chests, character levelling and
+256-colour rendering — in Python 3.10+, using **nothing but the standard library**.
 
-This is an engine base, not a finished game: it generates a dungeon you can descend through,
-with the fog lifting as you explore, and quits cleanly. There are deliberately no monsters,
-items or combat yet.
+It is playable: descend, fight what lives down there, pick up what you find, and try not to
+die. There is no win condition — the dungeon goes down indefinitely.
 
 ```
                                                             
@@ -73,11 +73,20 @@ Omit it and one is chosen at random, then printed when you quit so you can repla
 | Move | Arrow keys · `hjkl` · numpad `1`–`9` |
 | Move diagonally | Shift+arrows · `H` `J` `K` `L` · `y` `u` `b` `n` · numpad `7` `9` `1` `3` |
 | Open a door | Walk into it |
+| **Close a door** | `c` — asks a direction only if two are beside you |
+| **Attack** | Walk into a hostile monster |
+| **Attack without moving** | `a`, then a direction |
+| **Fire the bow** | `f` to aim, `Tab` to cycle targets, `f` to shoot |
+| **Look around** | `x`, then direction keys; free and unlimited |
+| **Inventory** | `i` |
+| **Pick up from a chest** | `g` |
+| **Rest until healed** | `R` |
 | Descend / climb a staircase | `>` / `<` while standing on one |
 | **Travel to a known staircase** | `>` / `<` while *not* standing on one |
 | **Explore the level** | `E` |
 | **Walk until something happens** | `w`, then a direction |
 | **Stop whatever is running** | any key |
+| **This list, in game** | `?` |
 | Quit | `q` |
 
 Walking into a closed door opens it. That costs a turn and does **not** move you — the next
@@ -148,6 +157,39 @@ because a rejected move costs no turn, bumping a wall leaves the last message on
 doors, and bold white for the player, with darker shades for explored ground. Falls back
 cleanly to 8-colour and monochrome.
 
+**Monsters.** Four species — rat, jackal, giant bat, cave snake — each with its own statistics,
+speed, and reasons to be afraid of it. They act on an energy scheduler, so a bat at speed 180
+genuinely acts more often than you do and a cave snake at 80 acts less. They run their real AI
+whether or not you can see them, wander until they notice you, hunt by the same A\* the player's
+travel uses, and **break off a fight they are losing** — rarely, and more readily the smarter the
+animal. A jackal disengages from about one fight in six; a cave snake almost never.
+
+**Combat.** Walking into a hostile attacks it; `a` and a direction attacks without moving, which
+is the only way to hit something peaceful. To-hit depends on the defender's evasion alone.
+Damage is a weapon roll, plus strength for a wielded weapon, minus the defender's block — with
+a floor of one, so a landed blow is never nothing.
+
+**Damage types and resistances.** Weapons are slashing, piercing or blunt, and a creature can be
+resistant, normal or vulnerable to each. Your starting dagger is piercing and the cave snake
+resists piercing, which is the whole reason to carry a blunt club as well: it is worse in general
+and better against the one thing that shrugs off your dagger.
+
+**Inventory.** Twenty slots, with melee, ranged and shield equipped separately. Bare-handed is
+representable and weak. A shield is a *chance to turn a blow entirely*, never a damage
+subtraction — flat reduction saturates against numbers this small and makes every attack
+identical.
+
+**Chests.** Roughly one level in eight carries a chest, and what is in it improves with depth: a
+finer grade is a one-in-a-hundred chance near the surface and one in seven far down. Chests are
+the only source of items.
+
+**Health you can read.** Both you and every monster show one of five bands — unhurt, lightly
+hurt, wounded, badly wounded, almost dead — in the same words, so "am I worse off than that
+thing?" is one comparison. It is also literally the question a monster asks before it runs.
+
+**Doors as tactics.** No animal can work a latch, so a door you shut behind you genuinely stops
+pursuit rather than delaying it a turn.
+
 ## Design
 
 Four constraints shaped the whole codebase, and each one is visible in the module layout:
@@ -191,6 +233,12 @@ depend on test ordering.
 | `events.py` | Event vocabulary and the message wording table |
 | `pathfind.py` | A\* and the corridor/room topology tests |
 | `activity.py` | Frontier search and corridor following |
+| `stats.py` | Primary statistics and the values derived from them |
+| `status.py` | Status effects — poison, regeneration, rage |
+| `items.py` | Weapons, shields, consumables, damage types, the inventory |
+| `combat.py` | To-hit, damage, resistance and the shield roll |
+| `npc.py` | The bestiary, monster AI, and spawning |
+| `loot.py` | Chests and depth-scaled loot |
 
 The import graph is acyclic and enforced by tests — `render.py` cannot import `fov.py`, and
 `keys.py`, `events.py` and `pathfind.py` import nothing from the package at all. `pathfind.py`
@@ -203,12 +251,13 @@ map for one caller and over only the explored map for another.
 .venv/bin/python -m pytest
 ```
 
-1982 tests, covering each module in isolation plus an end-to-end suite that crosses module
+3029 tests, covering each module in isolation plus an end-to-end suite that crosses module
 boundaries: connectivity by independent flood fill, a scripted walk asserting the player never
 enters a wall or leaves the map, turn accounting, fog-of-war progression, bump-to-open,
 multi-level descent chains, the fog-and-doors round trip, auto-explore coverage, that a planned
-route is walkable step-for-step by the real movement rules, and determinism across separate
-processes.
+route is walkable step-for-step by the real movement rules, that resistance actually reaches
+combat through the real turn loop, that no monster ever starts on a chest, and determinism
+across separate processes.
 
 No test requires a TTY; the suite runs headless.
 
@@ -233,18 +282,34 @@ permissive field of view was chosen over a shadowcasting variant that was 100× 
 (it revealed walls around corners the player could not see), or why door state lives in the
 game state rather than on the level.
 
-- [`.plan/CONTRACT.md`](.plan/CONTRACT.md) · [`.plan/CONTRACT-v2.md`](.plan/CONTRACT-v2.md) · [`.plan/CONTRACT-v3.md`](.plan/CONTRACT-v3.md) · [`.plan/CONTRACT-v4.md`](.plan/CONTRACT-v4.md) — the frozen interface contracts
-- [`.plan/RESEARCH-v2.md`](.plan/RESEARCH-v2.md) · [`.plan/RESEARCH-v3.md`](.plan/RESEARCH-v3.md) · [`.plan/RESEARCH-v4.md`](.plan/RESEARCH-v4.md) — measurements behind the field-of-view, colour, stair-anchoring and auto-navigation decisions
-- [`.plan/INTEGRATION.md`](.plan/INTEGRATION.md) · [`.plan/INTEGRATION-v2.md`](.plan/INTEGRATION-v2.md) · [`.plan/INTEGRATION-v3.md`](.plan/INTEGRATION-v3.md) · [`.plan/INTEGRATION-v4.md`](.plan/INTEGRATION-v4.md) — what was assembled, verified, and left as known gaps
+- **`.plan/CONTRACT*.md`** — six frozen interface contracts, each carrying the measurement that
+  justifies every number in it
+- **`.plan/RESEARCH*.md`** — the measurements behind field of view, colour, stair anchoring,
+  auto-navigation, the combat formulas and the item system. `RESEARCH-v5.md` §0 is worth reading
+  on its own: it lists seven defects found by *simulating* a design that was internally
+  consistent and completely unplayable
+- **`.plan/INTEGRATION*.md`** — what was assembled, verified, and left as known gaps
+- **`.plan/tasks/`** and **`.plan/reports/`** — 36 task briefs and the report each worker wrote
+
+[`CLAUDE.md`](CLAUDE.md) is the short version: how the project is built, and the traps that have
+already bitten.
 
 ## Not implemented
 
-Deliberately out of scope, with no speculative stubs left behind: monsters, combat, items,
-inventory, saving and loading to disk, and sound. There is no win condition — the dungeon goes
-down indefinitely. Auto-explore finishes a level and hands back control; it never descends on
-its own. Dungeon branching is scaffolded but not generated: a level carries a tuple
-of down-staircases and the seed derivation already takes a branch index, but exactly one is
-placed. Terminal resizing is not handled — the view clips safely rather than reflowing.
+Deliberately out of scope, with no speculative stubs left behind: hunger and food, armour,
+weight and encumbrance, item identification, shops, monster drops, saving and loading to disk,
+and sound. There is no win condition — the dungeon goes down indefinitely. Auto-explore finishes
+a level and hands back control; it never descends on its own. Dungeon branching is scaffolded but
+not generated. Terminal resizing is not handled — the view clips safely rather than reflowing.
+
+Some mechanics ship tested but with nothing to exercise them yet, and this is deliberate rather
+than an oversight: no monster carries a shield or shoots, so shields never come up against a
+missile; nothing is immune to a damage type; and every species is an animal, so the humanoid
+door-opening rule has no user. Each is listed in [`CLAUDE.md`](CLAUDE.md) so it stays a recorded
+choice.
+
+The bestiary is static, so character levelling stops mattering around level 5 — depth-scaled
+spawn tables are the fix, and are a future increment.
 
 One known cosmetic defect: on a terminal exactly as tall as the frame, the final character of
 the status row is never drawn (curses cannot write the bottom-right cell), so `Seed 1234`
